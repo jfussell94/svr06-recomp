@@ -1,0 +1,2 @@
+Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int c); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);'
+Get-Process svr06run -ErrorAction SilentlyContinue | ForEach-Object { if ($_.MainWindowHandle -ne 0) { [N.W]::ShowWindow($_.MainWindowHandle, 9) | Out-Null; [N.W]::SetForegroundWindow($_.MainWindowHandle) | Out-Null; "restored " + $_.Id } else { "no window handle " + $_.Id } }

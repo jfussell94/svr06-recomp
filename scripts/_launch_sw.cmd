@@ -1,0 +1,4 @@
+@echo off
+cd /d C:\Users\ajizz\Documents\Recomp
+set "SVR06_PINE_PORT=28012"
+start "" /min cmd /c svr06-recomp\scripts\RUN_SOFTWARE.cmd

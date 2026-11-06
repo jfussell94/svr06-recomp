@@ -1,0 +1,26 @@
+# Never commit game material
+*.elf
+*.iso
+*.bin
+*.afs
+*.pac
+*.pss
+*.adx
+*.mp3
+*.wav
+SLES_*
+SLUS_*
+assets/
+Custom Music/
+# Generated recompiler output and build products
+PS2Recomp/ps2xRuntime/src/runner/
+out/
+overrides/
+analysis/
+build*/
+*.bak*
+__pycache__/
+*.pyc
+*.log
+# Third-party checkout
+PS2Recomp/ps2xRuntime/third_party/parallel-gs/

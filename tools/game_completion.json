@@ -1,0 +1,370 @@
+{
+  "updated": "2026-11-06",
+  "weights": {
+    "code": 25,
+    "visual": 20,
+    "audio": 10,
+    "input": 10,
+    "logic": 20,
+    "playable": 15
+  },
+  "weights_note": "code = recompiled code for this feature matches the PS2 game (audited/verified vs reference); visual = renders correctly; audio = sounds/music correct; input = controls work; logic = game rules/state machines verified against the original; playable = can be used start-to-finish without bugs/crashes/hangs. Each component is 0-100, scored from evidence only (see 'evidence'). Overall for a feature = weighted sum; group = weighted by 'size'. A component set to null does not apply to that feature and is left out of its weighting.",
+  "groups": {
+    "Boot / intro / title": {
+      "size": 4,
+      "items": {
+        "Boot, logos, intro movies": {
+          "code": 90,
+          "visual": 85,
+          "audio": 20,
+          "input": 70,
+          "logic": 90,
+          "playable": 85,
+          "evidence": "boots to title; movies decode; sound model new/unverified"
+        },
+        "Title screen / Press START": {
+          "code": 85,
+          "visual": 70,
+          "audio": 20,
+          "input": 70,
+          "logic": 85,
+          "playable": 75,
+          "evidence": "Press START layering bug open; title to demo load now completes (~8 min load, was stalled)"
+        },
+        "Memory card screen": {
+          "code": 60,
+          "visual": 80,
+          "audio": 20,
+          "input": 70,
+          "logic": 50,
+          "playable": 60,
+          "evidence": "screen shows; saves partial"
+        }
+      }
+    },
+    "Main menu & submenus": {
+      "size": 8,
+      "items": {
+        "Main menu navigation": {
+          "code": 75,
+          "visual": 65,
+          "audio": 20,
+          "input": 70,
+          "logic": 75,
+          "playable": 70,
+          "evidence": "navigable in logged runs; backgrounds show stripe garbage"
+        },
+        "Options (audio/controller/game settings)": {
+          "code": 50,
+          "visual": 60,
+          "audio": 10,
+          "input": 60,
+          "logic": 40,
+          "playable": 40,
+          "evidence": "not exercised"
+        },
+        "Save / Load": {
+          "code": 40,
+          "visual": 60,
+          "audio": 10,
+          "input": 60,
+          "logic": 30,
+          "playable": 30,
+          "evidence": "memory card partial"
+        },
+        "Shop / Unlockables / Unlock All": {
+          "code": 30,
+          "visual": 50,
+          "audio": 10,
+          "input": 60,
+          "logic": 20,
+          "playable": 15,
+          "evidence": "not exercised"
+        },
+        "Records / Hall / Stats screens": {
+          "code": 30,
+          "visual": 50,
+          "audio": 10,
+          "input": 60,
+          "logic": 20,
+          "playable": 15,
+          "evidence": "not exercised"
+        }
+      }
+    },
+    "Exhibition (match setup)": {
+      "size": 10,
+      "items": {
+        "Wrestler select / roster": {
+          "code": 50,
+          "visual": 40,
+          "audio": 10,
+          "input": 60,
+          "logic": 40,
+          "playable": 35,
+          "evidence": "resource namespace catalogued; selection not verified"
+        },
+        "Arena select": {
+          "code": 40,
+          "visual": 35,
+          "audio": 10,
+          "input": 60,
+          "logic": 30,
+          "playable": 25,
+          "evidence": "not verified"
+        },
+        "Match type / rules screens": {
+          "code": 45,
+          "visual": 50,
+          "audio": 10,
+          "input": 60,
+          "logic": 35,
+          "playable": 30,
+          "evidence": "not verified"
+        }
+      }
+    },
+    "Match types (in-ring)": {
+      "size": 22,
+      "items": {
+        "Singles": {
+          "code": 35,
+          "visual": 30,
+          "audio": 5,
+          "input": 40,
+          "logic": 25,
+          "playable": 15,
+          "evidence": "demo/attract runs; collision primitive fixed (unverified in play)"
+        },
+        "Tag team": {
+          "code": 30,
+          "visual": 25,
+          "audio": 5,
+          "input": 35,
+          "logic": 20,
+          "playable": 10,
+          "evidence": "not exercised"
+        },
+        "Triple threat / Fatal 4-way / 6-man": {
+          "code": 30,
+          "visual": 25,
+          "audio": 5,
+          "input": 35,
+          "logic": 20,
+          "playable": 10,
+          "evidence": "not exercised"
+        },
+        "Handicap / Battle royal / Royal Rumble": {
+          "code": 28,
+          "visual": 25,
+          "audio": 5,
+          "input": 35,
+          "logic": 18,
+          "playable": 8,
+          "evidence": "not exercised"
+        },
+        "Cage / Hell in a Cell / Elimination Chamber": {
+          "code": 28,
+          "visual": 22,
+          "audio": 5,
+          "input": 35,
+          "logic": 15,
+          "playable": 8,
+          "evidence": "not exercised"
+        },
+        "Ladder / TLC / Table / Iron Man / Last Man / Submission": {
+          "code": 28,
+          "visual": 22,
+          "audio": 5,
+          "input": 35,
+          "logic": 15,
+          "playable": 8,
+          "evidence": "not exercised"
+        }
+      }
+    },
+    "Match engine subsystems": {
+      "size": 20,
+      "items": {
+        "Skeleton / pose / animation playback": {
+          "code": 75,
+          "visual": 65,
+          "audio": null,
+          "input": null,
+          "logic": 70,
+          "playable": 55,
+          "evidence": "skeleton, euler->matrix, animation applier and controllers mapped; entrance poses render; crouched legs ISS-139 open"
+        },
+        "Collision / hit detection": {
+          "code": 45,
+          "visual": null,
+          "audio": null,
+          "input": null,
+          "logic": 40,
+          "playable": 35,
+          "evidence": "pair query, overlap test and response dispatch verified in a run; response fn 0x5F9C40, ring/rope bounds, sqrtf fix (ISS-141) not verified in play; ISS-139 legs open"
+        },
+        "Grapple / strike / reversal logic": {
+          "code": 20,
+          "visual": null,
+          "audio": null,
+          "input": 30,
+          "logic": 10,
+          "playable": 5,
+          "evidence": "not traced"
+        },
+        "Camera": {
+          "code": 35,
+          "visual": 40,
+          "audio": null,
+          "input": null,
+          "logic": 30,
+          "playable": 25,
+          "evidence": "clip classifier flags fixed; unverified in match"
+        },
+        "Physics / ring / ropes": {
+          "code": 30,
+          "visual": 30,
+          "audio": null,
+          "input": null,
+          "logic": 20,
+          "playable": 15,
+          "evidence": "FPU rounding differs by 1 ULP (opt-in fix)"
+        },
+        "Crowd / referee / AI": {
+          "code": 20,
+          "visual": 20,
+          "audio": 5,
+          "input": null,
+          "logic": 10,
+          "playable": 8,
+          "evidence": "not traced"
+        }
+      }
+    },
+    "Entrances": {
+      "size": 8,
+      "items": {
+        "Entrance playback (movie+music+walk)": {
+          "code": 60,
+          "visual": 65,
+          "audio": 45,
+          "input": 60,
+          "logic": 55,
+          "playable": 40,
+          "evidence": "runs in real match entrance: black screen (CL-0096), textures (ISS-130), HUD fixed; wrestler/walk/music play; VU1-bound so slower than full speed (ISS-144); custom song in real entrance unconfirmed"
+        },
+        "Create entrance / Entrance set-up menu": {
+          "code": 80,
+          "visual": 80,
+          "audio": 70,
+          "input": 75,
+          "logic": 70,
+          "playable": 70,
+          "evidence": "menu works; custom music list (303 themes, A-Z, year tags) and refresh work; slot limit 165 vs 303 and save width >159 unverified"
+        }
+      }
+    },
+    "Season / GM mode": {
+      "size": 8,
+      "items": {
+        "GM desk and menus": {
+          "code": 45,
+          "visual": 55,
+          "audio": 15,
+          "input": 60,
+          "logic": 35,
+          "playable": 35,
+          "evidence": "GM Desk reached"
+        },
+        "Season progression / calendar / PPV": {
+          "code": 25,
+          "visual": 30,
+          "audio": 5,
+          "input": 40,
+          "logic": 15,
+          "playable": 10,
+          "evidence": "not exercised"
+        }
+      }
+    },
+    "Create modes": {
+      "size": 8,
+      "items": {
+        "Create-a-Wrestler": {
+          "code": 35,
+          "visual": 35,
+          "audio": 5,
+          "input": 50,
+          "logic": 25,
+          "playable": 20,
+          "evidence": "Name Engraving screen reached"
+        },
+        "Create belt / finisher / other": {
+          "code": 25,
+          "visual": 30,
+          "audio": 5,
+          "input": 50,
+          "logic": 15,
+          "playable": 10,
+          "evidence": "not exercised"
+        }
+      }
+    },
+    "Audio": {
+      "size": 6,
+      "items": {
+        "Music (ADX streaming, soundtrack)": {
+          "code": 65,
+          "visual": null,
+          "audio": 40,
+          "input": null,
+          "logic": 55,
+          "playable": 45,
+          "evidence": "custom music system (own list, 303 extracted themes, year tags) working; entrance music plays; stock ADX/level accuracy not re-verified"
+        },
+        "SFX / commentary / crowd (SPU2)": {
+          "code": 60,
+          "visual": null,
+          "audio": 20,
+          "input": null,
+          "logic": 40,
+          "playable": 25,
+          "evidence": "bank uploads, voices model in place; no KON of real samples seen yet; stream audio present in dump"
+        }
+      }
+    },
+    "Platform layer": {
+      "size": 6,
+      "items": {
+        "Rendering (software GS)": {
+          "code": 70,
+          "visual": 60,
+          "audio": null,
+          "input": null,
+          "logic": 60,
+          "playable": 55,
+          "evidence": "garbled demo geometry ISS-101, halftone"
+        },
+        "Input (keyboard/XInput)": {
+          "code": 60,
+          "visual": null,
+          "audio": null,
+          "input": 30,
+          "logic": 40,
+          "playable": 35,
+          "evidence": "keyboard works; XInput pending"
+        },
+        "Performance / windowing": {
+          "code": 60,
+          "visual": null,
+          "audio": null,
+          "input": null,
+          "logic": 50,
+          "playable": 45,
+          "evidence": "60 FPS locked on intros/title (CL-0112-0115); entrances ~65% of game thread in VU1, async worker (CL-0127) under test"
+        }
+      }
+    }
+  }
+}

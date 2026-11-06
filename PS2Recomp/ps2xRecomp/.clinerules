@@ -1,0 +1,29 @@
+# PS2Recomp Development Architecture & Guidelines
+
+## General Context
+This project is a PlayStation 2 (PS2) static recompilation engine / game port toolchain (C++20, CMake).
+Always verify file paths exist before reading/writing. 
+Do not generate frontend/web code (e.g., JS/React) unless specifically instructed.
+
+## Core Hardware Architecture Requirements
+When generating, refactoring, or stubbing recompiler components, ensure compliance with these layers:
+
+### 1. Emotion Engine (EE) CPU Handling
+- **MIPS R5900 128-bit MMI:** Map 128-bit SIMD integer instructions (e.g., `paddw`, `pmulth`, `pceqb`) to host x86 AVX2 / SSE4.1 intrinsics or std::array / SIMD vector abstractions.
+- **Delay Slot Resolution:** Ensure control flow translation correctly accounts for MIPS branch delay slots without reordering memory writes that affect branch conditions.
+
+### 2. Vector Units (VU0 & VU1) & COP2
+- **Macro vs. Micro Modes:** Handle VU0 inline macro instructions separately from VU1 geometry/lighting microcode programs.
+- **VU Microcode Execution:** Prefer dedicated recompiler pipelines or fast runtime interpreters for VU microcode blocks to prevent host CPU bottlenecks.
+
+### 3. Graphics Synthesizer (GS) & Rendering
+- **VRAM Emulation:** Support 4MB local GS VRAM packing and swizzling formats (`PSMCT32`, `PSMT8`, `PSMT4`).
+- **Modern API Hooks:** Target modern rendering backends (Vulkan / DirectX 12 / OpenGL) to render GS primitive packets natively.
+
+### 4. IOP & High-Level Emulation (HLE)
+- **RPC Module Hooking:** Intercept BIOS/IOP RPC calls (`pad`, `mcman`, `sifcmd`, `cdvd`).
+- **Function Mapping System:** Use a CSV/YAML map (e.g., `function_map.csv`) to map target MIPS function addresses to standard host C++ overrides (SDL2 controller input, audio mixing, file I/O).
+
+## Tooling & Verification Pipeline
+- **Symbol Maps:** Parse Ghidra disassembly maps or `.elf` symbol tables to emit human-readable function signatures (`Player_Update_08012340()`) instead of generic labels (`func_08012340()`).
+- **State Parity Testing:** Include unit tests that validate `EmotionEngineState` (registers, memory updates) against known emulator execution traces (e.g., PCSX2 debug logs).

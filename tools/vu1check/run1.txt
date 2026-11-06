@@ -1,0 +1,6 @@
+loaded: TPC=0x28b8 start=0x28b8 top=722 itop=0 Q=0 P=2.39622e-43 I=255 status=c1 mac=1 clip=800800
+  vi: 0 32 7 0 0 755 0 731 0 0 0 768 1 1264 824 10
+[gsreg] PRIM#1 val=0x7c
+after: pc=0x28b8 cycles=156 ebit=0  vi: 0 32 7 0 0 755 0 731 0 0 0 768 1 1264 824 10
+qwords that differ from PCSX2 memory after the run: 0
+EXIT=0 

@@ -1,0 +1,1 @@
+Get-ChildItem 'C:\Users\ajizz\Documents\PCSX2\snaps','C:\Users\ajizz\Documents\PCSX2\sstates' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 8 | ForEach-Object { $_.LastWriteTime.ToString('HH:mm:ss') + ' ' + $_.Length + ' ' + $_.Name } | Out-File -Encoding ascii C:\Users\ajizz\Documents\Recomp\svr06-recomp\analysis\_snaps.txt
