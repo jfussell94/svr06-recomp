@@ -79,9 +79,23 @@ Issues and pull requests are welcome, especially for VU1 performance, collision 
 - No copyrighted game material is distributed here. You must supply your own legally obtained copy of the game, and you are responsible for complying with the law where you live.
 - Do not open issues or pull requests containing game files, dumps, disc images or extracted assets.
 
+## Authors
+- **jfussell94** – project owner: direction, testing, requirements and all in-game verification.
+- **Claude (Anthropic)** – AI co-author. Most of the code, analysis, tooling and documentation in this repository was written by Claude (Claude Code, Sonnet/Opus models) working under jfussell94's direction. Commits made with Claude carry a `Co-Authored-By: Claude` trailer. All changes were reviewed and run by the project owner.
+
 ## Licenses and credits
-- PS2Recomp and the base runtime: see `PS2Recomp/LICENSE`.
-- paraLLEl-GS (fetched separately): LGPL-3.0.
-- Embedded menu font: Montserrat, SIL Open Font License 1.1.
-- Design ideas for the async VIF1/GIF worker follow hctp-recomp (GPL-3.0). [ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp) and the PCSX2 project were used as references.
-- Real-hardware FPU test data: [ps2autotests](https://github.com/unknownbrackets/ps2autotests).
+This project builds on the work of others. Thank you to:
+
+- **[PS2Recomp](https://github.com/ran-j/PS2Recomp)** (ran-j and contributors) – the static recompiler and base runtime this repository is forked from; see `PS2Recomp/LICENSE`.
+- **[paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs)** (Arntzen Software / Hans-Kristian Arntzen) – the Vulkan GS renderer, LGPL-3.0, fetched separately (not included). It builds on the Granite engine.
+- **[PCSX2](https://github.com/PCSX2/pcsx2)** – the reference emulator. Behaviour, captures and GS/VU1 comparisons were checked against it, and its soft-float work ([PR #12001](https://github.com/PCSX2/pcsx2/pull/12001)) informed the FPU model.
+- **[ps2autotests](https://github.com/unknownbrackets/ps2autotests)** (unknownbrackets and contributors) – real-hardware test results used to verify the EE FPU bit for bit.
+- **[eefloat](https://www.github.com/hch12907/eefloat)** (hch12907) – reference for Emotion Engine floating-point behaviour.
+- **hctp-recomp** – its ChainWorker design and ahead-of-time VU1 compiler approach (GPL-3.0) informed the async VIF1/GIF worker and the VU1 optimisation plan.
+- **[ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp)** (exoteric33) – reference for native PS2 recompilation and its performance lessons, together with the r/decomps community write-up on making recompilations beat emulation.
+- **ps2tek** – the PS2 hardware reference used throughout.
+- **[console-skill](https://github.com/Jakeschincariol/console-skill)** (Jakeschincariol) – the console-porting reference pack used during the work.
+- **Montserrat** (The Montserrat Project Authors, SIL Open Font License 1.1) – the font embedded in the in-game menu.
+- **Ghidra** (NSA) – used for static analysis of the game executable.
+
+If a source is missing or wrongly credited, please open an issue and it will be fixed.
