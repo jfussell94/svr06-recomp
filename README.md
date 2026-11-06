@@ -91,11 +91,11 @@ This project builds on the work of others. Thank you to:
 - **[PCSX2](https://github.com/PCSX2/pcsx2)** – the reference emulator. Behaviour, captures and GS/VU1 comparisons were checked against it, and its soft-float work ([PR #12001](https://github.com/PCSX2/pcsx2/pull/12001)) informed the FPU model.
 - **[ps2autotests](https://github.com/unknownbrackets/ps2autotests)** (unknownbrackets and contributors) – real-hardware test results used to verify the EE FPU bit for bit.
 - **[eefloat](https://www.github.com/hch12907/eefloat)** (hch12907) – reference for Emotion Engine floating-point behaviour.
-- **hctp-recomp** – its ChainWorker design and ahead-of-time VU1 compiler approach (GPL-3.0) informed the async VIF1/GIF worker and the VU1 optimisation plan.
+- **[hctp-recomp](https://github.com/BigDaddyJRich/hctp-recomp)** (BigDaddyJRich) – its ChainWorker design and ahead-of-time VU1 compiler approach (GPL-3.0) informed the async VIF1/GIF worker and the VU1 optimisation plan.
 - **[ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp)** (exoteric33) – reference for native PS2 recompilation and its performance lessons, together with the r/decomps community write-up on making recompilations beat emulation.
 - **ps2tek** – the PS2 hardware reference used throughout.
 - **[console-skill](https://github.com/Jakeschincariol/console-skill)** (Jakeschincariol) – the console-porting reference pack used during the work.
 - **Montserrat** (The Montserrat Project Authors, SIL Open Font License 1.1) – the font embedded in the in-game menu.
-- **Ghidra** (NSA) – used for static analysis of the game executable.
+- **[Ghidra](https://github.com/nationalsecurityagency/ghidra)** (National Security Agency) – used for static analysis of the game executable.
 
 If a source is missing or wrongly credited, please open an issue and it will be fixed.
