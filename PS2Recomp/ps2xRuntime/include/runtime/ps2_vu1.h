@@ -116,6 +116,20 @@ private:
         bool tBit = false;
         uint8_t upperVfShadowReg = 0;
         uint8_t suppressedLowerVf = 0;
+        // CL-0133: precomputed per-pair facts for the fast loop (derived from the fields above in decodeInstructionPair)
+        bool anyReserved = false;    // upperUsage.reserved || lowerUsage.reserved
+        bool ctlBits = false;        // dBit || tBit || eBit
+        bool fdivOrWaitQ = false;    // lowerUsage.pipeline == PipelineFdiv || lowerUsage.waitQ
+        uint8_t delayViReg = 0;      // first VI (1..15) written by an op that delays the next branch read, else 0
+        // CL-0133: pre-decoded fast-path forms (0 = use the generic execUpper/execLower)
+        uint8_t uKind = 0;           // 1 NOP, 2 FMAC arithmetic, 3 ITOF, 4 FTOI, 5 MAX, 6 MINI, 7 ABS (uOp = ITOF/FTOI scale index)
+        uint8_t uOp = 0;             // 0 ADD, 1 SUB, 2 MADD, 3 MSUB, 4 MUL
+        uint8_t uSrc = 0;            // 0..3 broadcast lane of ft, 4 vector ft, 5 Q, 6 I
+        bool uAcc = false;           // result to ACC instead of fd
+        uint8_t uDest = 0, uFs = 0, uFt = 0, uFd = 0;
+        uint8_t lKind = 0;           // 1 NOP, 2 LQ, 3 SQ, 4 IADDIU, 5 ISUBIU, 6 IADD, 7 ISUB, 8 IADDI, 9 IAND, 10 IOR, 11 LQI, 12 SQI, 13 MOVE
+        uint8_t lA = 0, lB = 0, lC = 0, lDest = 0;
+        int16_t lImm = 0;
     };
 
     struct FlagPipelineEntry
@@ -205,6 +219,11 @@ private:
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
     std::array<bool, kMaxDecodedPairs> m_decodedPairValid{};
+    // CL-0132: programs that never read MAC/status/clip (static scan) can skip flag bookkeeping (debug flag 16, default off)
+    bool m_skipFlags = false;
+    std::array<uint64_t, kMaxDecodedPairs> m_noFlagGen{};
+    std::array<uint8_t, kMaxDecodedPairs> m_noFlagVal{};
+    bool programReadsNoFlags(const uint8_t *vuCode, uint32_t startPC);
     const DecodedInstructionPair &decodedEntry(const uint8_t *vuCode, uint32_t pairIndex);
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
@@ -213,6 +232,9 @@ private:
     bool m_decodedCodeCacheValid = false;
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
+    uint8_t m_flagFifo[8] = {};   // CL-0133: valid slots in push order (readyCycle is non-decreasing in push order)
+    uint32_t m_flagFifoHead = 0u, m_flagFifoCount = 0u;
+    uint32_t m_flagValid = 0u; // CL-0133: bit n set <=> m_flagPipeline[n].valid (kept in sync everywhere valid changes)
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};
     std::array<PendingStore, kMaxPendingStores> m_storePipeline{};
@@ -285,6 +307,15 @@ private:
     uint32_t calculateFmacProductSticky(uint8_t dest) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void pushFmacFlags(uint32_t mac, uint32_t status, uint32_t extraSticky);
+    // CL-0133: inline fast-path versions (defined in src/lib/vu/ps2_vu1_inline.h); valid only when m_fast && !m_fastExact
+    inline void pushFmacFlagsInl(uint32_t mac, uint32_t status);
+    inline void fmacStoreFast(float *dst, const float *result, uint8_t dest);
+    inline void commitFlagsOnlyInl();
+    inline bool execUpperFast(uint32_t instr);
+    inline void execUpperPre(const DecodedInstructionPair &d);
+    inline void execUpperPreNoFlags(const DecodedInstructionPair &d); // CL-0133: uKind 3 ITOF, 4 FTOI, 5 MAX, 6 MINI, 7 ABS                        // CL-0133: uKind == 2
+    inline void execLowerPre(const DecodedInstructionPair &d, uint8_t *vuData, uint32_t dataSize); // CL-0133: lKind >= 2   // CL-0133: common upper ops; false = not handled (call execUpper)
+    inline bool execLowerFast(uint32_t instr, uint8_t *vuData, uint32_t dataSize); // CL-0133: common lower ops (fast path only) // commitReadyPipelines() when m_pendMask == 1 and no FDIV result is in flight
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);
     void queueFcset(uint32_t clip);

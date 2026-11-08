@@ -58,10 +58,19 @@ std::atomic<size_t> g_svr06VramSize{0};
 std::atomic<uint8_t *> g_svr06Vu1Data{nullptr};
 std::atomic<uint8_t *> g_svr06Vu1Code{nullptr};
 std::atomic<uint8_t *> g_svr06Vu0Data{nullptr};
+std::atomic<uint8_t *> g_svr06Vu0Code{nullptr}; // ISS-139: VU0 micro memory for the vu0c command
 std::atomic<int> g_svr06CmdBtn{0};       // PS2 pad mask held by console "press"
 std::atomic<int> g_svr06CmdBtnFrames{0}; // frames left
-std::atomic<int> g_svr06Flags{std::getenv("SVR06_VUAB") ? 1024 : 0}; // 1024 = run every VU1 program twice (fast + exact) and compare: debug only, ~2x slower; opt in with SVR06_VUAB=1        // free-form debug toggles (bit n via "flag n 0/1")
+static int svr06InitFlags()
+{   // launcher modes pass SVR06_FLAGS (decimal or 0x hex); SVR06_VUAB keeps its old meaning (bit 10)
+    int v = std::getenv("SVR06_VUAB") ? 1024 : 0;
+    if (const char *e = std::getenv("SVR06_FLAGS")) v |= static_cast<int>(std::strtoul(e, nullptr, 0));
+    return v;
+}
+std::atomic<int> g_svr06Flags{svr06InitFlags()}; // 1024 = run every VU1 program twice (fast + exact) and compare: debug only, ~2x slower; opt in with SVR06_VUAB=1        // free-form debug toggles (bit n via "flag n 0/1")
 std::atomic<uint64_t> g_svr06Frame{0};
+std::atomic<int> g_svr06PerfFps{0}; std::atomic<uint64_t> g_svr06PerfPresented{0}; // ISS-146 control channel
+std::atomic<bool> g_svr06ShotPending{false}; char g_svr06ShotPath[260] = {0};
 // Runtime diagnostic switches (console "diag NAME on|off"); loggers test bits instead of env vars.
 // bit0 imgw, bit1 storeimg, bit2 save, bit3 anim, bit4 vmgr, bit5 bt, bit6 atlas, bit7 cpy
 std::atomic<uint32_t> g_svr06Diag{0};
@@ -306,10 +315,10 @@ void svr06con::runCommands(uint8_t *rdram)
             if (!v || off >= vs) out << "no vram\n";
             else hexdump(out, v + off, static_cast<uint32_t>(off), static_cast<uint32_t>(std::min<size_t>(std::min<size_t>(len, 4096), vs - off)));
         }
-        else if (c == "vu0d")
+        else if (c == "vu0d" || c == "vu0c")
         {
             std::string a; uint32_t len = 256; ls >> a >> len;
-            uint8_t *v = g_svr06Vu0Data.load();
+            uint8_t *v = (c == "vu0c") ? g_svr06Vu0Code.load() : g_svr06Vu0Data.load();
             const uint32_t off = static_cast<uint32_t>(std::strtoul(a.c_str(), nullptr, 16));
             if (!v || off >= 0x1000u) out << "no vu0 (no VIF0 unpack seen yet)\n";
             else hexdump(out, v + off, off, std::min<uint32_t>(len, 0x1000u - off));
@@ -475,6 +484,16 @@ void svr06con::runCommands(uint8_t *rdram)
         }
         else if (c == "frame")
             out << "frame " << frame << "\n";
+        else if (c == "shot")   // ISS-146: screenshot of the presented window (incl. overlay) -> analysis/live/shots/NAME.png
+        {
+            std::string n; ls >> n; if (n.empty()) n = "shot_" + std::to_string(frame);
+            std::filesystem::create_directories("analysis/live/shots");
+            std::snprintf(g_svr06ShotPath, sizeof g_svr06ShotPath, "analysis/live/shots/%s.png", n.c_str());
+            g_svr06ShotPending.store(true);
+            out << "shot queued " << g_svr06ShotPath << "\n";
+        }
+        else if (c == "perf")
+            out << "fps=" << g_svr06PerfFps.load() << " presented=" << g_svr06PerfPresented.load() << " frame=" << frame << " flags=" << g_svr06Flags.load() << "\n";
         else
             out << "unknown command\n";
     }

@@ -1,0 +1,6 @@
+{
+  "regions": [
+    {"id": "pal", "name": "Europe / Australia", "serial": "SLES-53676", "boot_elf": "SLES_536.76", "status": "playable"},
+    {"id": "usa", "name": "North America", "serial": "SLUS-21286", "boot_elf": "SLUS_212.86", "status": "in-progress"}
+  ]
+}

@@ -46,5 +46,41 @@ namespace vu1fast
         status = (zM ? 1u : 0u) | (sM ? 2u : 0u) | (uM ? 4u : 0u) | (oM ? 8u : 0u);
         return true;
     }
+    // CL-0133: same computation as fmacNormalizeFlags, but table-driven and blending the normalised dest lanes straight into dst
+    // (non-dest lanes of dst untouched), i.e. fmacNormalizeFlags(res) followed by applyDest(dst, res, dest).
+    alignas(16) static constexpr uint8_t kRev4[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    alignas(16) static constexpr int32_t kLaneMask[16][4] = {
+        {0, 0, 0, 0}, {-1, 0, 0, 0}, {0, -1, 0, 0}, {-1, -1, 0, 0}, {0, 0, -1, 0}, {-1, 0, -1, 0}, {0, -1, -1, 0}, {-1, -1, -1, 0},
+        {0, 0, 0, -1}, {-1, 0, 0, -1}, {0, -1, 0, -1}, {-1, -1, 0, -1}, {0, 0, -1, -1}, {-1, 0, -1, -1}, {0, -1, -1, -1}, {-1, -1, -1, -1}};
+    static inline bool fmacFinish(float *dst, const float *res, uint8_t dest, uint32_t &mac, uint32_t &status)
+    {
+        if (dest == 0u)
+            return false;
+        const uint32_t dc = kRev4[dest & 0xFu];
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(res));
+        const __m128i zero = _mm_setzero_si128();
+        const __m128i expMask = _mm_set1_epi32(0x7F800000);
+        const __m128i signBit = _mm_set1_epi32(static_cast<int>(0x80000000u));
+        const __m128i e = _mm_and_si128(b, expMask);
+        const __m128i mag = _mm_andnot_si128(signBit, b);
+        const __m128i e0 = _mm_cmpeq_epi32(e, zero);
+        const __m128i mag0 = _mm_cmpeq_epi32(mag, zero);
+        const __m128i ff = _mm_cmpeq_epi32(e, expMask);
+        const __m128i sign = _mm_and_si128(b, signBit);
+        const __m128i keep = _mm_andnot_si128(_mm_or_si128(e0, ff), b);
+        const __m128i nz = _mm_and_si128(e0, sign);
+        const __m128i nf = _mm_and_si128(ff, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)));
+        const __m128i norm = _mm_or_si128(keep, _mm_or_si128(nz, nf));
+        const __m128i lm = _mm_load_si128(reinterpret_cast<const __m128i *>(kLaneMask[dc]));
+        const __m128i old = _mm_loadu_si128(reinterpret_cast<const __m128i *>(dst));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(dst), _mm_or_si128(_mm_and_si128(lm, norm), _mm_andnot_si128(lm, old)));
+        const uint32_t zM = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(e0))) & dc;
+        const uint32_t uM = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(mag0, e0)))) & dc;
+        const uint32_t sM = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(b))) & dc;
+        const uint32_t oM = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(ff))) & dc;
+        mac = static_cast<uint32_t>(kRev4[zM]) | (static_cast<uint32_t>(kRev4[sM]) << 4) | (static_cast<uint32_t>(kRev4[uM]) << 8) | (static_cast<uint32_t>(kRev4[oM]) << 12);
+        status = (zM ? 1u : 0u) | (sM ? 2u : 0u) | (uM ? 4u : 0u) | (oM ? 8u : 0u);
+        return true;
+    }
 }
 #endif

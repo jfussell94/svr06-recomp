@@ -2,8 +2,18 @@
 #include "runtime/gs/gs_vulkan_bridge.h"
 
 #include <cstdio>
+#include <string>
+#include <set>
+#include <tuple>
+#include <vector>
 #include <cstring>
 #include "runtime/gs/ps2_gs_psmct32.h"
+#include "runtime/gs/ps2_gs_psmt8.h"
+#include "runtime/gs/ps2_gs_psmt4.h"
+#include <filesystem>
+#include <unordered_map>
+#define XXH_INLINE_ALL
+#include "../../../third_party/xxhash/xxhash.h"
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -204,6 +214,381 @@ static void startHangWatch()
         }).detach();
     });
 }
+
+// ============================================================================
+// ISS-161 / CL-0149 (v2): controller button-icon sets, applied on the raw GIF stream that goes to paraLLEl-GS.
+// The menu button glyphs are one 128x256 PSMT8 sheet at GS block 0x1F00 with a 256-entry CT32 CLUT at block 8064. A small GIF parser
+// tracks BITBLTBUF/TRXPOS/TRXREG/TRXDIR (packed A+D) and the following IMAGE data; every 16-byte chunk of those two uploads that equals
+// the ORIGINAL data (mods/icons/orig_idx.bin / orig_clut.bin) is replaced by the chosen set's chunk (mods/icons/<set>/glyph_idx.bin,
+// glyph_clut.bin). Chunks that differ are never touched. Off unless SVR06_ICONSET names a set (SVR06_ICONLOG=1 = log only).
+// ============================================================================
+
+// ============================================================================
+// Texture-pack stage 1 (detection only): CPU shadow of host->local uploads, PCSX2-style texture hashing at TEX0 writes, match against a
+// PCSX2 replacement pack index. Enabled with SVR06_TEXPACK=<replacements dir>. No rendering change yet; logs "[texpack]" lines.
+// ============================================================================
+namespace
+{
+    struct TexPack
+    {
+        bool init = false, on = false;
+        std::vector<uint8_t> vram;
+        struct E { uint64_t clut; uint32_t bits; std::string name; };
+        std::unordered_map<uint64_t, std::vector<E>> idx;
+        struct Xf { bool on = false; uint32_t dbp = 0, dbw = 0, dpsm = 0, sx = 0, sy = 0, rw = 0, rh = 0; uint64_t n = 0; } xf[5];
+        std::set<std::pair<uint64_t, uint64_t>> seen;
+        int logN = 0; uint32_t uniq = 0, texHit = 0, exact = 0;
+    } g_tp;
+    constexpr uint32_t kVMask = (4u << 20) - 1u;
+    void tpInit()
+    {
+        if (g_tp.init) return;
+        g_tp.init = true;
+        const char *d = std::getenv("SVR06_TEXPACK");
+        if (!d || !d[0]) return;
+        std::error_code ec;
+        size_t n = 0;
+        for (const auto &e : std::filesystem::directory_iterator(d, ec))
+        {
+            const std::string name = e.path().filename().string();
+            unsigned long long a = 0, b = 0; unsigned bits = 0; char ext = 0;
+            if (std::sscanf(name.c_str(), "%llx-%llx-%x.%c", &a, &b, &bits, &ext) == 4 && ext == 'p')
+            {
+                g_tp.idx[a].push_back({b, bits & ~0x4000u, name});
+                ++n;
+            }
+        }
+        g_tp.vram.assign(4u << 20, 0);
+        g_tp.on = n != 0;
+        std::fprintf(stderr, "[texpack] pack '%s': %zu textures indexed (%zu distinct tex hashes)%s\n", d, n, g_tp.idx.size(), g_tp.on ? "" : " -- nothing found, disabled");
+    }
+    void tpBegin(int p, uint64_t bb, uint64_t tp, uint64_t tr)
+    {
+        auto &x = g_tp.xf[p];
+        x.dbp = (uint32_t)((bb >> 32) & 0x3fff); x.dbw = (uint32_t)((bb >> 48) & 63); x.dpsm = (uint32_t)((bb >> 56) & 63);
+        x.sx = (uint32_t)((tp >> 32) & 0x7ff); x.sy = (uint32_t)((tp >> 48) & 0x7ff);
+        x.rw = (uint32_t)(tr & 0xfff); x.rh = (uint32_t)((tr >> 32) & 0xfff); x.n = 0;
+        x.on = x.rw && x.rh && (x.dpsm == 0 || x.dpsm == 19 || x.dpsm == 20);
+    }
+    void tpFeed(int p, const uint8_t *d, uint32_t size)
+    {
+        auto &x = g_tp.xf[p];
+        if (!x.on) return;
+        uint8_t *v = g_tp.vram.data();
+        const uint64_t total = (uint64_t)x.rw * x.rh;
+        if (x.dpsm == 0)
+        {
+            for (uint32_t o = 0; o + 4 <= size && x.n < total; o += 4, ++x.n)
+            {
+                const uint32_t px = x.sx + (uint32_t)(x.n % x.rw), py = x.sy + (uint32_t)(x.n / x.rw);
+                std::memcpy(v + (GSPSMCT32::addrPSMCT32(x.dbp, x.dbw, px, py) & kVMask), d + o, 4);
+            }
+        }
+        else if (x.dpsm == 19)
+        {
+            for (uint32_t o = 0; o < size && x.n < total; ++o, ++x.n)
+            {
+                const uint32_t px = x.sx + (uint32_t)(x.n % x.rw), py = x.sy + (uint32_t)(x.n / x.rw);
+                v[GSPSMT8::addrPSMT8(x.dbp, x.dbw, px, py) & kVMask] = d[o];
+            }
+        }
+        else
+        {
+            for (uint32_t o = 0; o < size * 2u && x.n < total; ++o, ++x.n)
+            {
+                const uint32_t px = x.sx + (uint32_t)(x.n % x.rw), py = x.sy + (uint32_t)(x.n / x.rw);
+                const uint32_t nib = GSPSMT4::addrPSMT4(x.dbp, x.dbw, px, py);
+                const uint8_t val = (o & 1u) ? (d[o >> 1] >> 4) : (d[o >> 1] & 15u);
+                uint8_t &b = v[(nib >> 1) & kVMask];
+                b = (nib & 1u) ? (uint8_t)((b & 0x0f) | (val << 4)) : (uint8_t)((b & 0xf0) | val);
+            }
+        }
+    }
+    void tpTex0(uint64_t lo)
+    {
+        const uint32_t tbp = (uint32_t)(lo & 0x3fff), tbw = (uint32_t)((lo >> 14) & 63), psm = (uint32_t)((lo >> 20) & 63);
+        const uint32_t tw = (uint32_t)((lo >> 26) & 15), th = (uint32_t)((lo >> 30) & 15);
+        const uint32_t cbp = (uint32_t)((lo >> 37) & 0x3fff), cpsm = (uint32_t)((lo >> 51) & 15);
+        if (psm != 0 && psm != 19 && psm != 20) return;
+        const uint32_t w = 1u << tw, h = 1u << th;
+        const uint32_t bw = psm == 0 ? 8u : (psm == 19 ? 16u : 32u), bh = psm == 0 ? 8u : 16u;
+        const uint8_t *v = g_tp.vram.data();
+        XXH3_state_t st;
+        XXH3_64bits_reset(&st);
+        for (uint32_t by = 0; by < (h / bh ? h / bh : 1u); ++by)
+            for (uint32_t bx = 0; bx < (w / bw ? w / bw : 1u); ++bx)
+            {
+                const uint32_t x = bx * bw, y = by * bh;
+                uint32_t a;
+                if (psm == 0) a = GSPSMCT32::addrPSMCT32(tbp, tbw, x, y);
+                else if (psm == 19) a = GSPSMT8::addrPSMT8(tbp, tbw, x, y);
+                else a = GSPSMT4::addrPSMT4(tbp, tbw, x, y) >> 1;
+                XXH3_64bits_update(&st, v + (a & kVMask), 256);
+            }
+        const uint64_t th64 = XXH3_64bits_digest(&st);
+        uint64_t ch = 0;
+        if (psm != 0 && cpsm == 0)
+        {
+            uint32_t pal[256];
+            const uint32_t n = psm == 19 ? 256u : 16u;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                uint32_t xx, yy;
+                if (n == 256) { const uint32_t j = (i & 0xE7u) | ((i & 8u) << 1) | ((i & 16u) >> 1); xx = j % 16u; yy = j / 16u; }
+                else { xx = i % 8u; yy = i / 8u; }
+                std::memcpy(&pal[i], v + (GSPSMCT32::addrPSMCT32(cbp, 1, xx, yy) & kVMask), 4);
+            }
+            ch = XXH3_64bits(pal, n * 4u);
+        }
+        if (!g_tp.seen.insert({th64, ch}).second) return;
+        ++g_tp.uniq;
+        // SVR06_TEXDUMP=1: save every small texture (<= 64x64) once as decoded RGBA so UI art (inline button icons etc.) can be found
+        {
+            static int dumpOn = -1; static uint32_t dumpN = 0;
+            if (dumpOn < 0) { const char *e = std::getenv("SVR06_TEXDUMP"); dumpOn = (e && e[0] && e[0] != '0') ? 1 : 0; if (dumpOn) std::filesystem::create_directories("texdump"); }
+            if (dumpOn && dumpN < 1500 && w * h <= 4096u && w >= 8 && h >= 8)
+            {
+                std::vector<uint32_t> px(w * h);
+                uint32_t pal[256] = {};
+                if (psm != 0)
+                {
+                    const uint32_t n = psm == 19 ? 256u : 16u;
+                    for (uint32_t i = 0; i < n; ++i)
+                    {
+                        uint32_t xx, yy;
+                        if (n == 256) { const uint32_t j = (i & 0xE7u) | ((i & 8u) << 1) | ((i & 16u) >> 1); xx = j % 16u; yy = j / 16u; }
+                        else { xx = i % 8u; yy = i / 8u; }
+                        std::memcpy(&pal[i], v + (GSPSMCT32::addrPSMCT32(cbp, 1, xx, yy) & kVMask), 4);
+                    }
+                }
+                for (uint32_t y = 0; y < h; ++y)
+                    for (uint32_t x = 0; x < w; ++x)
+                    {
+                        uint32_t c;
+                        if (psm == 0) std::memcpy(&c, v + (GSPSMCT32::addrPSMCT32(tbp, tbw, x, y) & kVMask), 4);
+                        else if (psm == 19) c = pal[v[GSPSMT8::addrPSMT8(tbp, tbw, x, y) & kVMask]];
+                        else { const uint32_t na = GSPSMT4::addrPSMT4(tbp, tbw, x, y); const uint8_t bb = v[(na >> 1) & kVMask]; c = pal[(na & 1u) ? (bb >> 4) : (bb & 15u)]; }
+                        const uint32_t a2 = ((c >> 24) & 255u) * 2u;
+                        px[y * w + x] = (c & 0x00ffffffu) | ((a2 > 255u ? 255u : a2) << 24);
+                    }
+                char nm[200]; std::snprintf(nm, sizeof nm, "texdump/t_%05u_tbp%u_psm%u_%ux%u_%016llx.rgba", dumpN++, tbp, psm, w, h, (unsigned long long)th64);
+                if (FILE *fp = std::fopen(nm, "wb")) { std::fwrite(px.data(), 4, px.size(), fp); std::fclose(fp); }
+            }
+        }
+        const uint32_t bits = psm | (tw << 6) | (th << 10);
+        auto it = g_tp.idx.find(th64);
+        if (it != g_tp.idx.end())
+        {
+            ++g_tp.texHit;
+            const TexPack::E *best = nullptr; bool ex = false;
+            for (const auto &e : it->second)
+                if (e.bits == bits) { if (!best) best = &e; if (e.clut == ch) { best = &e; ex = true; break; } }
+            if (ex) ++g_tp.exact;
+            if (g_tp.logN < 300 && best) { ++g_tp.logN; std::fprintf(stderr, "[texpack] %s tbp=%u psm=%u %ux%u hash=%llx clut=%llx -> %s\n", ex ? "EXACT" : "tex-only", tbp, psm, w, h, (unsigned long long)th64, (unsigned long long)ch, best->name.c_str()); }
+        }
+        else if (g_tp.logN < 700) { ++g_tp.logN; std::fprintf(stderr, "[texpack] none tbp=%u psm=%u %ux%u hash=%llx clut=%llx\n", tbp, psm, w, h, (unsigned long long)th64, (unsigned long long)ch); }
+        if ((g_tp.uniq % 100) == 0)
+            std::fprintf(stderr, "[texpack] stats: unique textures seen=%u, tex-hash hits=%u, exact (tex+palette)=%u\n", g_tp.uniq, g_tp.texHit, g_tp.exact);
+    }
+}
+namespace
+{
+    struct IconPatch
+    {
+        bool init = false, on = false, logOnly = false;
+        std::vector<uint8_t> nIdx, nClut, oIdx, oClut;
+        struct Ps { int mode = 0; uint32_t left = 0; uint64_t bb = 0, tp = 0, tr = 0; int kind = 0; uint32_t off = 0, hit = 0, miss = 0, dbp = 0, dpsm = 0, w = 0, h = 0, any = 0, tot = 0; std::vector<uint8_t> buf; uint32_t dumped = 0; } ps[4];
+        std::set<std::pair<uint64_t,uint64_t>> oset; std::set<std::tuple<uint32_t,uint32_t,uint32_t,uint32_t,uint32_t>> seen; int diagN = 0, dumpN = 0;
+        int logN = 0; uint32_t cur[4] = {};
+    } g_ip;
+    bool ipLoad(const std::string &path, std::vector<uint8_t> &out, size_t want)
+    {
+        FILE *f = std::fopen(path.c_str(), "rb");
+        if (!f) return false;
+        out.resize(want);
+        const size_t got = std::fread(out.data(), 1, want, f);
+        char extra;
+        const bool exact = got == want && std::fread(&extra, 1, 1, f) == 0;
+        std::fclose(f);
+        return exact;
+    }
+    void ipInit()
+    {
+        if (g_ip.init) return;
+        g_ip.init = true;
+        const char *lg = std::getenv("SVR06_ICONLOG");
+        g_ip.logOnly = lg && lg[0] && lg[0] != '0';
+        const char *set = std::getenv("SVR06_ICONSET");
+        if (!set || !set[0] || std::string(set) == "ps2") return;
+        g_ip.logOnly = true;
+        const char *root = std::getenv("SVR06_ICONDIR");
+        const std::string base = std::string(root && root[0] ? root : "mods/icons") + "/";
+        if (ipLoad(base + "orig_idx.bin", g_ip.oIdx, 32768) && ipLoad(base + "orig_clut.bin", g_ip.oClut, 1024) &&
+            ipLoad(base + set + "/glyph_idx.bin", g_ip.nIdx, 32768) && ipLoad(base + set + "/glyph_clut.bin", g_ip.nClut, 1024))
+        {
+            g_ip.on = true;
+            std::fprintf(stderr, "[iconhook] icon set '%s' loaded from %s\n", set, base.c_str());
+        }
+        else
+            std::fprintf(stderr, "[iconhook] icon set '%s' NOT loaded (need orig_idx.bin, orig_clut.bin and %s/glyph_idx.bin, glyph_clut.bin under %s); original icons stay\n", set, set, base.c_str());
+    }
+    int ipKind(uint64_t bb, uint64_t tp, uint64_t tr)
+    {
+        const uint32_t dbp = (uint32_t)((bb >> 32) & 0x3fff), dpsm = (uint32_t)((bb >> 56) & 63);
+        const uint32_t sx = (uint32_t)((tp >> 32) & 0x7ff), sy = (uint32_t)((tp >> 48) & 0x7ff), w = (uint32_t)(tr & 0xfff), h = (uint32_t)((tr >> 32) & 0xfff);
+        g_ip.cur[0]=dbp; g_ip.cur[1]=dpsm; g_ip.cur[2]=w; g_ip.cur[3]=h;
+        // the game keeps extra copies of the sheet / palette at other VRAM addresses (match + pause screens); recognised by shape,
+        // patched only while every chunk so far equals the original (see ipStrict)
+        if (dpsm == 0x13u && !sx && !sy && w == 128u && h == 256u) return 1;
+        if (dpsm == 0u && !sx && !sy && w == 16u && h == 16u) return 2;
+        if (w * h >= 256u) return 3;
+        if ((dbp == 0x1F00u || dbp == 8064u) && g_ip.logN < 40)
+        {
+            ++g_ip.logN;
+            std::fprintf(stderr, "[iconhook] other upload to dbp=%u psm=%u pos=%u,%u size=%ux%u (left alone)\n", dbp, dpsm, sx, sy, w, h);
+        }
+        return 0;
+    }
+    static bool ipStrict(uint32_t dbp) { return !(dbp == 0x1F00u || dbp == 8064u); }
+    // patch one 16-byte chunk of an upload of `kind` at byte offset `off`; returns 1 replaced/matched, 0 differs
+    int ipChunk(int kind, uint32_t off, const uint8_t *src, uint8_t *dstOrNull)
+    {
+        const std::vector<uint8_t> &o = kind == 1 ? g_ip.oIdx : g_ip.oClut;
+        const std::vector<uint8_t> &n = kind == 1 ? g_ip.nIdx : g_ip.nClut;
+        if (off + 16u > o.size()) return 1;
+        if (std::memcmp(o.data() + off, src, 16) != 0) return 0;
+        if (g_ip.on && dstOrNull) std::memcpy(dstOrNull, n.data() + off, 16);
+        return 1;
+    }
+    void ipDone(IconPatch::Ps &ps)
+    {
+        if (!ipStrict(ps.dbp) && !ps.buf.empty() && ps.dumped < 6)
+        {
+            char nm[160]; std::snprintf(nm, sizeof nm, "icon_real_%s_%d_dbp%u.bin", ps.kind == 1 ? "sheet" : "clut", ps.dumped++, ps.dbp);
+            if (FILE *f = std::fopen(nm, "wb")) { std::fwrite(ps.buf.data(), 1, ps.buf.size(), f); std::fclose(f); }
+        }
+        if (ipStrict(ps.dbp) && !ps.buf.empty())
+        {
+            // sheet-like uploads that only partly match the original (e.g. a second icon sheet used by tip text) + the palette that follows
+            static uint32_t sheetAt = 0, nDump = 0;
+            const bool sheetVariant = ps.kind == 1 && ps.miss > 0 && ps.hit >= 16;
+            const bool palNear = ps.kind == 2 && sheetAt && ps.dbp + 160u >= sheetAt && ps.dbp <= sheetAt + 160u;
+            if (sheetVariant) sheetAt = ps.dbp;
+            if ((sheetVariant || palNear) && nDump < 16)
+            {
+                char nm[160]; std::snprintf(nm, sizeof nm, "icon_var_%02u_%s_dbp%u.bin", nDump++, ps.kind == 1 ? "sheet" : "clut", ps.dbp);
+                if (FILE *f2 = std::fopen(nm, "wb")) { std::fwrite(ps.buf.data(), 1, ps.buf.size(), f2); std::fclose(f2); }
+            }
+        }
+        ps.buf.clear();
+        if (g_ip.logN < 40 && (!ipStrict(ps.dbp) || ps.hit >= 16))
+        {
+            ++g_ip.logN;
+            std::fprintf(stderr, "[iconhook] %s upload at dbp=%u done: %u chunks equal to original, %u differ (%s)\n", ps.kind == 1 ? "sheet" : "clut", ps.dbp, ps.hit, ps.miss,
+                         g_ip.on ? (ps.miss ? "partly replaced" : "replaced") : "log only");
+        }
+        ps.kind = 0; ps.off = 0; ps.hit = ps.miss = 0;
+    }
+    // whole-transfer helper for gsvk::uploadImage (registers known)
+    const uint8_t *ipWhole(uint64_t bb, uint64_t tp, uint64_t tr, uint64_t dir, const uint8_t *data, uint32_t size, std::vector<uint8_t> &tmp)
+    {
+        ipInit();
+        tpInit();
+        if (g_tp.on && (dir & 3) == 0) { tpBegin(4, bb, tp, tr); tpFeed(4, data, size); }
+        if (!g_ip.on && !g_ip.logOnly) return data;
+        if ((dir & 3) != 0) return data;
+        IconPatch::Ps &ps = g_ip.ps[3];
+        ps.kind = ipKind(bb, tp, tr);
+        if (ps.kind != 1 && ps.kind != 2) return data;
+        ps.hit = ps.miss = 0;
+        const uint32_t need = ps.kind == 1 ? 32768u : 1024u;
+        ps.buf.assign(data, data + (size < need ? size : need)); ps.dbp = g_ip.cur[0];
+        for (uint32_t off = 0; off + 16u <= size && off < need; off += 16u)
+        {
+            uint8_t *dst = nullptr;
+            if (g_ip.on) { if (tmp.empty()) tmp.assign(data, data + size); dst = tmp.data() + off; }
+            if (ipChunk(ps.kind, off, data + off, (ipStrict(ps.dbp) && ps.miss) ? nullptr : dst)) ++ps.hit; else ++ps.miss;
+        }
+        ipDone(ps);
+        return tmp.empty() ? data : tmp.data();
+    }
+    // GIF stream helper for gsvk::gifTransfer (state kept per path)
+    const uint8_t *ipStream(uint32_t path, const uint8_t *data, uint32_t size, std::vector<uint8_t> &tmp)
+    {
+        ipInit();
+        tpInit();
+        if (!g_ip.on && !g_ip.logOnly && !g_tp.on) return data;
+        IconPatch::Ps &ps = g_ip.ps[path & 3u];
+        for (uint32_t i = 0; i + 16u <= size; i += 16u)
+        {
+            uint64_t lo, hi;
+            std::memcpy(&lo, data + i, 8);
+            std::memcpy(&hi, data + i + 8, 8);
+            switch (ps.mode)
+            {
+            case 0:
+            {
+                const uint32_t nloop = (uint32_t)(lo & 0x7fff), flg = (uint32_t)((lo >> 58) & 3);
+                uint32_t nreg = (uint32_t)((lo >> 60) & 15);
+                if (!nreg) nreg = 16;
+                if (!nloop) break;
+                if (flg == 0) { if (nreg == 1 && (hi & 15) == 0xE) { ps.mode = 1; ps.left = nloop; } else { ps.mode = 3; ps.left = nloop * nreg; } }
+                else if (flg == 1) { ps.mode = 3; ps.left = (nloop * nreg + 1) / 2; }
+                else if (flg == 2) { ps.mode = 2; ps.left = nloop; }
+                else { ps.mode = 3; ps.left = nloop; }
+                break;
+            }
+            case 1:
+            {
+                const uint32_t r = (uint32_t)(hi & 0xff);
+                if (r == 0x50) ps.bb = lo; else if (r == 0x51) ps.tp = lo; else if (r == 0x52) ps.tr = lo;
+                else if (r == 0x06 || r == 0x07) { if (g_tp.on) tpTex0(lo); }
+                else if (r == 0x53) { if (g_tp.on) { if ((lo & 3) == 0) tpBegin(path & 3u, ps.bb, ps.tp, ps.tr); else g_tp.xf[path & 3u].on = false; } if ((lo & 3) == 0) { ps.kind = ipKind(ps.bb, ps.tp, ps.tr); ps.off = 0; ps.hit = ps.miss = 0; ps.any = ps.tot = 0; ps.buf.clear(); ps.dbp = g_ip.cur[0]; ps.dpsm = g_ip.cur[1]; ps.w = g_ip.cur[2]; ps.h = g_ip.cur[3]; } else ps.kind = 0; }
+                if (--ps.left == 0) ps.mode = 0;
+                break;
+            }
+            case 2:
+            {
+                if (g_tp.on) tpFeed(path & 3u, data + i, 16);
+                if (ps.kind == 3)
+                {
+                    if (g_ip.oset.empty() && !g_ip.oIdx.empty())
+                        for (size_t o = 0; o + 16 <= g_ip.oIdx.size(); o += 16) { uint64_t a, b; std::memcpy(&a, &g_ip.oIdx[o], 8); std::memcpy(&b, &g_ip.oIdx[o + 8], 8); if (a != b) g_ip.oset.insert({a, b}); }
+                    uint64_t a, b; std::memcpy(&a, data + i, 8); std::memcpy(&b, data + i + 8, 8);
+                    ++ps.tot; if (a != b && g_ip.oset.count({a, b})) ++ps.any;
+                    if (ps.buf.size() < 131072) ps.buf.insert(ps.buf.end(), data + i, data + i + 16);
+                    // finish is logged when the stream chunk count hits the rect size is unknown; log on every 64th and at end via left==1
+                    if (ps.left == 1)
+                    {
+                        if (g_ip.diagN < 600 && ps.tot >= 8 && g_ip.seen.insert(std::make_tuple(ps.dbp, ps.dpsm, ps.w, ps.h, ps.any)).second) { ++g_ip.diagN; std::fprintf(stderr, "[iconhook] diag upload dbp=%u psm=%u %ux%u chunks=%u in-orig-set=%u\n", ps.dbp, ps.dpsm, ps.w, ps.h, ps.tot, ps.any); }
+                        if (ps.any * 4 >= ps.tot && ps.any >= 16 && g_ip.dumpN < 12)
+                        {
+                            char nm[160]; std::snprintf(nm, sizeof nm, "icon_up_%d_dbp%u_psm%u_%ux%u.bin", g_ip.dumpN++, ps.dbp, ps.dpsm, ps.w, ps.h);
+                            if (FILE *f = std::fopen(nm, "wb")) { std::fwrite(ps.buf.data(), 1, ps.buf.size(), f); std::fclose(f); }
+                        }
+                    }
+                }
+                else if (ps.kind)
+                {
+                    if (ps.buf.size() < 40000) ps.buf.insert(ps.buf.end(), data + i, data + i + 16);
+                    const uint32_t need = ps.kind == 1 ? 32768u : 1024u;
+                    uint8_t *dst = nullptr;
+                    if (g_ip.on) { if (tmp.empty()) tmp.assign(data, data + size); dst = tmp.data() + i; }
+                    if (ipChunk(ps.kind, ps.off, data + i, (ipStrict(ps.dbp) && ps.miss) ? nullptr : dst)) ++ps.hit; else ++ps.miss;
+                    ps.off += 16u;
+                    if (ps.off >= need) ipDone(ps);
+                }
+                if (--ps.left == 0) ps.mode = 0;
+                break;
+            }
+            default:
+                if (--ps.left == 0) ps.mode = 0;
+                break;
+            }
+        }
+        return tmp.empty() ? data : tmp.data();
+    }
+}
 static int g_gifCapFrames = 0;
 static FILE *g_gifCapF = nullptr; // diagnostics: raw GIF capture of exactly one frame (see FLAGDUMP in presentFrame)
 void gifTransfer(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
@@ -223,7 +608,9 @@ void gifTransfer(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
     if (g_gifCapF) { uint32_t hd[2] = {sizeBytes, path}; std::fwrite(hd, 4, 2, g_gifCapF); std::fwrite(data, 1, sizeBytes, g_gifCapF); }
     { const bool iw = std::getenv("SVR06_IMGW") != nullptr || (g_svr06Diag.load() & 1u); if (iw) imgWatch(data, sizeBytes); }
     g_stgGif = 12;
-    s.iface.gif_transfer(path, data, sizeBytes);
+    std::vector<uint8_t> iconTmp;
+    const uint8_t *iconData = ipStream(path, data, sizeBytes, iconTmp);
+    s.iface.gif_transfer(path, iconData, sizeBytes);
     g_stgGif = 0;
 }
 
@@ -273,7 +660,9 @@ void uploadImage(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t 
     std::vector<uint8_t> img(16u + static_cast<size_t>(qwc) * 16u);
     const uint64_t tag[2] = {gifTagLo(qwc, 2, 0), 0};
     std::memcpy(img.data(), tag, 16);
-    std::memcpy(img.data() + 16, data, static_cast<size_t>(qwc) * 16u);
+    std::vector<uint8_t> iconTmp;
+    const uint8_t *iconSrc = ipWhole(bitbltbuf, trxpos, trxreg, trxdir, data, qwc * 16u, iconTmp);
+    std::memcpy(img.data() + 16, iconSrc, static_cast<size_t>(qwc) * 16u);
     s.iface.gif_transfer(2, img.data(), img.size());
 }
 

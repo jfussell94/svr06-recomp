@@ -9,6 +9,7 @@ The presenter polls the console every 15 frames, so replies take ~0.25 s at 60 f
   svrlive.py flag BIT 0|1         debug flag toggle              svrlive.py quit              exit the game now
   svrlive.py watch ADDR [SECS]    poll a word until it changes (15-frame resolution), prints old/new + frame
   svrlive.py obj ADDR             live object check: first word, vtable-like?, 4CC tag, nearby pointers
+  svrlive.py shot [NAME]          screenshot -> analysis\\live\\shots\\NAME.png   svrlive.py perf   fps/presented frames/flags   svrlive.py health   heartbeat age (exit 2 = frozen/not running)
   svrlive.py raw 'cmd1; cmd2'     send arbitrary console lines
 Exit code 2 if the game does not answer (frozen presenter or not running)."""
 import os, sys, time, shutil, struct, re
@@ -64,7 +65,13 @@ def main():
             dst = os.path.join(ROOT, 'analysis', 'dumps', (a[1] if len(a) > 1 else 'live_' + time.strftime('%H%M%S')) + '.bin')
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(src, dst); r += 'copied to %s\n' % dst
-    elif c in ('vramdump', 'frame', 'quit'): r = send([c])
+    elif c in ('vramdump', 'frame', 'quit', 'perf'): r = send([c])
+    elif c == 'shot': r = send(['shot %s' % (a[1] if len(a) > 1 else 'shot_' + time.strftime('%H%M%S'))])   # -> analysis\\live\\shots\\NAME.png (window incl. overlay)
+    elif c == 'health':    # heartbeat written by the presenter once a second: exit 0 alive, 2 stale/missing (frozen presenter or not running)
+        hb = os.path.join(LIVE, 'heartbeat.txt')
+        age = time.time() - os.path.getmtime(hb) if os.path.exists(hb) else 1e9
+        r = (open(hb).read().strip() + ' age=%.1fs\n' % age) if age < 1e8 else 'no heartbeat\n'
+        sys.stdout.write(r); return 0 if age < 5 else 2
     elif c in ('vu1d', 'vu1c', 'vu0d'): r = send(['%s %s %s' % (c, a[1], a[2] if len(a) > 2 else '256')])
     elif c == 'press': r = send(['press %s %s' % (a[1], a[2] if len(a) > 2 else '6')])
     elif c == 'seq': r = send(['seq ' + ' '.join(a[1:])])

@@ -25,6 +25,114 @@ std::atomic<int> g_svr06DrawLimit{-1};
 std::atomic<int> g_svr06DrawCtr{0};
 
 // ============================================================================
+// ISS-161 / CL-0149: controller button-icon sets. The menu button glyphs (cross/circle/square/triangle, L1/R1/L2/R2, sticks, d-pad)
+// live in one 128x256 PSMT8 sheet at GS block 0x1F00 with a 256-entry CT32 CLUT at block 8064. When SVR06_ICONSET names a folder
+// (mods/icons/<set>/glyph_idx.bin + glyph_clut.bin) the host->local upload of exactly that sheet / CLUT is replaced, but only if the
+// uploaded data hashes to the known original (otherwise it is passed through untouched). Off by default (SVR06_ICONSET empty/ps2).
+// SVR06_ICONLOG=1 only logs the two uploads (shape + hash) without changing anything. SVR06_ICONDIR overrides the icon root.
+// ============================================================================
+#include <string>
+namespace
+{
+    struct IconSwapState
+    {
+        bool init = false, on = false, logOnly = false;
+        std::vector<uint8_t> idx, clut, buf;
+        int kind = 0;
+        uint32_t need = 0;
+        int logged = 0;
+    };
+    IconSwapState g_icon;
+    constexpr uint64_t kIconSheetHash = 0xbb1990918f1d6940ull; // FNV-1a 64 of the original 128x256 index raster
+    constexpr uint64_t kIconClutHash = 0xce66efda925b89ddull;  // FNV-1a 64 of the original 16x16 CT32 CLUT raster
+    uint64_t iconFnv(const uint8_t *p, size_t n)
+    {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
+        return h;
+    }
+    bool iconLoad(const std::string &path, std::vector<uint8_t> &out, size_t want)
+    {
+        FILE *f = std::fopen(path.c_str(), "rb");
+        if (!f) return false;
+        out.resize(want);
+        const size_t got = std::fread(out.data(), 1, want, f);
+        char extra;
+        const bool exact = got == want && std::fread(&extra, 1, 1, f) == 0;
+        std::fclose(f);
+        return exact;
+    }
+    void iconInit()
+    {
+        if (g_icon.init) return;
+        g_icon.init = true;
+        const char *log = std::getenv("SVR06_ICONLOG");
+        g_icon.logOnly = log && log[0] && log[0] != '0';
+        const char *set = std::getenv("SVR06_ICONSET");
+        if (!set || !set[0] || std::string(set) == "ps2") return;
+        const char *root = std::getenv("SVR06_ICONDIR");
+        std::string dir = std::string(root && root[0] ? root : "mods/icons") + "/" + set + "/";
+        if (iconLoad(dir + "glyph_idx.bin", g_icon.idx, 32768) && iconLoad(dir + "glyph_clut.bin", g_icon.clut, 1024))
+        {
+            g_icon.on = true;
+            std::fprintf(stderr, "[iconhook] icon set '%s' loaded from %s\n", set, dir.c_str());
+        }
+        else
+            std::fprintf(stderr, "[iconhook] icon set '%s' NOT loaded (need %sglyph_idx.bin 32768 B + glyph_clut.bin 1024 B); original icons stay\n", set, dir.c_str());
+    }
+}
+// called when TRXDIR is written: a new transfer starts, drop any half-collected icon upload
+static void svr06IconXferStart()
+{
+    g_icon.kind = 0;
+    g_icon.buf.clear();
+}
+// returns true when it consumed the data (forwarded to the backend itself)
+static bool svr06IconSwap(GSRasterBackend *be, uint32_t dbp, uint32_t dpsm, uint32_t dsax, uint32_t dsay, uint32_t rrw, uint32_t rrh,
+                          const uint8_t *data, uint32_t size)
+{
+    iconInit();
+    if (!be || (!g_icon.on && !g_icon.logOnly)) return false;
+    if (dbp != 0x1F00u && dbp != 8064u) return false;
+    int kind = 0;
+    uint32_t need = 0;
+    if (dbp == 0x1F00u && dpsm == 0x13u && dsax == 0u && dsay == 0u && rrw == 128u && rrh == 256u) { kind = 1; need = 32768u; }
+    else if (dbp == 8064u && dpsm == 0u && dsax == 0u && dsay == 0u && rrw == 16u && rrh == 16u) { kind = 2; need = 1024u; }
+    if (!kind)
+    {
+        if (g_icon.logged < 40 && size)
+        {
+            ++g_icon.logged;
+            std::fprintf(stderr, "[iconhook] other upload to dbp=%u psm=%u pos=%u,%u size=%ux%u bytes=%u (passed through)\n", dbp, dpsm, dsax, dsay, rrw, rrh, size);
+        }
+        return false;
+    }
+    if (g_icon.kind != kind) { g_icon.kind = kind; g_icon.need = need; g_icon.buf.clear(); }
+    g_icon.buf.insert(g_icon.buf.end(), data, data + size);
+    if (g_icon.buf.size() < need) return true; // keep collecting; forwarded in one piece when complete
+    const uint64_t h = iconFnv(g_icon.buf.data(), need);
+    const bool match = h == (kind == 1 ? kIconSheetHash : kIconClutHash);
+    if (g_icon.logged < 40)
+    {
+        ++g_icon.logged;
+        std::fprintf(stderr, "[iconhook] %s upload complete: hash=%016llx expected=%016llx match=%d bytes=%zu replace=%d\n", kind == 1 ? "sheet" : "clut",
+                     (unsigned long long)h, (unsigned long long)(kind == 1 ? kIconSheetHash : kIconClutHash), match ? 1 : 0, g_icon.buf.size(),
+                     (g_icon.on && match) ? 1 : 0);
+    }
+    if (g_icon.on && match)
+    {
+        std::vector<uint8_t> out = kind == 1 ? g_icon.idx : g_icon.clut;
+        out.insert(out.end(), g_icon.buf.begin() + need, g_icon.buf.end());
+        be->UploadImage(out.data(), (uint32_t)out.size());
+    }
+    else
+        be->UploadImage(g_icon.buf.data(), (uint32_t)g_icon.buf.size());
+    g_icon.kind = 0;
+    g_icon.buf.clear();
+    return true;
+}
+
+// ============================================================================
 // CL-0040: multi-threaded GS ("MTGS").  GIF packets are queued by the EE/VU
 // thread and processed in order on a dedicated GS thread, so rasterization
 // overlaps game logic and VU1.  Every other entry point into the GS from
@@ -1923,6 +2031,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        svr06IconXferStart();
         {
             // Structured summary instead of per-upload logging: skip startup (tick < 3000) and 16x16 macroblock
             // tiles (movie frames); aggregate everything else per (dbp,psm,w,h) and print one line per 500 ticks.
@@ -2175,7 +2284,11 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
     svr06prof::Scope _ps(3);
     if (m_backend)
+    {
+        if (m_trxdir == 0u && svr06IconSwap(m_backend.get(), m_bitbltbuf.dbp, m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh, data, sizeBytes))
+            return;
         m_backend->UploadImage(data, sizeBytes);
+    }
 }
 
 

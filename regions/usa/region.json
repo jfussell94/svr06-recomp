@@ -1,0 +1,10 @@
+{
+  "id": "usa",
+  "name": "North America (NTSC-U)",
+  "serial": "SLUS-21286",
+  "boot_elf": "SLUS_212.86",
+  "recomp_config": "recomp.toml",
+  "status": "in progress: executable recompiles and boots; overlay banks not generated yet",
+  "generated_dir": "out/generated_usa",
+  "build_dir": "build_svr06_usa"
+}

@@ -34,7 +34,10 @@ function(EnableFastReleaseMode TargetName)
         endif()
     endif()
 
-    if(IPO_SUPPORTED)
+    # ISS-153: -DPS2X_NO_LTO=ON = development build: no ThinLTO, so a relink takes seconds instead of ~5 min (slower game code).
+    if(PS2X_NO_LTO)
+        message("> ${TargetName}: LTO disabled (PS2X_NO_LTO)")
+    elseif(IPO_SUPPORTED)
         set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
     else()
         message(WARNING "Interprocedural optimization not supported: ${ipo_error}")

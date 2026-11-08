@@ -3,6 +3,7 @@
 #include <fstream>
 #include <atomic>
 #include "runtime/ps2_vu1.h"
+#include "ps2_vu1_inline.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
@@ -76,6 +77,8 @@ VU1Interpreter::VU1Interpreter(Unit unit)
 void VU1Interpreter::resetScheduler()
 {
     m_flagPipeline = {};
+    m_flagValid = 0u;
+    m_flagFifoHead = 0u; m_flagFifoCount = 0u;
     m_fdiv = {};
     m_efu = {};
     m_storePipeline = {};
@@ -547,21 +550,16 @@ void VU1Interpreter::pushFmacFlags(uint32_t mac, uint32_t status, uint32_t extra
         m_state.status = (m_state.status & 0xFF0u) | current | ((current | extraSticky) << 6);
         return;
     }
-    FlagPipelineEntry *entry = nullptr;
-    for (FlagPipelineEntry &candidate : m_flagPipeline)
-    {
-        if (!candidate.valid)
-        {
-            entry = &candidate;
-            break;
-        }
-    }
-    if (!entry)
+    const uint32_t freeSlots = ~m_flagValid & ((1u << kMaxFlagEntries) - 1u);
+    if (freeSlots == 0u)
     {
         reportReservedInstruction(true, 0xFFFFFFFFu);
         return;
     }
-
+    const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(freeSlots)); // first free slot, as before
+    m_flagValid |= 1u << slot;
+    m_flagFifo[(m_flagFifoHead + m_flagFifoCount++) & 7u] = static_cast<uint8_t>(slot);
+    FlagPipelineEntry *entry = &m_flagPipeline[slot];
     *entry = {};
     entry->valid = true;
     entry->issueCycle = m_cycle;
@@ -574,15 +572,19 @@ void VU1Interpreter::pushFmacFlags(uint32_t mac, uint32_t status, uint32_t extra
     entry->writesStatus = true;
 }
 
+static uint32_t s_cl133Off = 0; // ISS-145 bisect switches (debug flags 17..22), set per run in runFast
 void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
 {
     if (m_fast && !m_fastExact)
     {   // ISS-144: vectorised normalise + flags (bit-identical, tested against the scalar code)
         uint32_t mac, status;
-        if (vu1fast::fmacNormalizeFlags(result, dest, mac, status))
+        if (s_cl133Off & 32u)
+        {   // ISS-145 bisect (flag 22): pre-CL-0133 store
+            if (vu1fast::fmacNormalizeFlags(result, dest, mac, status)) { if (!m_skipFlags) pushFmacFlags(mac, status, 0u); applyDest(dst, result, dest); }
+        }
+        else if (vu1fast::fmacFinish(dst, result, dest, mac, status))
         {
-            pushFmacFlags(mac, status, 0u);
-            applyDest(dst, result, dest);
+            if (!m_skipFlags) pushFmacFlags(mac, status, 0u);
         }
         return;
     }
@@ -597,10 +599,13 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
     if (m_fast && !m_fastExact)
     {
         uint32_t mac, status;
-        if (vu1fast::fmacNormalizeFlags(result, dest, mac, status))
+        if (s_cl133Off & 32u)
         {
-            pushFmacFlags(mac, status, 0u);
-            applyDestAcc(result, dest);
+            if (vu1fast::fmacNormalizeFlags(result, dest, mac, status)) { if (!m_skipFlags) pushFmacFlags(mac, status, 0u); applyDestAcc(result, dest); }
+        }
+        else if (vu1fast::fmacFinish(m_state.acc, result, dest, mac, status))
+        {
+            if (!m_skipFlags) pushFmacFlags(mac, status, 0u);
         }
         return;
     }
@@ -629,6 +634,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
         {
             entry = {};
             entry.valid = true;
+            { const uint32_t slot = static_cast<uint32_t>(&entry - m_flagPipeline.data()); m_flagValid |= 1u << slot; m_flagFifo[(m_flagFifoHead + m_flagFifoCount++) & 7u] = static_cast<uint8_t>(slot); }
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
             if (entry.readyCycle < m_minReady) m_minReady = entry.readyCycle; m_pendMask |= 1u;
@@ -654,6 +660,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
         {
             entry = {};
             entry.valid = true;
+            { const uint32_t slot = static_cast<uint32_t>(&entry - m_flagPipeline.data()); m_flagValid |= 1u << slot; m_flagFifo[(m_flagFifoHead + m_flagFifoCount++) & 7u] = static_cast<uint8_t>(slot); }
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
             if (entry.readyCycle < m_minReady) m_minReady = entry.readyCycle; m_pendMask |= 1u;
@@ -684,6 +691,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
         {
             entry = {};
             entry.valid = true;
+            { const uint32_t slot = static_cast<uint32_t>(&entry - m_flagPipeline.data()); m_flagValid |= 1u << slot; m_flagFifo[(m_flagFifoHead + m_flagFifoCount++) & 7u] = static_cast<uint8_t>(slot); }
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
             if (entry.readyCycle < m_minReady) m_minReady = entry.readyCycle; m_pendMask |= 1u;
@@ -872,14 +880,27 @@ void VU1Interpreter::commitReadyPipelines()
     uint64_t nm = UINT64_MAX;
     const uint32_t pm = m_pendMask;
     uint32_t keep = 0u;
+    uint32_t readyFlags = 0u;
     if (pm & 1u)
-    for (FlagPipelineEntry &entry : m_flagPipeline)
-    {
-        if (!entry.valid || entry.readyCycle > m_cycle)
+    {   // CL-0133: ready entries are a prefix of the push-order FIFO; apply them in slot order (as the full scan did)
+        while (m_flagFifoCount != 0u && m_flagPipeline[m_flagFifo[m_flagFifoHead]].readyCycle <= m_cycle)
         {
-            if (entry.valid) { keep |= 1u; if (entry.readyCycle < nm) nm = entry.readyCycle; }
-            continue;
+            readyFlags |= 1u << m_flagFifo[m_flagFifoHead];
+            m_flagFifoHead = (m_flagFifoHead + 1u) & 7u;
+            --m_flagFifoCount;
         }
+        if (m_flagFifoCount != 0u)
+        {
+            keep |= 1u;
+            const uint64_t r = m_flagPipeline[m_flagFifo[m_flagFifoHead]].readyCycle;
+            if (r < nm) nm = r;
+        }
+    }
+    for (uint32_t bits = readyFlags; bits != 0u; bits &= bits - 1u)
+    {
+        const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(bits));
+        FlagPipelineEntry &entry = m_flagPipeline[slot];
+        m_flagValid &= ~(1u << slot);
 
         if (entry.writesMac)
             m_state.mac = entry.mac;
@@ -1028,6 +1049,96 @@ void VU1Interpreter::progressXgkick()
         }
     };
 
+    if (m_fast && !(s_cl133Off & 16u))
+    {   // CL-0133: the fast path completes the whole XGKICK inside startXgkick, so cycle credits are irrelevant: walk the GIF tags
+        // and copy whole runs at once (same packet bytes, same totalBytes, same failure checks in the same order as below).
+        const uint32_t sz = m_activeVuDataSize;
+        const bool pow2 = (sz & (sz - 1u)) == 0u;
+        auto copyRun = [&](uint32_t dstOff, uint32_t bytes) {   // bytes from source + dstOff, wrapping like the per-qword copy
+            uint32_t done = 0;
+            while (done < bytes)
+            {
+                const uint32_t start = m_xgkick.sourceAddress + dstOff + done;
+                const uint32_t off = pow2 ? (start & (sz - 1u)) : (start % sz);
+                uint32_t n = bytes - done;
+                if (off + n > sz) n = sz - off;
+                if (n >= 16u)
+                {
+                    n &= ~15u;
+                    std::memcpy(m_xgkick.packet.data() + dstOff + done, m_activeVuData + off, n);
+                }
+                else
+                {   // a qword straddling the end of VU memory: byte-wise with modulo, as the original
+                    for (uint32_t i = 0; i < 16u; ++i)
+                        m_xgkick.packet[dstOff + done + i] = m_activeVuData[(start + i) % sz];
+                    n = 16u;
+                }
+                done += n;
+            }
+        };
+        while (m_xgkick.active)
+        {
+            if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
+            {
+                xgFail(0xFFFFFFFBu); reportReservedInstruction(false, 0xFFFFFFFBu);
+                m_xgkick.active = false;
+                return;
+            }
+            const uint32_t qwordOffset = m_xgkick.copiedBytes;
+            if (m_xgkick.currentTagEnd == 0u)
+            {
+                copyRun(qwordOffset, 16u);
+                m_xgkick.copiedBytes += 16u;
+                uint64_t tagLo = 0;
+                std::memcpy(&tagLo, m_xgkick.packet.data() + qwordOffset, sizeof(tagLo));
+                const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+                const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+                uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+                if (nreg == 0u)
+                    nreg = 16u;
+                uint64_t tagBytes = 16u;
+                if (format == 0u)
+                    tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
+                else if (format == 1u)
+                    tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
+                else if (format == 2u)
+                    tagBytes += static_cast<uint64_t>(nloop) * 16u;
+                else
+                {
+                    xgFail(0xFFFFFFF8u); reportReservedInstruction(false, 0xFFFFFFF8u);
+                    m_xgkick.active = false;
+                    return;
+                }
+                if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
+                {
+                    xgFail(0xFFFFFFFBu); reportReservedInstruction(false, 0xFFFFFFFBu);
+                    m_xgkick.active = false;
+                    return;
+                }
+                m_xgkick.currentTagEnd = qwordOffset + static_cast<uint32_t>(tagBytes);
+                m_xgkick.currentTagEop = ((tagLo >> 15) & 1u) != 0u;
+                if (m_xgkick.currentTagEop)
+                    m_xgkick.totalBytes = m_xgkick.currentTagEnd;
+            }
+            else
+            {   // the rest of this tag's data in one copy (tagEnd <= kBufferSize, so the overflow check cannot fire inside it)
+                const uint32_t rest = (m_xgkick.currentTagEnd - qwordOffset + 15u) & ~15u;
+                copyRun(qwordOffset, rest);
+                m_xgkick.copiedBytes += rest;
+            }
+            if (m_xgkick.copiedBytes >= m_xgkick.currentTagEnd)
+            {
+                if (m_xgkick.currentTagEop)
+                    finishXgkick();
+                else
+                {
+                    m_xgkick.currentTagEnd = 0u;
+                    m_xgkick.currentTagEop = false;
+                }
+            }
+        }
+        return;
+    }
     ++m_xgkick.cycleCredit;
     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
     {
@@ -1740,6 +1851,94 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
     if (!decoded.iBit)
         decoded.lowerUsage = decodeLowerUsage(decoded.lower);
 
+    decoded.anyReserved = decoded.upperUsage.reserved || decoded.lowerUsage.reserved;
+    {   // CL-0133: pre-decoded fast forms (must mirror execUpperFast / execLowerFast exactly)
+        const uint32_t up = decoded.upper;
+        if ((up & 0x7FFu) == 0x2FFu) decoded.uKind = 1;
+        else
+        {
+            const uint32_t op = up & 0x3Fu;
+            int kind = -1, src = -1; bool toAcc = false;
+            auto cls = [&](uint32_t code) {
+                if (code < 0x10u) { kind = static_cast<int>(code >> 2); src = static_cast<int>(code & 3u); return; }
+                if (code >= 0x18u && code <= 0x1Bu) { kind = 4; src = static_cast<int>(code & 3u); return; }
+                switch (code)
+                {
+                case 0x1C: kind = 4; src = 5; break; case 0x1E: kind = 4; src = 6; break;
+                case 0x20: kind = 0; src = 5; break; case 0x21: kind = 2; src = 5; break;
+                case 0x22: kind = 0; src = 6; break; case 0x23: kind = 2; src = 6; break;
+                case 0x24: kind = 1; src = 5; break; case 0x25: kind = 3; src = 5; break;
+                case 0x26: kind = 1; src = 6; break; case 0x27: kind = 3; src = 6; break;
+                case 0x28: kind = 0; src = 4; break; case 0x29: kind = 2; src = 4; break;
+                case 0x2A: kind = 4; src = 4; break; case 0x2C: kind = 1; src = 4; break;
+                case 0x2D: kind = 3; src = 4; break;
+                default: break;
+                }
+            };
+            if (op < 0x3Cu) cls(op);
+            else { cls((up & 0x3u) | ((up >> 4) & 0x7Cu)); toAcc = true; }
+            decoded.uDest = static_cast<uint8_t>((up >> 21) & 0xFu); decoded.uFt = static_cast<uint8_t>((up >> 16) & 0x1Fu);
+            decoded.uFs = static_cast<uint8_t>((up >> 11) & 0x1Fu); decoded.uFd = static_cast<uint8_t>((up >> 6) & 0x1Fu);
+            if (kind < 0)
+            {   // non-flag ops: ITOF/FTOI/ABS (special group) and MAX/MINI
+                if (op >= 0x3Cu)
+                {
+                    const uint32_t sp = (up & 0x3u) | ((up >> 4) & 0x7Cu);
+                    if (sp >= 0x10u && sp <= 0x13u) { decoded.uKind = 3; decoded.uOp = static_cast<uint8_t>(sp & 3u); }
+                    else if (sp >= 0x14u && sp <= 0x17u) { decoded.uKind = 4; decoded.uOp = static_cast<uint8_t>(sp & 3u); }
+                    else if (sp == 0x1Du) decoded.uKind = 7;
+                }
+                else if (op >= 0x10u && op <= 0x17u) { decoded.uKind = op < 0x14u ? 5 : 6; decoded.uSrc = static_cast<uint8_t>(op & 3u); }
+                else if (op == 0x1Du || op == 0x1Fu) { decoded.uKind = op == 0x1Du ? 5 : 6; decoded.uSrc = 6; }
+                else if (op == 0x2Bu || op == 0x2Fu) { decoded.uKind = op == 0x2Bu ? 5 : 6; decoded.uSrc = 4; }
+            }
+            if (kind >= 0)
+            {
+                decoded.uKind = 2; decoded.uOp = static_cast<uint8_t>(kind); decoded.uSrc = static_cast<uint8_t>(src); decoded.uAcc = toAcc;
+                decoded.uDest = static_cast<uint8_t>((up >> 21) & 0xFu); decoded.uFt = static_cast<uint8_t>((up >> 16) & 0x1Fu);
+                decoded.uFs = static_cast<uint8_t>((up >> 11) & 0x1Fu); decoded.uFd = static_cast<uint8_t>((up >> 6) & 0x1Fu);
+            }
+        }
+        const uint32_t lo = decoded.lower;
+        if (!decoded.iBit)
+        {
+            const uint32_t opHi = (lo >> 25) & 0x7Fu;
+            decoded.lDest = static_cast<uint8_t>((lo >> 21) & 0xFu);
+            if (lo == 0u || lo == 0x8000033Cu) decoded.lKind = 1;
+            else if (opHi == 0x00u) { decoded.lKind = 2; decoded.lA = static_cast<uint8_t>((lo >> 16) & 0x1Fu); decoded.lB = static_cast<uint8_t>((lo >> 11) & 0xFu); decoded.lImm = static_cast<int16_t>(static_cast<int32_t>(lo << 21) >> 21); }
+            else if (opHi == 0x01u) { decoded.lKind = 3; decoded.lA = static_cast<uint8_t>((lo >> 11) & 0x1Fu); decoded.lB = static_cast<uint8_t>((lo >> 16) & 0xFu); decoded.lImm = static_cast<int16_t>(static_cast<int32_t>(lo << 21) >> 21); }
+            else if (opHi == 0x28u || opHi == 0x29u || (opHi >= 0x2Cu && opHi <= 0x2Fu) || opHi == 0x20u || opHi == 0x21u)
+            {   // CL-0133: B/BAL/IBEQ/IBNE/IBLTZ/IBGTZ/IBLEZ/IBGEZ (JR/JALR stay generic)
+                decoded.lKind = opHi == 0x28u ? 14 : opHi == 0x29u ? 15 : opHi == 0x2Cu ? 16 : opHi == 0x2Du ? 17 : opHi == 0x2Eu ? 18 : opHi == 0x2Fu ? 19 : opHi == 0x20u ? 20 : 21;
+                decoded.lA = static_cast<uint8_t>((lo >> 16) & 0xFu); decoded.lB = static_cast<uint8_t>((lo >> 11) & 0xFu);
+                decoded.lImm = static_cast<int16_t>(static_cast<int32_t>(lo << 21) >> 21);
+            }
+            else if (opHi == 0x08u || opHi == 0x09u) { decoded.lKind = opHi == 0x08u ? 4 : 5; decoded.lA = static_cast<uint8_t>((lo >> 16) & 0xFu); decoded.lB = static_cast<uint8_t>((lo >> 11) & 0xFu); decoded.lImm = static_cast<int16_t>((int16_t)(lo & 0x7FF) | ((lo >> 10) & 0x7800)); }
+            else if (opHi == 0x40u)
+            {
+                const uint32_t funct = lo & 0x3Fu;
+                const uint8_t viT = static_cast<uint8_t>((lo >> 16) & 0xFu), viS = static_cast<uint8_t>((lo >> 11) & 0xFu), viD = static_cast<uint8_t>((lo >> 6) & 0xFu);
+                if (funct == 0x30u || funct == 0x31u || funct == 0x34u || funct == 0x35u)
+                { decoded.lKind = funct == 0x30u ? 6 : funct == 0x31u ? 7 : funct == 0x34u ? 9 : 10; decoded.lA = viD; decoded.lB = viS; decoded.lC = viT; }
+                else if (funct == 0x32u)
+                { decoded.lKind = 8; decoded.lA = viT; decoded.lB = viS; decoded.lImm = (int16_t)((int32_t)((lo >> 6) & 0x1F) << 27 >> 27); }
+                else if (funct >= 0x3Cu)
+                {
+                    const uint32_t f2 = (lo & 0x3u) | ((lo >> 4) & 0x7Cu);
+                    const uint8_t vfT = static_cast<uint8_t>((lo >> 16) & 0x1Fu), vfS = static_cast<uint8_t>((lo >> 11) & 0x1Fu);
+                    if (f2 == 0x34u) { decoded.lKind = 11; decoded.lA = vfT; decoded.lB = viS; }
+                    else if (f2 == 0x35u) { decoded.lKind = 12; decoded.lA = vfS; decoded.lB = viT; }
+                    else if (f2 == 0x30u) { decoded.lKind = 13; decoded.lA = vfT; decoded.lB = vfS; }
+                }
+            }
+        }
+    }
+    decoded.ctlBits = decoded.dBit || decoded.tBit || decoded.eBit;
+    decoded.fdivOrWaitQ = decoded.lowerUsage.pipeline == PipelineFdiv || decoded.lowerUsage.waitQ;
+    decoded.delayViReg = 0u;
+    if (decoded.lowerUsage.delaysNextBranchRead)
+        for (uint32_t reg = 1; reg < 16u; ++reg)
+            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u) { decoded.delayViReg = static_cast<uint8_t>(reg); break; }
     const uint8_t upperWriteReg = decoded.upperUsage.vfWrite.reg;
     if (upperWriteReg != 0u && (vfReadLanes(decoded.lowerUsage, upperWriteReg) != 0u || decoded.lowerUsage.vfWrite.reg == upperWriteReg))
     {
@@ -1788,6 +1987,72 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
     if (pairIndex >= kMaxDecodedPairs)
         return decodeInstructionPair(vuCode, pc);
     return decodedEntry(vuCode, pairIndex);
+}
+
+static uint64_t s_nSkipRuns = 0, s_nFlagRuns = 0;
+// CL-0132: true when no instruction reachable from startPC reads or writes a flag register (FMAND/FSAND/FCAND family, CLIP) and no
+// indirect jump leaves the scanned region. Mirrors tools/vu1_progstat.py.
+bool VU1Interpreter::programReadsNoFlags(const uint8_t *vuCode, uint32_t startPC)
+{
+    uint8_t seen[kMaxDecodedPairs] = {0};
+    uint32_t stack[64]; int sp = 0;
+    stack[sp++] = (startPC >> 3) & (kMaxDecodedPairs - 1u);
+    uint32_t budget = 4096u;
+    while (sp > 0)
+    {
+        uint32_t p = stack[--sp];
+        while (p < kMaxDecodedPairs && !seen[p])
+        {
+            if (budget-- == 0u) return false;
+            seen[p] = 1;
+            uint32_t w[2]; std::memcpy(w, vuCode + p * 8u, 8u);
+            const uint32_t lower = w[0], upper = w[1];
+            const bool iBit = (upper & 0x80000000u) != 0u, eBit = (upper & 0x40000000u) != 0u;
+            const uint32_t op = upper & 0x3Fu;
+            if (op == 0x3Fu && ((upper >> 6) & 0x1Fu) == 7u) return false; // CLIP
+            bool uncond = false;
+            if (!iBit && lower != 0u && lower != 0x8000033Cu)
+            {
+                const uint32_t hi = (lower >> 25) & 0x7Fu;
+                if (hi >= 0x10u && hi <= 0x1Cu) return false;          // FC*/FS*/FM* flag ops
+                if (hi == 0x24u || hi == 0x25u) return false;          // JR/JALR: unknown target
+                if (hi == 0x20u || hi == 0x21u || (hi >= 0x28u && hi <= 0x2Fu))
+                {
+                    int32_t imm = static_cast<int32_t>(lower & 0x7FFu); if (imm & 0x400) imm -= 0x800;
+                    const int32_t tgt = static_cast<int32_t>(p) + 1 + imm;
+                    if (tgt < 0 || tgt >= static_cast<int32_t>(kMaxDecodedPairs) || sp >= 64) return false;
+                    stack[sp++] = static_cast<uint32_t>(tgt);
+                    uncond = (hi == 0x20u || hi == 0x21u);
+                }
+            }
+            if (eBit)
+            {   // delay slot executes, then the program ends
+                if (p + 1u < kMaxDecodedPairs && !seen[p + 1u])
+                {
+                    seen[p + 1u] = 1;
+                    uint32_t w2[2]; std::memcpy(w2, vuCode + (p + 1u) * 8u, 8u);
+                    const uint32_t u2 = w2[1], l2 = w2[0];
+                    if ((u2 & 0x3Fu) == 0x3Fu && ((u2 >> 6) & 0x1Fu) == 7u) return false;
+                    if (!(u2 & 0x80000000u) && l2 != 0u) { const uint32_t h2 = (l2 >> 25) & 0x7Fu; if ((h2 >= 0x10u && h2 <= 0x1Cu) || h2 == 0x24u || h2 == 0x25u) return false; }
+                }
+                break;
+            }
+            if (uncond)
+            {   // branch delay slot at p+1 runs before the jump
+                if (p + 1u < kMaxDecodedPairs && !seen[p + 1u])
+                {
+                    seen[p + 1u] = 1;
+                    uint32_t w2[2]; std::memcpy(w2, vuCode + (p + 1u) * 8u, 8u);
+                    const uint32_t u2 = w2[1], l2 = w2[0];
+                    if ((u2 & 0x3Fu) == 0x3Fu && ((u2 >> 6) & 0x1Fu) == 7u) return false;
+                    if (!(u2 & 0x80000000u) && l2 != 0u) { const uint32_t h2 = (l2 >> 25) & 0x7Fu; if ((h2 >= 0x10u && h2 <= 0x1Cu) || h2 == 0x24u || h2 == 0x25u) return false; }
+                }
+                break;
+            }
+            ++p;
+        }
+    }
+    return true;
 }
 
 const VU1Interpreter::DecodedInstructionPair &VU1Interpreter::decodedEntry(const uint8_t *vuCode, uint32_t pairIndex)
@@ -2209,6 +2474,16 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
         const int fl = g_svr06Flags.load();
         m_fastPipe = !(fl & 2048);
         m_fastExact = (fl & 4096) != 0;
+        m_skipFlags = false;
+        s_cl133Off = ((fl & (1 << 29)) ? 0x3Fu : 0u) | ((fl >> 17) & 0xFFF); // ISS-151 (2026-11-07): CL-0133 ON by default again (freeze cause found: branch handlers were missing from the Windows ps2_vu1_inline.h); debug flag 29 now turns the speed-ups OFF // ISS-145: CL-0133 speed-ups OFF by default until the freeze is found; debug flag 29 re-enables them // + bits 23..28: generic execLower for LQ / SQ / IALU / LQI+SQI / MOVE / branches // ISS-145 bisect: 17 lower inline, 18 upper inline, 19 inline commit, 20 halt skip, 21 XGKICK fast copy
+        if ((fl & 65536) != 0 && m_fastPipe && !m_fastExact && m_unit == Unit::VU1 && memory != nullptr && vuCode == memory->getVU1Code())
+        {   // CL-0132 (flag 16): skip MAC/status bookkeeping for programs that never read flags; result cached per start PC and code generation
+            const uint32_t pi = (m_state.pc >> 3) & (kMaxDecodedPairs - 1u);
+            const uint64_t gen = memory->getVU1CodeGeneration() + 1u;
+            if (m_noFlagGen[pi] != gen) { m_noFlagVal[pi] = programReadsNoFlags(vuCode, m_state.pc) ? 1u : 0u; m_noFlagGen[pi] = gen; }
+            m_skipFlags = m_noFlagVal[pi] != 0u;
+            if (m_skipFlags) ++s_nSkipRuns; else ++s_nFlagRuns;
+        }
     }
 
     const int previousRoundingMode = std::fegetround();
@@ -2350,7 +2625,7 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
             m_viBranchBackupValid = false;
             runawayStage = 0;
         }
-        if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
+        if (decoded.anyReserved)
         {
             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
             break;
@@ -2359,27 +2634,17 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
         if (m_fastPipe)
         {
             // DIV/SQRT/RSQRT/WAITQ interlock on an in-flight Q result.
-            if ((decoded.lowerUsage.pipeline == PipelineFdiv || decoded.lowerUsage.waitQ) &&
-                m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
+            if (decoded.fdivOrWaitQ && m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
                 m_cycle = m_fdiv.readyCycle;
             if (m_cycle >= m_minReady)
-                commitReadyPipelines();
-        }
-
-        uint8_t writtenVi = 0u;
-        int32_t oldVi = 0;
-        if (decoded.lowerUsage.delaysNextBranchRead)
-        {
-            for (uint32_t reg = 1; reg < 16u; ++reg)
             {
-                if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
-                {
-                    writtenVi = static_cast<uint8_t>(reg);
-                    oldVi = m_state.vi[reg];
-                    break;
-                }
+                if ((m_pendMask & ~1u) == 0u && !(s_cl133Off & 4u)) commitFlagsOnlyInl(); // CL-0133: flags/FDIV only (always in the fast path), same result
+                else commitReadyPipelines();
             }
         }
+
+        const uint8_t writtenVi = decoded.delayViReg;
+        const int32_t oldVi = writtenVi != 0u ? m_state.vi[writtenVi] : 0;
 
         if (decoded.iBit)
         {
@@ -2400,9 +2665,22 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
             std::memcpy(m_state.vf[decoded.upperVfShadowReg], upperVf, sizeof(upperVf));
         }
         else
-        {
-            execUpper(decoded.upper);
-            execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+        {   // CL-0133: inline fast handlers for the common ops, generic handlers otherwise (same order: upper, then lower)
+            if (s_cl133Off & 2u) execUpper(decoded.upper);
+            else if (decoded.uKind == 1u) m_currentUpperInstruction = decoded.upper;
+            else if (decoded.uKind == 2u && !m_fastExact) { m_currentUpperInstruction = decoded.upper; execUpperPre(decoded); }
+            else if (decoded.uKind >= 3u) { m_currentUpperInstruction = decoded.upper; execUpperPreNoFlags(decoded); }
+            else execUpper(decoded.upper);
+            uint32_t lkOff = 0u;
+            if (decoded.lKind >= 2u)
+            {
+                const uint32_t k = decoded.lKind;
+                const uint32_t grp = k == 2u ? 6u : k == 3u ? 7u : k <= 10u ? 8u : k <= 12u ? 9u : k == 13u ? 10u : 11u;
+                lkOff = (s_cl133Off >> grp) & 1u;
+            }
+            if ((s_cl133Off & 1u) || lkOff) execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
+            else if (decoded.lKind >= 2u) execLowerPre(decoded, vuData, dataSize);
+            else if (decoded.lKind == 0u) execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
         }
 
         m_viBranchBackupValid = false;
@@ -2433,6 +2711,11 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
             }
         }
 
+        if (!decoded.ctlBits && !m_state.haltAfterDelaySlot && !m_state.ebit && !(s_cl133Off & 8u))
+        {   // CL-0133: no D/T/E bit and no pending end: the halt/end chain below would do nothing
+            ++m_cycle;
+            continue;
+        }
         const bool dHalt = decoded.dBit && m_state.dBitEnabled;
         const bool tHalt = decoded.tBit && m_state.tBitEnabled;
         const bool haltBit = dHalt || tHalt;
@@ -2483,6 +2766,18 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
             std::fprintf(stderr, "\n");
             svr06PrintVifEvents("[spin]", 6u);
         }
+        static int s_spinDump = 0;
+        if (dbgRings && s_preValid && s_preStart == m_spinStart && s_spinDump < 6)
+        {   // CL-0134 diag (flag 13): exact input of a spinning run (state + VU data at run start + code) for offline replay
+            char np[96]; std::snprintf(np, sizeof np, "analysis/live/vu1spin_%d.bin", s_spinDump++);
+            if (FILE *f = std::fopen(np, "wb"))
+            {
+                const uint32_t hdr[8] = {0x31555644u, (uint32_t)sizeof(VU1State), s_preStart, s_preState.pc, (uint32_t)s_viaResume, 0u, codeSize, dataSize};
+                std::fwrite(hdr, 4, 8, f); std::fwrite(&s_preState, sizeof(VU1State), 1, f); std::fwrite(m_spinVi, 4, 16, f);
+                std::fwrite(s_preData, 1, 16384u, f); std::fwrite(vuCode, 1, codeSize, f); std::fclose(f);
+                std::fprintf(stderr, "[vu1spin] wrote %s startPC=%x\n", np, s_preStart);
+            }
+        }
     }
     if (programEnded)
     {
@@ -2517,7 +2812,7 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
                 std::fprintf(stderr, "\n");
                 std::memset(s_hTsc, 0, sizeof s_hTsc); std::memset(s_hRuns, 0, sizeof s_hRuns); std::memset(s_hCyc, 0, sizeof s_hCyc);
             }
-            std::fprintf(stderr, "[vufast3] lazyDecodes=%llu\n", (unsigned long long)s_nLazyDec); s_nLazyDec = 0;
+            std::fprintf(stderr, "[vufast3] lazyDecodes=%llu noflagRuns=%llu flagRuns=%llu\n", (unsigned long long)s_nLazyDec, (unsigned long long)s_nSkipRuns, (unsigned long long)s_nFlagRuns); s_nLazyDec = 0; s_nSkipRuns = s_nFlagRuns = 0;
             s_tRun = s_tProg = s_tSubmit = s_nPkt = s_bytesPkt = 0;
             s_runs = s_cyc = s_ns = s_spins = 0; s_xgOk = s_xgFail = s_xgFailF8 = 0; s_last = nowMs;
         }

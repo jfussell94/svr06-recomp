@@ -1,3 +1,4 @@
+#include <ctime>
 #include <mutex>
 #include <functional>
 #include <atomic>
@@ -1499,6 +1500,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        // ISS-150 (2026-11-07): mark the stop. Without this, a call that stops HERE leaves ctx->pc == targetPc, and when the
+        // enclosing dispatch has the same entry (recursion, e.g. the motion-node walk 0x104FC0 -> node vt[0x14] = 0x104FC0)
+        // the "pc == entry => native stub returned" rule below treated the half-run callee as finished: the caller (chara
+        // update 0x23AC90) continued at 0x23AD34 with the callee's s0/sp/ra (s0 = sibling node 0x13F2990, ra = 0x10500C),
+        // overwrote MoHo node 0x13F2A70 (ISS-147) and later returned through a bad stack slot (ISS-149 pc=0x5).
+        t_eeCheckpointHit = true;
         return false;
     }
 
@@ -1635,7 +1642,7 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
         return;
     }
 
-    { extern std::atomic<uint8_t *> g_svr06Vu0Data; g_svr06Vu0Data.store(vu0Data); }
+    { extern std::atomic<uint8_t *> g_svr06Vu0Data; g_svr06Vu0Data.store(vu0Data); extern std::atomic<uint8_t *> g_svr06Vu0Code; g_svr06Vu0Code.store(vu0Code); }
     static __m128 s_vu0In[32]; static uint32_t s_vu0InVi[16];
     for (int r = 0; r < 32; ++r) s_vu0In[r] = ctx->vu0_vf[r];
     for (int r = 0; r < 16; ++r) s_vu0InVi[r] = ctx->vi[r];
@@ -2859,6 +2866,12 @@ void PS2Runtime::run()
             ++s_frames;
             const double now = GetTime();
             if (now - s_t0 >= 0.5) { s_fps = static_cast<int>(s_frames / (now - s_t0) + 0.5); s_frames = 0; s_t0 = now; }
+            { // ISS-146 control channel: heartbeat (watchdog / launcher) + perf numbers for `svrlive perf`
+                extern std::atomic<int> g_svr06PerfFps; extern std::atomic<uint64_t> g_svr06PerfPresented;
+                g_svr06PerfFps.store(s_fps); g_svr06PerfPresented.fetch_add(1);
+                static double s_hb = 0.0;
+                if (now - s_hb >= 1.0) { s_hb = now; if (FILE *hf = std::fopen("analysis/live/heartbeat.txt", "w")) { std::fprintf(hf, "fps=%d presented=%llu vsync=%llu time=%lld\n", s_fps, (unsigned long long)g_svr06PerfPresented.load(), (unsigned long long)eeScheduler().currentVSyncTick(), (long long)std::time(nullptr)); std::fclose(hf); } }
+            }
             if (ps2settings::getInt("graphics.showFps", 1))
             {
                 // run clock + frame counters: lets screenshots and logs be matched to the moment a bug happens (see the [shot]/[clock] log lines)
@@ -2880,6 +2893,8 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
+        { extern std::atomic<bool> g_svr06ShotPending; extern char g_svr06ShotPath[260];
+          if (g_svr06ShotPending.exchange(false)) { { Image im = LoadImageFromScreen(); ExportImage(im, g_svr06ShotPath); UnloadImage(im); } /* not TakeScreenshot(): it drops the folder part of the path */ std::fprintf(stderr, "[ctl] screenshot %s\n", g_svr06ShotPath); } } // ISS-146: svrlive shot
         EndDrawing();
 
         if (WindowShouldClose())

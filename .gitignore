@@ -1,26 +1,53 @@
-# Never commit game material
+# Never commit game data or anything derived from it
+assets/*
+!assets/.gitkeep
+analysis/*
+!analysis/.gitkeep
+mods/*
+!mods/.gitkeep
+out/
+build/
+build_*/
+dist/
+third_party/
+PS2Recomp_*/
+config/launcher_prefs.json
+config/launcher_profile/
 *.elf
 *.iso
 *.bin
-*.afs
 *.pac
-*.pss
+*.afs
+*.irx
+*.tm2
 *.adx
-*.mp3
-*.wav
+*.sfd
+*.tar.gz
+*.tgz
+*.zip
+*.ppm
+*.pgm
+*.clut
+*.png
+*.rgba
 SLES_*
 SLUS_*
-assets/
-Custom Music/
-# Generated recompiler output and build products
+SCES_*
+SCUS_*
+SLPM_*
+# Generated from the game by ps2_recomp (produced locally)
 PS2Recomp/ps2xRuntime/src/runner/
-out/
-overrides/
-analysis/
-build*/
+overrides/sub_*.cpp
+overrides/entry_*.cpp
+overrides/ovl*.cpp
+overrides/ovx*.cpp
+overrides/*_functions.h
+overrides/svr06_ovl*.cpp
+overrides/svr06_ovx*.cpp
+# Editor/OS
+*.orig
 *.bak*
+.vs/
+.vscode/
 __pycache__/
-*.pyc
-*.log
-# Third-party checkout
-PS2Recomp/ps2xRuntime/third_party/parallel-gs/
+Thumbs.db

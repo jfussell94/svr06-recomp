@@ -1,6 +1,11 @@
 #include "svr06_prof.h"
 void svr06MtgsWaitIdle();
 #include <thread>
+#include <mutex>
+#include <set>
+#include <tuple>
+static void svr06SysLog(char kind, int cur, int a, int b);
+#include <ctime>
 #include <map>
 #include <vector>
 #include <atomic>
@@ -581,6 +586,7 @@ int EeScheduler::terminateThread(int id, uint32_t &ownedStack, bool interruptSaf
 int EeScheduler::suspendThread(int id, bool interruptSafe)
 {
     assertExecutor();
+    svr06SysLog('U', m_currentThreadId, id, 0);
     if (id == 0)
     {
         id = m_currentThreadId;
@@ -627,6 +633,7 @@ int EeScheduler::suspendThread(int id, bool interruptSafe)
 int EeScheduler::resumeThread(int id, bool interruptSafe)
 {
     assertExecutor();
+    svr06SysLog('R', m_currentThreadId, id, 0);
     if (id == 0)
     {
         return KE_ILLEGAL_THID;
@@ -663,6 +670,7 @@ void EeScheduler::sleepCurrent()
     assertExecutor();
     GuestThread *self = currentThread();
     assert(self != nullptr);
+    svr06SysLog('Z', m_currentThreadId, (int)self->wakeupCount, 0);
     if (self->wakeupCount != 0u)
     {
         --self->wakeupCount;
@@ -684,6 +692,7 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     {
         return KE_UNKNOWN_THID;
     }
+    svr06SysLog(interruptSafe ? 'w' : 'W', m_currentThreadId, id, (int)target->status);
     if (target->status == EeThreadStatus::Dormant)
     {
         return KE_DORMANT;
@@ -884,6 +893,29 @@ int EeScheduler::deleteSemaphore(int id, bool interruptSafe)
     return id;
 }
 
+
+// ISS-157: boot-time thread event log (first N events), written to analysis/syslog_boot_<time>.txt when full.
+static void svr06SysLog(char kind, int cur, int a, int b)
+{
+    static std::mutex mtx; static uint32_t n = 0; static char (*buf)[48] = nullptr;
+    const uint32_t kMax = 6000;
+    std::lock_guard<std::mutex> lk(mtx);
+    {   // novel-event timeline: first occurrence of each (kind,cur,a,b) tuple, with frame counter (= iSignal count)
+        static std::set<std::tuple<char,int,int,int>> seen; static uint64_t frames = 0; static FILE *nf = nullptr;
+        if (kind == 'I') ++frames;
+        if (!nf) { char nn[96]; std::snprintf(nn, sizeof nn, "analysis/syslog_novel_%lld.txt", (long long)std::time(nullptr)); nf = std::fopen(nn, "w"); }
+        if (nf && seen.insert(std::make_tuple(kind, cur, a, kind == 'S' || kind == 'I' ? 0 : b)).second)
+        { std::fprintf(nf, "f=%llu %c cur=%d a=%d b=%d\n", (unsigned long long)frames, kind, cur, a, b); std::fflush(nf); }
+    }
+    if (n >= kMax) return;
+    if (!buf) buf = new char[kMax][48];
+    std::snprintf(buf[n], 48, "%c cur=%d a=%d b=%d", kind, cur, a, b);
+    if (++n == kMax)
+    {
+        char name[96]; std::snprintf(name, sizeof name, "analysis/syslog_boot_%lld.txt", (long long)std::time(nullptr));
+        if (FILE *f = std::fopen(name, "w")) { for (uint32_t i = 0; i < kMax; ++i) std::fprintf(f, "%s\n", buf[i]); std::fclose(f); }
+    }
+}
 volatile int g_svr06TitleReached = 1;
 static unsigned g_s67Waits[2] = {0,0}; static int g_s67LastWaiter[2] = {0,0}; static uint32_t g_s67LastWaitRa[2] = {0,0};
 
@@ -895,15 +927,16 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
     {
         return KE_UNKNOWN_SEMID;
     }
+    svr06SysLog(interruptSafe ? 'I' : 'S', m_currentThreadId, id, (int)object->count);
     if (interruptSafe && g_svr06TitleReached && !object->waiters.empty())
     {
         // Thread-context i-signal spin (e.g. the game's "kick worker until it has a pending count" loops): on hardware the
         // worker does not get to run between back-to-back i-signals, so the count builds up and the loop ends. The HLE
         // scheduler lets the worker consume every signal. Break such spins after many consecutive signals.
-        static int s_cnt[64] = {0}; static std::chrono::steady_clock::time_point s_last[64];
+        static int s_cnt[64] = {0}; static uint64_t s_last[64] = {0};
         const int sk = id & 63;
-        const auto spinNow = std::chrono::steady_clock::now();
-        if ((spinNow - s_last[sk]) < std::chrono::milliseconds(100)) ++s_cnt[sk]; else s_cnt[sk] = 1;
+        const uint64_t spinNow = m_eeCycle; /* ISS-157: guest cycles (100 ms ~ 29.5M), not wall clock */
+        if ((spinNow - s_last[sk]) < 29500000ull) ++s_cnt[sk]; else s_cnt[sk] = 1;
         s_last[sk] = spinNow;
         int &s_spinN = s_cnt[sk];
         { static int s_dbg=0; if ((s_spinN % 500)==0 && s_dbg++<200) { const int k=(id==6)?0:(id==7)?1:-1; const GuestThread *wt = thread(object->waiters.front()); std::fprintf(stderr,"[sema] spin id=%d n=%d count=%d inInt=%d cur=%d waiter=%d wst=%d waitsSince=%u lastWaiter=%d lastWaitRa=%X\n", id, s_spinN, (int)object->count, (int)m_insideInterrupt, m_currentThreadId, object->waiters.front(), wt ? (int)wt->status : -9, k>=0 ? g_s67Waits[k] : 0u, k>=0 ? g_s67LastWaiter[k] : 0, k>=0 ? g_s67LastWaitRa[k] : 0u); if (k>=0) g_s67Waits[k]=0; } }

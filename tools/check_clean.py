@@ -23,7 +23,7 @@ for dp,dn,fn in os.walk(root):
         try: h=open(p,'rb').read(8)
         except Exception: continue
         why=None
-        if sz>5*1024*1024: why='>5MB'
+        if sz>5*1024*1024 and not rel.startswith('PS2Recomp/ps2xAnalyzer/include/'): why='>5MB'
         elif any(h.startswith(m) for m in MAGIC): why='game/binary magic'
         elif rel.endswith('.cpp') and rel.startswith('out'): why='generated code'
         if why: bad.append((rel,why))

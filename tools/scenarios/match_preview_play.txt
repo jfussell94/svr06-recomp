@@ -1,0 +1,12 @@
+# ISS-145: from the match preview screen press Play (cross) and watch the transition + loading screen for a freeze.
+# Start the game, get to the match preview (SmackDown, Taker vs HHH), then run: python tools/scenario.py tools/scenarios/match_preview_play.txt
+perf
+shot preview_before
+press cross 6
+wait 3
+shot after_play_3s
+wait 10
+shot after_play_13s
+wait 20
+shot after_play_33s
+perf

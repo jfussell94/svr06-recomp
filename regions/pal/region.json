@@ -1,0 +1,10 @@
+{
+  "id": "pal",
+  "name": "Europe / Australia (PAL)",
+  "serial": "SLES-53676",
+  "boot_elf": "SLES_536.76",
+  "recomp_config": "recomp.toml",
+  "status": "playable",
+  "generated_dir": "out/generated_r4",
+  "build_dir": "build_svr06b_clang"
+}

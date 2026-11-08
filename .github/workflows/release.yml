@@ -1,0 +1,24 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python tools/check_clean.py
+      - run: powershell -File tools/launcher/build_launcher.ps1
+      - name: Package
+        run: python release/package_release.py --version ${{ github.ref_name }} --launcher dist/SvR06Launcher.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SvR06Launcher-*.exe
+            dist/SvR06-tools-*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

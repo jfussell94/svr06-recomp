@@ -1,8 +1,11 @@
+#include <atomic>
 #include "runtime/ps2_vu1.h"
 #include "ps2_vu1_detail.h"
+#include "ps2_vu1_inline.h"
 
 #include <cmath>
 #include <emmintrin.h>
+#include <xmmintrin.h>
 #include <cstring>
 #include <limits>
 
@@ -21,6 +24,16 @@ namespace
 
 namespace
 {
+    // ISS-144 / CL-0133: scalar operand normalisation, inline (same as VU1Interpreter::normalizeOperand)
+    inline float vuNorm1(float value)
+    {
+        uint32_t bits; std::memcpy(&bits, &value, 4);
+        const uint32_t e = bits & 0x7F800000u;
+        if (e == 0u) bits &= 0x80000000u;
+        else if (e == 0x7F800000u) bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&value, &bits, 4);
+        return value;
+    }
     // VU operand normalisation for 4 lanes at once: exponent 0 -> signed zero, exponent 0xFF -> signed max finite (same as normalizeOperand)
     inline void normalize4(const float *in, float *out)
     {
@@ -51,6 +64,92 @@ void VU1Interpreter::execUpper(uint32_t instr)
     uint8_t fd = FD(instr);
     uint8_t op = instr & 0x3F;
 
+    extern std::atomic<int> g_svr06Flags;
+    if ((g_svr06Flags.load(std::memory_order_relaxed) & (1 << 22)) == 0)
+    {   // ISS-144 / CL-0133: fast path for the common FMAC arithmetic ops (bit-identical to the generic code below:
+        // same lane-wise IEEE operations in the same order, same normalisation, same applyFmacDest/applyFmacDestAcc).
+        int kind = -1;      // 0 ADD, 1 SUB, 2 MADD, 3 MSUB, 4 MUL
+        int src = -1;       // 0..3 broadcast lane of vf[ft], 4 = vector vf[ft], 5 = Q, 6 = I
+        bool toAcc = false;
+        if (op < 0x3Cu)
+        {
+            if (op < 0x10u) { kind = static_cast<int>(op >> 2); src = op & 3; }
+            else if (op >= 0x18u && op <= 0x1Bu) { kind = 4; src = op & 3; }
+            else switch (op)
+            {
+            case 0x1C: kind = 4; src = 5; break;  // MULq
+            case 0x1E: kind = 4; src = 6; break;  // MULi
+            case 0x20: kind = 0; src = 5; break;  // ADDq
+            case 0x21: kind = 2; src = 5; break;  // MADDq
+            case 0x22: kind = 0; src = 6; break;  // ADDi
+            case 0x23: kind = 2; src = 6; break;  // MADDi
+            case 0x24: kind = 1; src = 5; break;  // SUBq
+            case 0x25: kind = 3; src = 5; break;  // MSUBq
+            case 0x26: kind = 1; src = 6; break;  // SUBi
+            case 0x27: kind = 3; src = 6; break;  // MSUBi
+            case 0x28: kind = 0; src = 4; break;  // ADD
+            case 0x29: kind = 2; src = 4; break;  // MADD
+            case 0x2A: kind = 4; src = 4; break;  // MUL
+            case 0x2C: kind = 1; src = 4; break;  // SUB
+            case 0x2D: kind = 3; src = 4; break;  // MSUB
+            default: break;
+            }
+        }
+        else
+        {
+            const uint8_t sp = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
+            toAcc = true;
+            if (sp < 0x10u) { kind = static_cast<int>(sp >> 2); src = sp & 3; }
+            else if (sp >= 0x18u && sp <= 0x1Bu) { kind = 4; src = sp & 3; }
+            else switch (sp)
+            {
+            case 0x1C: kind = 4; src = 5; break;  // MULAq
+            case 0x1E: kind = 4; src = 6; break;  // MULAi
+            case 0x20: kind = 0; src = 5; break;  // ADDAq
+            case 0x21: kind = 2; src = 5; break;  // MADDAq
+            case 0x22: kind = 0; src = 6; break;  // ADDAi
+            case 0x23: kind = 2; src = 6; break;  // MADDAi
+            case 0x24: kind = 1; src = 5; break;  // SUBAq
+            case 0x25: kind = 3; src = 5; break;  // MSUBAq
+            case 0x26: kind = 1; src = 6; break;  // SUBAi
+            case 0x27: kind = 3; src = 6; break;  // MSUBAi
+            case 0x28: kind = 0; src = 4; break;  // ADDA
+            case 0x29: kind = 2; src = 4; break;  // MADDA
+            case 0x2A: kind = 4; src = 4; break;  // MULA
+            case 0x2C: kind = 1; src = 4; break;  // SUBA
+            case 0x2D: kind = 3; src = 4; break;  // MSUBA
+            default: break;
+            }
+        }
+        if (kind >= 0)
+        {
+            alignas(16) float nv[4];
+            normalize4(m_state.vf[fs], nv);
+            const __m128 a = _mm_load_ps(nv);
+            __m128 b;
+            if (src == 4) { alignas(16) float nt[4]; normalize4(m_state.vf[ft], nt); b = _mm_load_ps(nt); }
+            else if (src < 4) b = _mm_set1_ps(vuNorm1(m_state.vf[ft][src]));
+            else b = _mm_set1_ps(vuNorm1(src == 5 ? m_state.q : m_state.i));
+            __m128 r;
+            if (kind >= 2 && kind <= 3)
+            {
+                alignas(16) float na[4];
+                normalize4(m_state.acc, na);
+                const __m128 ac = _mm_load_ps(na);
+                r = kind == 2 ? _mm_add_ps(ac, _mm_mul_ps(a, b)) : _mm_sub_ps(ac, _mm_mul_ps(a, b));
+            }
+            else if (kind == 0) r = _mm_add_ps(a, b);
+            else if (kind == 1) r = _mm_sub_ps(a, b);
+            else r = _mm_mul_ps(a, b);
+            alignas(16) float res[4];
+            _mm_store_ps(res, r);
+            if (m_fast && !m_fastExact) fmacStoreFast(toAcc ? m_state.acc : m_state.vf[fd], res, dest);
+            else if (toAcc) applyFmacDestAcc(res, dest);
+            else applyFmacDest(m_state.vf[fd], res, dest);
+            return;
+        }
+    }
+
     float *vd = m_state.vf[fd];
     float normalizedVs[4];
     float normalizedVt[4];
@@ -61,8 +160,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
-    const float q = normalizeOperand(m_state.q);
-    const float i = normalizeOperand(m_state.i);
+    const float q = vuNorm1(m_state.q);
+    const float i = vuNorm1(m_state.i);
     float result[4];
 
     // Upper opcode decoding (bits 5:0 of upper word)
@@ -73,7 +172,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x02:
     case 0x03: // ADDbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3u] /* already normalised */;
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] + bc;
         applyFmacDest(vd, result, dest);
@@ -84,7 +183,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x06:
     case 0x07: // SUBbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3u] /* already normalised */;
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] - bc;
         applyFmacDest(vd, result, dest);
@@ -95,7 +194,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x0A:
     case 0x0B: // MADDbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3u] /* already normalised */;
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] + vs[c] * bc;
         applyFmacDest(vd, result, dest);
@@ -106,7 +205,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x0E:
     case 0x0F: // MSUBbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3u] /* already normalised */;
         for (int c = 0; c < 4; c++)
             result[c] = acc[c] - vs[c] * bc;
         applyFmacDest(vd, result, dest);
@@ -117,7 +216,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x12:
     case 0x13: // MAXbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3u] /* already normalised */;
         for (int c = 0; c < 4; c++)
             result[c] = (vs[c] > bc) ? vs[c] : bc;
         applyDest(vd, result, dest);
@@ -128,7 +227,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x16:
     case 0x17: // MINIbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3u] /* already normalised */;
         for (int c = 0; c < 4; c++)
             result[c] = (vs[c] < bc) ? vs[c] : bc;
         applyDest(vd, result, dest);
@@ -139,7 +238,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x1A:
     case 0x1B: // MULbc
     {
-        float bc = broadcast(vt, op & 3);
+        float bc = vt[op & 3u] /* already normalised */;
         for (int c = 0; c < 4; c++)
             result[c] = vs[c] * bc;
         applyFmacDest(vd, result, dest);
@@ -267,7 +366,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x02:
         case 0x03: // ADDAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3u] /* already normalised */;
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] + bc;
             applyFmacDestAcc(result, dest);
@@ -278,7 +377,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x06:
         case 0x07: // SUBAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3u] /* already normalised */;
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] - bc;
             applyFmacDestAcc(result, dest);
@@ -289,7 +388,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x0A:
         case 0x0B: // MADDAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3u] /* already normalised */;
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] + vs[c] * bc;
             applyFmacDestAcc(result, dest);
@@ -300,7 +399,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x0E:
         case 0x0F: // MSUBAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3u] /* already normalised */;
             for (int c = 0; c < 4; c++)
                 result[c] = acc[c] - vs[c] * bc;
             applyFmacDestAcc(result, dest);
@@ -379,7 +478,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x1A:
         case 0x1B: // MULAbc
         {
-            float bc = broadcast(vt, specialOp & 3);
+            float bc = vt[specialOp & 3u] /* already normalised */;
             for (int c = 0; c < 4; c++)
                 result[c] = vs[c] * bc;
             applyFmacDestAcc(result, dest);

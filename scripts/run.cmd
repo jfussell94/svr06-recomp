@@ -20,13 +20,17 @@ echo Boot ELF: %ELF%
 if not defined SVR06_GSDUMPTICK set "SVR06_GSDUMPTICK=10300"
 if not defined SVR06_GSDUMPLEN set "SVR06_GSDUMPLEN=20"
 set "SVR06_TRACE=1b80f0:TtlA,1b8830:TtlB,1b8b00:TtlC,182ba0:MwStop,199698:SfStop,199718:SfEnd,187e98:MwChk2,187da0:MwChk1,187d78:MwChk0"
+rem ISS-156 bisect: optional per-experiment environment (scripts\probe_env.cmd), delete the file for the normal run
+if exist "%~dp0probe_env.cmd" call "%~dp0probe_env.cmd"
+rem CL-0149 button icon sets: folder with <set>\glyph_idx.bin/glyph_clut.bin; select with SVR06_ICONSET (ps3 ps4 ps5 xbox360 xboxone switchpro switchpro2; empty = original PS2 icons)
+if not defined SVR06_ICONDIR set "SVR06_ICONDIR=%~dp0..\mods\icons"
 if not defined SVR06_GAMETITLE set "SVR06_GAMETITLE=0"
 if not defined SVR06_VK_NOFEEDBACK set "SVR06_VK_NOFEEDBACK=0"
 rem diag off by default (perf): set SVR06_ZEROUP=1 to enable
 rem diag off by default (perf): set SVR06_IMGW=1 to enable
 set "SVR06_TURBO=1"
 rem perf: SPU2 raw dump off by default. set SVR06_SPU2_WAV=path to enable: "SVR06_SPU2_WAV=%~dp0..\analysis\spu2_dump.raw"
-set "SVR06_SKIPMOVIES=0"
+if not defined SVR06_SKIPMOVIES set "SVR06_SKIPMOVIES=0"
 set "SVR06_DUMPDIR=%~dp0..\analysis\dumps"
 if not exist "%SVR06_DUMPDIR%" mkdir "%SVR06_DUMPDIR%"
 rem set "SVR06_NOCOV=1"
@@ -35,7 +39,8 @@ set "SVR06_DUMPFRAME=3000"
 set "SVR06_SHOTDIR=%~dp0..\analysis\shots"
 if not exist "%SVR06_SHOTDIR%" mkdir "%SVR06_SHOTDIR%"
 del /q "%SVR06_SHOTDIR%\*.png" 2>nul
-cd /d %~dp0..\..\PS2Recomp\build_svr06b_clang
+if not defined SVR06_BUILDPATH set "SVR06_BUILDPATH=%~dp0..\..\PS2Recomp\build_svr06b_clang"
+cd /d "%SVR06_BUILDPATH%"
 taskkill /F /IM svr06run.exe >nul 2>&1
 for %%f in (ps2EntryRunner.exe ps2xRuntime\ps2EntryRunner.exe) do if exist %%f (
   copy /y %%f "%%~dpfsvr06run.exe" >nul
