@@ -51,3 +51,6 @@ overrides/svr06_ovx*.cpp
 .vscode/
 __pycache__/
 Thumbs.db
+
+# local secrets
+config/github_token.txt

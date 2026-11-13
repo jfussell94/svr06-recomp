@@ -78,6 +78,7 @@ void VU1Interpreter::resetScheduler()
 {
     m_flagPipeline = {};
     m_flagValid = 0u;
+    m_lzCount = 0u; m_lzHaveRet = false; m_lzSticky = 0u; m_lazyFlags = false;
     m_flagFifoHead = 0u; m_flagFifoCount = 0u;
     m_fdiv = {};
     m_efu = {};
@@ -541,8 +542,53 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
     pushFmacFlags(mac, status, extraSticky);
 }
 
+void VU1Interpreter::pushFmacFlagsAt(uint64_t issue, uint32_t mac, uint32_t status)
+{
+    const uint32_t freeSlots = ~m_flagValid & ((1u << kMaxFlagEntries) - 1u);
+    if (freeSlots == 0u) { reportReservedInstruction(true, 0xFFFFFFFFu); return; }
+    const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(freeSlots));
+    m_flagValid |= 1u << slot;
+    m_flagFifo[(m_flagFifoHead + m_flagFifoCount++) & 7u] = static_cast<uint8_t>(slot);
+    FlagPipelineEntry &entry = m_flagPipeline[slot];
+    entry = {};
+    entry.valid = true;
+    entry.issueCycle = issue;
+    entry.readyCycle = issue + kFmacLatency;
+    if (entry.readyCycle < m_minReady) m_minReady = entry.readyCycle;
+    m_pendMask |= 1u;
+    entry.mac = mac;
+    entry.status = status;
+    entry.extraSticky = 0u;
+    entry.writesMac = true;
+    entry.writesStatus = true;
+}
+
+void VU1Interpreter::materializeLazy(uint64_t limit)
+{
+    if (m_lzCount == 0u) return;
+    if (m_lzHaveRet)
+    {
+        m_state.mac = m_lzRetMac;
+        m_state.status = (m_state.status & 0xFF0u) | m_lzRetCur | (m_lzSticky << 6);
+    }
+    const uint32_t live = m_lzCount < 4u ? m_lzCount : 4u;
+    for (uint32_t k = 0; k < live; ++k)
+    {
+        const LazyFlag &e = m_lz[(m_lzCount - live + k) & 3u];
+        if (e.issue + kFmacLatency <= limit)
+        {
+            m_state.mac = e.mac;
+            m_state.status = (m_state.status & 0xFF0u) | e.cur | (e.cur << 6);
+        }
+        else
+            pushFmacFlagsAt(e.issue, e.mac, e.cur);
+    }
+    m_lzCount = 0u; m_lzHaveRet = false; m_lzSticky = 0u;
+}
+
 void VU1Interpreter::pushFmacFlags(uint32_t mac, uint32_t status, uint32_t extraSticky)
 {
+    if (m_lzCount != 0u) materializeLazy(m_cycle);
     if (m_fast && !m_fastPipe)
     {
         m_state.mac = mac;
@@ -617,6 +663,7 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 
 void VU1Interpreter::queueFsset(uint16_t immediate)
 {
+    if (m_lzCount != 0u) materializeLazy(m_cycle);
     if (m_fast && !m_fastPipe)
     {
         m_state.status = (m_state.status & 0x03Fu) | (static_cast<uint32_t>(immediate) & 0xFC0u);
@@ -880,12 +927,12 @@ void VU1Interpreter::commitReadyPipelines()
     uint64_t nm = UINT64_MAX;
     const uint32_t pm = m_pendMask;
     uint32_t keep = 0u;
-    uint32_t readyFlags = 0u;
+    uint32_t readyList[8]; uint32_t readyN = 0u;
     if (pm & 1u)
     {   // CL-0133: ready entries are a prefix of the push-order FIFO; apply them in slot order (as the full scan did)
         while (m_flagFifoCount != 0u && m_flagPipeline[m_flagFifo[m_flagFifoHead]].readyCycle <= m_cycle)
         {
-            readyFlags |= 1u << m_flagFifo[m_flagFifoHead];
+            readyList[readyN++] = m_flagFifo[m_flagFifoHead];
             m_flagFifoHead = (m_flagFifoHead + 1u) & 7u;
             --m_flagFifoCount;
         }
@@ -896,9 +943,9 @@ void VU1Interpreter::commitReadyPipelines()
             if (r < nm) nm = r;
         }
     }
-    for (uint32_t bits = readyFlags; bits != 0u; bits &= bits - 1u)
-    {
-        const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(bits));
+    for (uint32_t rk = 0; rk < readyN; ++rk)
+    {   // FIFO (push) order, as on hardware
+        const uint32_t slot = readyList[rk];
         FlagPipelineEntry &entry = m_flagPipeline[slot];
         m_flagValid &= ~(1u << slot);
 
@@ -2195,8 +2242,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
     svr06prof::Scope _ps(0);
-    if (m_unit == Unit::VU1 && !s_vuInChecked)
-    {
+    if ((m_unit == Unit::VU1 || (g_svr06Flags.load(std::memory_order_relaxed) & (1 << 30))) && !s_vuInChecked)
+    {   // CL-0206: debug flag 30 sends VU0 through the fast path too (A/B-checked in executeVU0Microprogram)
         const int svr06Fl = g_svr06Flags.load();
         if (!(svr06Fl & 512))
         {
@@ -2484,6 +2531,14 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
             m_skipFlags = m_noFlagVal[pi] != 0u;
             if (m_skipFlags) ++s_nSkipRuns; else ++s_nFlagRuns;
         }
+        m_lzCount = 0u; m_lzHaveRet = false; m_lzSticky = 0u; m_lazyFlags = false;
+        if (!m_skipFlags && !(fl & (1 << 31)) && m_fastPipe && !m_fastExact && m_unit == Unit::VU1 && memory != nullptr && vuCode == memory->getVU1Code())
+        {   // lazy exact flags: programs that never read MAC/status keep only the last 4 FMAC flag results (see materializeLazy)
+            const uint32_t pi = (m_state.pc >> 3) & (kMaxDecodedPairs - 1u);
+            const uint64_t gen = memory->getVU1CodeGeneration() + 1u;
+            if (m_noFlagGen[pi] != gen) { m_noFlagVal[pi] = programReadsNoFlags(vuCode, m_state.pc) ? 1u : 0u; m_noFlagGen[pi] = gen; }
+            m_lazyFlags = m_noFlagVal[pi] != 0u;
+        }
     }
 
     const int previousRoundingMode = std::fegetround();
@@ -2494,8 +2549,8 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
     const uint64_t runStartC = m_cycle;
     int runawayStage = 0, runawayReg = -1; int32_t runawayVal = 0; uint64_t runawayAt = 0, runawayNext = 4096u; uint32_t runawayPcw = 0;
     bool directDecode = false;
-    if (memory != nullptr && m_unit == Unit::VU1 && vuCode == memory->getVU1Code())
-    {   // validate/rebuild the decoded-pair cache once; program code cannot change while the VU runs
+    if (memory != nullptr && ((m_unit == Unit::VU1 && vuCode == memory->getVU1Code()) || (m_unit == Unit::VU0 && vuCode == memory->getVU0Code())))
+    {   // validate/rebuild the decoded-pair cache once; program code cannot change while the VU runs (CL-0206: VU0 too)
         (void)getDecodedInstructionPairForPc(vuCode, codeSize, memory, 0u);
         directDecode = m_decodedCodeCacheValid && m_cachedVuCode == vuCode && m_cachedMemory == memory && m_cachedCodeSize == codeSize;
     }
@@ -2779,6 +2834,7 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
             }
         }
     }
+    if (m_lazyFlags) { materializeLazy(m_cycle - 1u); m_lazyFlags = false; }
     if (programEnded)
     {
         if (m_fastPipe)

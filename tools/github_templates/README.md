@@ -4,8 +4,13 @@ Native Windows port of **WWE SmackDown! vs. Raw 2006** through static recompilat
 
 | Region | Serial | Status |
 |---|---|---|
-| Europe / Australia (PAL) | SLES-53676 | Playable |
-| North America (NTSC-U) | SLUS-21286 | In progress - recompiles and boots, overlay code not generated yet |
+| Europe / Australia (PAL) | SLES-53676 | In-game - matches run, known crashes and glitches |
+| North America (NTSC-U) | SLUS-21286 | Bootable - boots to the logos, black screen afterwards while the PAL fixes are ported |
+| Italy (PAL) | SLES-53677 | Planned |
+| Japan (NTSC-J) | SLPM-66268 | Planned |
+| Korea (NTSC-K) | SLKA-25318 | Planned |
+
+Stages: Planned, Recompiled, Bootable, Menus, In-game, Playable (Playable is reserved for the 1.0 release).
 
 ## No game content in this repository
 Only original tooling lives here: recompiler configuration (addresses/options), runtime hooks, our changes to the PS2Recomp runtime, the launcher, scripts and documentation.
@@ -28,6 +33,9 @@ Run `python tools/check_clean.py` before publishing anything.
 | `scripts/` | Build/run scripts, `USA_BUILD.cmd`, `FAST_REBUILD_AND_RUN.cmd` |
 | `release/` | Release packaging (`package_release.py`, `regions.json`) |
 | `docs/` | Findings, roadmap, handoff notes. `CHANGELOG.md` / `CHANGELOG-detailed.md` |
+
+## Reporting bugs
+Use the launcher's **Report issue** page (it opens a GitHub issue with your version and log excerpt attached and later asks you to confirm the fix), or open an issue here with the bug template.
 
 ## Releases
 Tagged releases ship the **launcher app** and tooling per platform. Binaries containing code translated from the game are not distributed. See [release/README.md](release/README.md).

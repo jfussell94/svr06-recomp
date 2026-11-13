@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "ps2_settings.h"
 #include "runtime/gs/gs_vulkan_bridge.h"
 
@@ -38,6 +39,14 @@ extern std::atomic<int> g_svr06DrawCtr;
 bool svr06_movie_active(); // SvrMovie.cpp
 namespace gsvk
 {
+// [scale] internal resolution: 0 = native, 1 = native output + SSAA 4x, 2 = 2x output (SSAA 4x + high-res scanout), 3 = 2x output + SSAA 8x.
+// Read once at start-up (F1 menu > Graphics > Internal Resolution, or env SVR06_SCALE=0..3).
+static int scaleMode()
+{
+    static const int m = [] { const char *e = std::getenv("SVR06_SCALE"); int v = (e && e[0] >= '0' && e[0] <= '3') ? (e[0] - '0') : ps2settings::getInt("graphics.internalRes", 0); return v < 0 ? 0 : (v > 3 ? 0 : v); }();
+    return m;
+}
+
 namespace
 {
 struct State
@@ -110,6 +119,8 @@ bool initLocked(State &s)
     s.dev.init_frame_contexts(18); // [framequeue] up to 16 queued readbacks without next_frame_context() blocking on them
 
     ParallelGS::GSOptions opts;
+    { const int m = scaleMode(); if (m == 1 || m == 2) opts.super_sampling = ParallelGS::SuperSampling::X4; else if (m == 3) opts.super_sampling = ParallelGS::SuperSampling::X8;
+      std::cout << "[gsvk] internal resolution mode " << m << (m >= 2 ? " (2x output)" : (m == 1 ? " (SSAA 4x)" : " (native)")) << std::endl; }
     if (!s.iface.init(&s.dev, opts))
     {
         reportFatal("paraLLEl-GS initialisation failed.");
@@ -152,6 +163,8 @@ bool enabled()
     }();
     return e;
 }
+
+int outputScale() { return (enabled() && scaleMode() >= 2) ? 2 : 1; } // [scale] host frame = 640x512 times this
 
 bool ensureInit()
 {
@@ -606,7 +619,7 @@ void gifTransfer(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
     static uint64_t cnt[4] = {0, 0, 0, 0}, calls = 0; if(path>3)path=3; if(path>=1)path-=1; cnt[path] += sizeBytes;
     if ((++calls % 20000) == 1) std::cout << "[gsvk] gif bytes p1=" << cnt[1] << " p2=" << cnt[2] << " p3=" << cnt[3] << " calls=" << calls << std::endl;
     if (g_gifCapF) { uint32_t hd[2] = {sizeBytes, path}; std::fwrite(hd, 4, 2, g_gifCapF); std::fwrite(data, 1, sizeBytes, g_gifCapF); }
-    { const bool iw = std::getenv("SVR06_IMGW") != nullptr || (g_svr06Diag.load() & 1u); if (iw) imgWatch(data, sizeBytes); }
+    { static const bool s_imgwEnv = std::getenv("SVR06_IMGW") != nullptr; /* perf: was an uncached getenv per GIF packet (~16% of the game thread) */ const bool iw = s_imgwEnv || (g_svr06Diag.load() & 1u); if (iw) imgWatch(data, sizeBytes); }
     g_stgGif = 12;
     std::vector<uint8_t> iconTmp;
     const uint8_t *iconData = ipStream(path, data, sizeBytes, iconTmp);
@@ -635,7 +648,7 @@ void uploadImage(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t 
     { static const bool zd = std::getenv("SVR06_ZEROUP") != nullptr; static int zn = 0;
       if (zd && sizeBytes >= 8192 && zn < 60) { uint32_t nz = 0; for (uint32_t i = 0; i < sizeBytes; i += 8) nz += *reinterpret_cast<const uint64_t *>(data + i) != 0;
         std::fprintf(stderr, "[zeroup-vk] dbp=0x%llx ptr=%p bytes=%u nzQ=%u%s\n", (unsigned long long)((bitbltbuf >> 32) & 0x3fff), (const void *)data, sizeBytes, nz, nz ? "" : " ALLZERO"); ++zn; } }
-    { const bool iw = std::getenv("SVR06_IMGW") != nullptr || (g_svr06Diag.load() & 1u); static int un = 0; if (iw && un++ < 200) std::fprintf(stderr, "[imgw] uploadImage dbp=%llX dbw=%llu psm=%llu bytes=%u\n", (unsigned long long)((bitbltbuf >> 32) & 0x3fff), (unsigned long long)((bitbltbuf >> 48) & 63), (unsigned long long)((bitbltbuf >> 56) & 63), sizeBytes); }
+    { static const bool s_imgwEnv = std::getenv("SVR06_IMGW") != nullptr; /* perf: was an uncached getenv per GIF packet (~16% of the game thread) */ const bool iw = s_imgwEnv || (g_svr06Diag.load() & 1u); static int un = 0; if (iw && un++ < 200) std::fprintf(stderr, "[imgw] uploadImage dbp=%llX dbw=%llu psm=%llu bytes=%u\n", (unsigned long long)((bitbltbuf >> 32) & 0x3fff), (unsigned long long)((bitbltbuf >> 48) & 63), (unsigned long long)((bitbltbuf >> 56) & 63), sizeBytes); }
     if (g_gifCapF) { uint32_t hd[2] = {0xFFFFFFFEu, sizeBytes}; std::fwrite(hd, 4, 2, g_gifCapF); const uint64_t q4[4] = {bitbltbuf, trxpos, trxreg, trxdir}; std::fwrite(q4, 8, 4, g_gifCapF); }
     // A+D packet with the four transfer registers, then an IMAGE-mode packet with the payload.
     uint64_t setup[2 + 8];
@@ -756,6 +769,7 @@ static bool presentFrameImpl(const GSRegisters &r, std::vector<uint8_t> &rgba, u
     info.dst_access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
     info.force_progressive = true;
     info.anti_blur = true;
+    info.high_resolution_scanout = scaleMode() >= 2; // [scale]
     info.adapt_to_internal_horizontal_resolution = true;
 
     if (std::getenv("SVR06_VKSELFTEST"))
@@ -853,7 +867,7 @@ static bool presentFrameImpl(const GSRegisters &r, std::vector<uint8_t> &rgba, u
     popWait(true, w, h, src);
     if (!src)
         return false;
-    constexpr uint32_t kOutW = 640u; // host frame width; paraLLEl-GS scans out at the dot-clock width (e.g. 2560)
+    const uint32_t kOutW = 640u * (scaleMode() >= 2 ? 2u : 1u); // host frame width; paraLLEl-GS scans out at the dot-clock width (e.g. 2560)
     if (w >= 2u * kOutW && (w % kOutW) == 0u)
     {   // box-filter straight from the mapped readback buffer (no 5 MB intermediate copy, shift instead of divide for the usual 4:1)
         const uint32_t f = w / kOutW;
@@ -899,14 +913,15 @@ static bool presentFrameImpl(const GSRegisters &r, std::vector<uint8_t> &rgba, u
     height = h;
     {   // single-field modes (DH+1 <= 288 lines): paraLLEl-GS returns the field in the top half of a 2x-tall frame; line-double it to fill the frame
         const uint32_t lines = static_cast<uint32_t>((outDisp >> 44) & 0x7FFu) + 1u;
-        if (lines <= 288u && h == 2u * lines)
+        const uint32_t hs = scaleMode() >= 2 ? 2u : 1u; // [scale]
+        if (lines <= 288u && h == 2u * lines * hs)
         {
             const size_t rb = static_cast<size_t>(width) * 4u;
             for (uint32_t y = h; y-- > 0;)
                 if ((y >> 1) != y)
                     std::memcpy(rgba.data() + y * rb, rgba.data() + static_cast<size_t>(y >> 1) * rb, rb);
-            if (lines == 256u && height > 448u)
-                height = 448u; // the game draws 224 field lines (448 rows doubled): present 640x448 like the original 4:3 picture, no empty bottom band
+            if (lines == 256u && height > 448u * hs)
+                height = 448u * hs; // the game draws 224 field lines (448 rows doubled): present 640x448 like the original 4:3 picture, no empty bottom band
         }
     }
     {   // diagnostics: PPM dump of the scanned-out frame (env SVR06_SHOTDIR), a few per minute, max 80 files
@@ -1040,11 +1055,37 @@ static bool presentFrameImpl(const GSRegisters &r, std::vector<uint8_t> &rgba, u
     }
     return ok;
 }
+// Accessibility: colour-blind correction (daltonize). mode 1 = protanopia, 2 = deuteranopia, 3 = tritanopia; strength 0..100.
+static void applyColourBlind(std::vector<uint8_t> &rgba, uint32_t w, uint32_t h)
+{
+    const int mode = ps2settings::getInt("access.colorblind", 0);
+    if (mode < 1 || mode > 3 || rgba.size() < (size_t)w * h * 4u) return;
+    const float st = std::max(0.0f, std::min(1.0f, ps2settings::getFloat("access.colorblindStrength", 100.0f) / 100.0f));
+    // Machado et al. 2009 simulation matrices (severity 1.0), applied to sRGB values
+    static const float sim[3][9] = {
+        {0.152286f, 1.052583f, -0.204868f, 0.114503f, 0.786281f, 0.099216f, -0.003882f, -0.048116f, 1.051998f},   // protan
+        {0.367322f, 0.860646f, -0.227968f, 0.280085f, 0.672501f, 0.047413f, -0.011820f, 0.042940f, 0.968881f},    // deutan
+        {1.255528f, -0.076749f, -0.178779f, -0.078411f, 0.930809f, 0.147602f, 0.004733f, 0.691367f, 0.303900f}};  // tritan
+    const float *m = sim[mode - 1];
+    uint8_t *p = rgba.data(); const size_t n = (size_t)w * h;
+    for (size_t i = 0; i < n; ++i, p += 4)
+    {
+        const float r = p[0], g = p[1], b = p[2];
+        const float sr = m[0] * r + m[1] * g + m[2] * b, sg = m[3] * r + m[4] * g + m[5] * b, sb = m[6] * r + m[7] * g + m[8] * b;
+        const float er = r - sr, eg = g - sg, eb = b - sb; // colour information the viewer cannot see
+        float nr, ng, nb;
+        if (mode == 3) { nr = r + 0.7f * eb; ng = g + 0.5f * eb; nb = b; }        // tritan: move the lost blue-yellow difference into red/green
+        else { nr = r; ng = g + 0.7f * er + eg; nb = b + 0.7f * er + eb; }         // protan/deutan: move the lost red-green difference into green/blue
+        nr = r + (nr - r) * st; ng = g + (ng - g) * st; nb = b + (nb - b) * st;
+        p[0] = (uint8_t)std::max(0.0f, std::min(255.0f, nr)); p[1] = (uint8_t)std::max(0.0f, std::min(255.0f, ng)); p[2] = (uint8_t)std::max(0.0f, std::min(255.0f, nb));
+    }
+}
 bool presentFrame(const GSRegisters &r, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
 {   // [fps60] CL-0112: frame-cost telemetry, one line per 300 presented frames (avg/max ms, GPU scanouts and VRAM saves per frame)
     const auto t0 = std::chrono::steady_clock::now();
     g_queueFill.store(false);
     const bool ok = presentFrameImpl(r, rgba, width, height);
+    if (ok) applyColourBlind(rgba, width, height);
     static double s_sum = 0.0, s_max = 0.0; static uint32_t s_n = 0;
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     s_sum += ms; if (ms > s_max) s_max = ms;
@@ -1132,6 +1173,7 @@ bool dumpVram(const char *path)
 namespace gsvk
 {
 bool enabled() { return false; }
+int outputScale() { return 1; }
 bool ensureInit() { return false; }
 void setSubmitPath(uint32_t) {}
 uint32_t submitPath() { return 3; }

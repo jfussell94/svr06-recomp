@@ -1,0 +1,115 @@
+{
+ "_comment": "Single source of truth for game releases. 'state' is the progress stage (see 'states'); 'playable' is reserved for the 1.0 release. 'tags' are short free-text notes shown in the launcher.",
+ "regions": [
+  {
+   "id": "pal",
+   "name": "Europe / Australia (PAL)",
+   "short": "PAL - Europe/Australia",
+   "serial": "SLES-53676",
+   "boot_elf": "SLES_536.76",
+   "status": "ingame",
+   "recomp_config": "config/svr06_ps2recomp.toml",
+   "generated_dir": "out/generated_r4",
+   "runtime_dir": "PS2Recomp",
+   "build_dir": "build_svr06b_clang",
+   "state": "ingame",
+   "tags": [
+    "matches run",
+    "known crashes",
+    "visual glitches"
+   ]
+  },
+  {
+   "id": "usa",
+   "name": "North America (NTSC-U)",
+   "short": "USA - NTSC-U",
+   "serial": "SLUS-21286",
+   "boot_elf": "SLUS_212.86",
+   "status": "bootable",
+   "recomp_config": "config/svr06_usa_ps2recomp.toml",
+   "generated_dir": "out/generated_usa",
+   "runtime_dir": "PS2Recomp_usa",
+   "build_dir": "build_svr06_usa",
+   "state": "bootable",
+   "tags": [
+    "black screen after logos",
+    "movie fix pending test",
+    "cheats not mapped"
+   ]
+  },
+  {
+   "id": "ita",
+   "name": "Italy (PAL-I)",
+   "short": "Italy - PAL",
+   "serial": "SLES-53677",
+   "boot_elf": "SLES_536.77",
+   "status": "planned",
+   "recomp_config": "config/svr06_ita_ps2recomp.toml",
+   "generated_dir": "out/generated_ita",
+   "runtime_dir": "PS2Recomp_ita",
+   "build_dir": "build_svr06_ita",
+   "state": "planned",
+   "tags": []
+  },
+  {
+   "id": "jpn",
+   "name": "Japan (NTSC-J, Exciting Pro Wres)",
+   "short": "Japan - NTSC-J",
+   "serial": "SLPM-66268",
+   "boot_elf": "SLPM_662.68",
+   "status": "planned",
+   "recomp_config": "config/svr06_jpn_ps2recomp.toml",
+   "generated_dir": "out/generated_jpn",
+   "runtime_dir": "PS2Recomp_jpn",
+   "build_dir": "build_svr06_jpn",
+   "state": "planned",
+   "tags": []
+  },
+  {
+   "id": "kor",
+   "name": "Korea (NTSC-K)",
+   "short": "Korea - NTSC-K",
+   "serial": "SLKA-25318",
+   "boot_elf": "SLKA_253.18",
+   "status": "planned",
+   "recomp_config": "config/svr06_kor_ps2recomp.toml",
+   "generated_dir": "out/generated_kor",
+   "runtime_dir": "PS2Recomp_kor",
+   "build_dir": "build_svr06_kor",
+   "state": "planned",
+   "tags": []
+  }
+ ],
+ "states": [
+  {
+   "id": "planned",
+   "label": "Planned",
+   "desc": "Not started. Listed so the version has a place in the project."
+  },
+  {
+   "id": "recompiled",
+   "label": "Recompiled",
+   "desc": "The executable recompiles and builds, but it does not boot to the game yet."
+  },
+  {
+   "id": "bootable",
+   "label": "Bootable",
+   "desc": "Starts and runs the boot sequence (logos, intro). May stall or show a black screen before the menus."
+  },
+  {
+   "id": "menus",
+   "label": "Menus",
+   "desc": "Reaches the title screen and menus. Matches are not reliable yet."
+  },
+  {
+   "id": "ingame",
+   "label": "In-game",
+   "desc": "Matches can be started and played, with known bugs, glitches or crashes."
+  },
+  {
+   "id": "playable",
+   "label": "Playable",
+   "desc": "Release quality (1.0): complete game, no known blocking bugs."
+  }
+ ]
+}

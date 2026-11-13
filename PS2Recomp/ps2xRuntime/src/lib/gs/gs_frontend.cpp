@@ -8,6 +8,7 @@
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -244,13 +245,24 @@ bool svr06MtgsOnWorker()
     return std::this_thread::get_id() == svr06mtgs::st().worker;
 }
 
+static std::atomic<uint64_t> g_wpIdleNs{0}, g_wpIdleN{0}, g_wpBpNs{0}, g_wpBpN{0}, g_wpSubNs{0}, g_wpSubN{0};
+static inline uint64_t wpNow() { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static void wpReport()
+{
+    static uint64_t last = wpNow(); const uint64_t n = wpNow();
+    if (n - last < 3000000000ull) return; last = n;
+    std::fprintf(stderr, "[waitprof] 3s: idleWait %.0fms/%llu  backpressure %.0fms/%llu  submit %.0fms/%llu\n",
+        g_wpIdleNs.exchange(0) / 1e6, (unsigned long long)g_wpIdleN.exchange(0), g_wpBpNs.exchange(0) / 1e6, (unsigned long long)g_wpBpN.exchange(0), g_wpSubNs.exchange(0) / 1e6, (unsigned long long)g_wpSubN.exchange(0));
+}
 void svr06MtgsWaitIdle()
 {
     svr06mtgs::State &s = svr06mtgs::st();
     if (!s.started || std::this_thread::get_id() == s.worker)
         return;
+    const uint64_t t0 = wpNow();
     std::unique_lock<std::mutex> lk(s.m);
     s.cvIdle.wait(lk, [&] { return s.q.empty() && !s.busy; });
+    g_wpIdleNs.fetch_add(wpNow() - t0, std::memory_order_relaxed); g_wpIdleN.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool svr06MtgsIdle()
@@ -277,7 +289,8 @@ void svr06MtgsSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
             if (g_svr06GifCap.fetch_sub(1) <= 1 && cf) { std::fclose(cf); cf = nullptr; }
         }
     }
-    { // [vramw] log GS state writes that target the HUD atlas area (VRAM blocks 15700..16200): FRAME / BITBLTBUF / TRXREG / TRXDIR
+    static const bool vramwOn = [] { const char *v = std::getenv("SVR06_VRAMW"); return v && *v == '1'; }();
+    if (vramwOn) { // [vramw] log GS state writes that target the HUD atlas area (VRAM blocks 15700..16200): FRAME / BITBLTBUF / TRXREG / TRXDIR
         static FILE *vf = nullptr; static uint64_t n = 0; static std::mutex vm; static bool lastBbHit = false;
         std::lock_guard<std::mutex> g(vm);
         uint64_t seq = ++g_svr06VramwSeq;
@@ -477,7 +490,7 @@ void svr06MtgsSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
                 return;
             }
         }
-        gsvk::gifTransfer(gsvk::submitPath(), data, sizeBytes); return;
+        { const uint64_t v0 = wpNow(); gsvk::gifTransfer(gsvk::submitPath(), data, sizeBytes); g_wpSubNs.fetch_add(wpNow() - v0, std::memory_order_relaxed); g_wpSubN.fetch_add(1, std::memory_order_relaxed); wpReport(); } return;
     } // Vulkan GS: paraLLEl-GS consumes the raw GIF stream
     svr06mtgs::State &s = svr06mtgs::st();
     if ((g_svr06Flags.load(std::memory_order_relaxed) & 2048) || std::this_thread::get_id() == s.worker)
@@ -486,6 +499,7 @@ void svr06MtgsSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
         gs.processGIFPacket(data, sizeBytes);
         return;
     }
+    const uint64_t wpT0 = wpNow();
     std::unique_lock<std::mutex> lk(s.m);
     if (!s.started)
     {
@@ -495,7 +509,7 @@ void svr06MtgsSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
     }
     s.gs = &gs;
     // Back-pressure: never let the GS fall more than ~48 MB of packets behind.
-    s.cvIdle.wait(lk, [&] { return s.bytes < (48u << 20); });
+    { const uint64_t b0 = wpNow(); s.cvIdle.wait(lk, [&] { return s.bytes < (48u << 20); }); g_wpBpNs.fetch_add(wpNow() - b0, std::memory_order_relaxed); g_wpBpN.fetch_add(1, std::memory_order_relaxed); }
     std::vector<uint8_t> v;
     if (!s.pool.empty())
     {
@@ -507,6 +521,8 @@ void svr06MtgsSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
     s.q.push_back(std::move(v));
     lk.unlock();
     s.cvWork.notify_one();
+    g_wpSubNs.fetch_add(wpNow() - wpT0, std::memory_order_relaxed); g_wpSubN.fetch_add(1, std::memory_order_relaxed);
+    wpReport();
 }
 
 namespace
@@ -1029,10 +1045,11 @@ void GS::latchHostPresentationFrame()
     if (gsvk::enabled() && m_privRegs)
     {
         std::vector<uint8_t> rgba; uint32_t w = 0, h = 0;
+        const uint32_t S = static_cast<uint32_t>(gsvk::outputScale()), hostW = kHostFrameWidth * S, hostH = kVkHostH * S; // [scale]
         const bool ok = gsvk::presentFrame(*m_privRegs, rgba, w, h);
-        if (ok && w >= 2u * kHostFrameWidth && (w % kHostFrameWidth) == 0u)
+        if (ok && w >= 2u * hostW && (w % hostW) == 0u)
         {   // paraLLEl-GS scans out at the dot-clock width (e.g. 2560 for a 640 mode): box-filter down to the host frame width
-            const uint32_t f = w / kHostFrameWidth, nw = kHostFrameWidth;
+            const uint32_t f = w / hostW, nw = hostW;
             std::vector<uint8_t> o(static_cast<size_t>(nw) * h * 4u);
             for (uint32_t y = 0; y < h; ++y)
                 for (uint32_t x = 0; x < nw; ++x)
@@ -1045,36 +1062,48 @@ void GS::latchHostPresentationFrame()
             rgba.swap(o); w = nw;
         }
         bool vkNarrow = false;
-        if (ok && w >= 256u && w < kHostFrameWidth)
+        if (ok && w >= 256u * S && w < hostW)
         {
             vkNarrow = true;   // frame-mode screens (512 px wide: copyright, memory card, loading) come out narrower than the host frame: stretch to the full 640 width (4:3) like a real TV/PCSX2 does
-            const uint32_t nw = kHostFrameWidth;
+            const uint32_t nw = hostW;
             std::vector<uint8_t> o(static_cast<size_t>(nw) * h * 4u);
+            static std::vector<uint32_t> s_x0, s_x1, s_t; static uint32_t s_tw = 0, s_tn = 0; // [scale] column table, 8-bit fixed-point weights
+            if (s_tw != w || s_tn != nw)
+            {
+                s_tw = w; s_tn = nw; s_x0.resize(nw); s_x1.resize(nw); s_t.resize(nw);
+                for (uint32_t x = 0; x < nw; ++x)
+                {
+                    const float sx = (static_cast<float>(x) + 0.5f) * static_cast<float>(w) / static_cast<float>(nw) - 0.5f;
+                    int x0 = static_cast<int>(sx < 0.f ? 0.f : sx); int x1 = x0 + 1; if (x1 >= static_cast<int>(w)) x1 = static_cast<int>(w) - 1;
+                    float t = sx - static_cast<float>(x0); if (t < 0.f) t = 0.f; if (t > 1.f) t = 1.f;
+                    s_x0[x] = static_cast<uint32_t>(x0) * 4u; s_x1[x] = static_cast<uint32_t>(x1) * 4u; s_t[x] = static_cast<uint32_t>(t * 256.f + 0.5f);
+                }
+            }
             for (uint32_t y = 0; y < h; ++y)
             {
                 const uint8_t *row = rgba.data() + static_cast<size_t>(y) * w * 4u;
                 uint8_t *orow = o.data() + static_cast<size_t>(y) * nw * 4u;
                 for (uint32_t x = 0; x < nw; ++x)
                 {
-                    const float sx = (static_cast<float>(x) + 0.5f) * static_cast<float>(w) / static_cast<float>(nw) - 0.5f;
-                    int x0 = static_cast<int>(sx < 0.f ? 0.f : sx); int x1 = x0 + 1; if (x1 >= static_cast<int>(w)) x1 = static_cast<int>(w) - 1;
-                    float t = sx - static_cast<float>(x0); if (t < 0.f) t = 0.f; if (t > 1.f) t = 1.f;
-                    for (int c = 0; c < 4; ++c)
-                        orow[x * 4u + c] = static_cast<uint8_t>(row[x0 * 4 + c] * (1.f - t) + row[x1 * 4 + c] * t + 0.5f);
+                    const uint8_t *p0 = row + s_x0[x], *p1 = row + s_x1[x]; const uint32_t t = s_t[x], u = 256u - t;
+                    orow[x * 4u + 0] = static_cast<uint8_t>((p0[0] * u + p1[0] * t + 128u) >> 8);
+                    orow[x * 4u + 1] = static_cast<uint8_t>((p0[1] * u + p1[1] * t + 128u) >> 8);
+                    orow[x * 4u + 2] = static_cast<uint8_t>((p0[2] * u + p1[2] * t + 128u) >> 8);
+                    orow[x * 4u + 3] = static_cast<uint8_t>((p0[3] * u + p1[3] * t + 128u) >> 8);
                 }
             }
             rgba.swap(o); w = nw;
         }
-        if (ok && vkNarrow && h >= 256u && h <= 600u)
+        if (ok && vkNarrow && h >= 256u * S && h <= 600u * S)
         {   // frame-mode screens (copyright, memory card, loading) are rendered into the top of the 512-line field; a TV/PCSX2 centres them vertically
             auto rowLit = [&](uint32_t y) { const uint8_t *r = rgba.data() + static_cast<size_t>(y) * w * 4u; for (uint32_t x = 0; x < w; x += 2u) if (r[x * 4u] > 12 || r[x * 4u + 1] > 12 || r[x * 4u + 2] > 12) return true; return false; };
             int top = -1, bot = -1;
             for (uint32_t y = 0; y < h; ++y) if (rowLit(y)) { if (top < 0) top = static_cast<int>(y); bot = static_cast<int>(y); }
-            const uint32_t outH = h > kVkHostH ? kVkHostH : h;
-            if (top >= 0 && top <= 24 && bot < static_cast<int>(outH) - 24)
+            const uint32_t outH = h > hostH ? hostH : h;
+            if (top >= 0 && top <= 24 * static_cast<int>(S) && bot < static_cast<int>(outH) - 24 * static_cast<int>(S))
             {
                 const int shift = ((static_cast<int>(outH) - 1 - bot) - top) / 2;
-                if (shift > 4 && shift < 120)
+                if (shift > 4 * static_cast<int>(S) && shift < 120 * static_cast<int>(S))
                 {
                     std::vector<uint8_t> o(rgba.size(), 0);
                     for (uint32_t y = 0; y + static_cast<uint32_t>(shift) < h; ++y)
@@ -1083,18 +1112,18 @@ void GS::latchHostPresentationFrame()
                 }
             }
         }
-        const uint32_t cw = w > kHostFrameWidth ? kHostFrameWidth : w, ch = h > kVkHostH ? kVkHostH : h;
+        const uint32_t cw = w > hostW ? hostW : w, ch = h > hostH ? hostH : h;
         std::lock_guard<std::mutex> pl(m_presentationMutex);
         if (!(ok && cw && ch) && gsvk::lastPresentWasQueueFill() && m_hasHostPresentationFrame && !m_hostPresentationFrame.empty())
             return; // [nopink] CL-0115: no new picture this vsync (frame queue refilling, scanout skipped): keep showing the last one, never the magenta placeholder
         m_hasHostPresentationFrame = ok && cw && ch;
         if (m_hasHostPresentationFrame)
         {
-            const size_t hostBytes = static_cast<size_t>(kHostFrameWidth) * kVkHostH * 4u;
-            if (m_hostPresentationFrame.size() != hostBytes || cw < kHostFrameWidth || ch < kVkHostH)
+            const size_t hostBytes = static_cast<size_t>(hostW) * hostH * 4u;
+            if (m_hostPresentationFrame.size() != hostBytes || cw < hostW || ch < hostH)
                 m_hostPresentationFrame.assign(hostBytes, 0); // zero only when the picture does not cover the whole host frame
             for (uint32_t y = 0; y < ch; ++y)
-                std::memcpy(m_hostPresentationFrame.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u, rgba.data() + static_cast<size_t>(y) * w * 4u, static_cast<size_t>(cw) * 4u);
+                std::memcpy(m_hostPresentationFrame.data() + static_cast<size_t>(y) * hostW * 4u, rgba.data() + static_cast<size_t>(y) * w * 4u, static_cast<size_t>(cw) * 4u);
             m_hostPresentationWidth = cw; m_hostPresentationHeight = ch;
         }
         return;
@@ -1186,7 +1215,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * static_cast<size_t>(gsvk::outputScale()) * 4u; // [scale]
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;

@@ -1,0 +1,31 @@
+name: Bug report
+description: Something in the game or launcher is wrong
+labels: ["needs-triage"]
+body:
+  - type: dropdown
+    id: region
+    attributes:
+      label: Game version
+      options: [PAL (Europe/Australia), USA (NTSC-U), Italy, Japan, Korea]
+    validations: { required: true }
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [Boot / black screen, Graphics, Audio, Controls, Menus, Match gameplay, Entrances, Save / memory card, Launcher, Cheats, Other]
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations: { required: true }
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: The launcher's Report page fills this in for you.
+      render: text

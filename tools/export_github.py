@@ -14,7 +14,7 @@ def put(src, rel):
 def text(rel, s):
     dst = os.path.join(out, rel); os.makedirs(os.path.dirname(dst), exist_ok=True)
     open(dst, 'w', encoding='utf-8', newline='\n').write(s); copied.append(rel.replace('\\', '/'))
-BAD = re.compile(r'(\.bak|\.orig|~$|__pycache__|\.pyc$)')
+BAD = re.compile(r'(\.bak|\.cl\d+|\.orig|~$|__pycache__|\.pyc$)')
 def walk(base, exts=None, skipdirs=(), maxsize=1500000, skipnames=lambda n: False):
     for dp, dn, fn in os.walk(base):
         dn[:] = [d for d in dn if d not in skipdirs and not BAD.search(d) and not d.startswith('build')]
@@ -43,16 +43,16 @@ for f in HAND:
     if os.path.exists(s): put(s, 'overrides/' + f)
 text('overrides/README.md', 'Hand-written runtime hooks only. Overlay banks (ovl*/ovx*), recompiled functions (sub_*/entry_*) and *_functions.h are generated from your own disc and are git-ignored.\n')
 # ---- regions
-regions = {
-    'pal': dict(name='Europe / Australia (PAL)', serial='SLES-53676', elf='SLES_536.76', toml='svr06_ps2recomp.toml', status='playable', builddir='build_svr06b_clang', gen='out/generated_r4'),
-    'usa': dict(name='North America (NTSC-U)', serial='SLUS-21286', elf='SLUS_212.86', toml='svr06_usa_ps2recomp.toml', status='in progress: executable recompiles and boots; overlay banks not generated yet', builddir='build_svr06_usa', gen='out/generated_usa'),
-}
-for rid, r in regions.items():
-    src = os.path.join(ROOT, 'config', r['toml'])
+REG = json.load(open(os.path.join(ROOT, 'regions', 'regions.json')))
+put(os.path.join(ROOT, 'regions', 'regions.json'), 'regions/regions.json')
+for r in REG['regions']:
+    rid = r['id']
+    src = os.path.join(ROOT, r['recomp_config'])
     if os.path.exists(src): put(src, 'regions/%s/recomp.toml' % rid)
-    text('regions/%s/region.json' % rid, json.dumps({'id': rid, 'name': r['name'], 'serial': r['serial'], 'boot_elf': r['elf'], 'recomp_config': 'recomp.toml',
-                                                      'status': r['status'], 'generated_dir': r['gen'], 'build_dir': r['builddir']}, indent=2) + '\n')
-    text('regions/%s/README.md' % rid, '# %s - %s\n\nBoot file: `%s` (you supply it from your own disc; never committed).\nStatus: %s.\n\nThis folder holds only addresses and options for the recompiler. Everything generated from the game stays on your machine.\n' % (r['name'], r['serial'], r['elf'], r['status']))
+    text('regions/%s/region.json' % rid, json.dumps(r, indent=2) + '\n')
+    rd = os.path.join(ROOT, 'regions', rid, 'README.md')
+    if os.path.exists(rd): put(rd, 'regions/%s/README.md' % rid)
+    else: text('regions/%s/README.md' % rid, '# %s - %s\n\nBoot file: `%s` (you supply it from your own disc; never committed).\nStatus: %s.\n\nThis folder holds only addresses and options for the recompiler. Everything generated from the game stays on your machine.\n' % (r['name'], r['serial'], r['boot_elf'], r['status']))
 text('regions/README.md', '''# Regions
 
 One repository supports every release of the game. A region is a folder here:
@@ -77,17 +77,17 @@ seen = set()
 for x in oldrt:
     s = os.path.join(RT_SRC, x[len('PS2Recomp/'):])
     if os.path.isfile(s) and rt_ok(os.path.basename(s)) and not BAD.search(x): put(s, x); seen.add(x)
-for sub in ('ps2xRuntime/src/lib', 'ps2xRuntime/include', 'ps2xRuntime/cmake'):
+for sub in ('ps2xRuntime/src/lib', 'ps2xRuntime/include', 'ps2xRuntime/cmake', 'ps2xIOP/src', 'ps2xIOP/include'):
     for p, r in walk(os.path.join(RT_SRC, sub), None, maxsize=3000000, skipnames=lambda n: not rt_ok(n)):
         rel = 'PS2Recomp/' + sub + '/' + r.replace('\\', '/')
         if rel not in seen: put(p, rel); seen.add(rel)
-for f in ('ps2xRuntime/CMakeLists.txt',):
+for f in ('ps2xRuntime/CMakeLists.txt', 'ps2xIOP/CMakeLists.txt'):
     rel = 'PS2Recomp/' + f
     if rel not in seen and os.path.exists(os.path.join(RT_SRC, f)): put(os.path.join(RT_SRC, f), rel)
 # ---- repo scaffolding
 shutil.copyfile(os.path.join(ROOT, 'tools', 'github_templates', '.gitignore'), os.path.join(out, '.gitignore')) if os.path.exists(os.path.join(ROOT, 'tools', 'github_templates', '.gitignore')) else None
-for f in ('.gitignore', '.gitattributes', 'README.md', 'BUILDING.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'release/README.md', 'release/regions.json', 'release/package_release.py',
-          '.github/workflows/ci.yml', '.github/workflows/release.yml', 'tools/launcher/build_launcher.ps1'):
+for f in ('.gitignore', '.gitattributes', 'README.md', 'BUILDING.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'release/README.md', 'release/package_release.py',
+          '.github/workflows/ci.yml', '.github/workflows/release.yml', '.github/workflows/issue-lifecycle.yml', '.github/ISSUE_TEMPLATE/bug_report.yml', '.github/ISSUE_TEMPLATE/config.yml', '.github/labels.json', 'tools/launcher/build_launcher.ps1'):
     t = os.path.join(HERE, 'github_templates', f.replace('/', os.sep))
     if os.path.exists(t): put(t, f)
 if os.path.exists(os.path.join(ROOT, 'docs', 'CHANGELOG-2026-10-28.md')): put(os.path.join(ROOT, 'docs', 'CHANGELOG-2026-10-28.md'), 'CHANGELOG-detailed.md')

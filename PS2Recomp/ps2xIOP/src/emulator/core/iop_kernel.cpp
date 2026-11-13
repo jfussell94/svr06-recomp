@@ -93,6 +93,14 @@ namespace ps2x::iop::detail
                 return true;
             }
             IopThread &thread = it->second;
+            if (thread.state != IopThreadState::Dormant)
+            {
+                // CL-0180: real IOP returns KE_NOT_DORMANT (-414). SvR's sound module starts a pre-made "reaper" thread
+                // with StartThread(reaper, myId) and retries on -414; restarting a busy thread here lost the first
+                // request, so that worker was never deleted and its stack leaked.
+                setV0(-414);
+                return true;
+            }
             thread.cpu = {};
             thread.cpu.pc = thread.entry;
             thread.cpu.gpr[4] = cpu.gpr[5];
@@ -392,7 +400,7 @@ namespace ps2x::iop::detail
             if (id == 12)
             {
                 static int s_s12 = 0;
-                if (++s_s12 < 300)
+                if (++s_s12 < 400000)
                     std::fprintf(stderr, "[iop-sema12] signal cur=%d ra=0x%x thr=%d\n", it->second.current, cpu.gpr[31], m_currentThread ? m_currentThread->id : -1);
             }
             if (id == 8 || id == 9 || id == 10)
@@ -418,7 +426,7 @@ namespace ps2x::iop::detail
             if (id == 12)
             {
                 static int s_w12 = 0;
-                if (++s_w12 < 300)
+                if (++s_w12 < 400000)
                     std::fprintf(stderr, "[iop-sema12] wait cur=%d ra=0x%x thr=%d\n", it->second.current, cpu.gpr[31], m_currentThread ? m_currentThread->id : -1);
             }
             if (id == 8)

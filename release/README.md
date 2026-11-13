@@ -16,4 +16,4 @@ Region builds are not shipped as binaries: they contain code translated from the
 3. Local dry run: `python release/package_release.py --version 0.1.0` (writes `dist/`).
 
 ## Adding a region
-Add a folder under `regions/`, an entry in `release/regions.json`, and an entry in the launcher `BUILDS` list. No fork needed.
+Add a folder under `regions/`, an entry in `regions/regions.json`, and an entry in the launcher `BUILDS` list. No fork needed.

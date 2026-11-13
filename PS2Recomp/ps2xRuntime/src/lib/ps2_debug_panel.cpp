@@ -2244,7 +2244,7 @@ namespace
             stCheck("Fullscreen (F11)", "graphics.fullscreen", 0, "Toggles fullscreen. Applies immediately.");
             const char *fl[] = {"Nearest (sharp, original pixels)", "Bilinear (smooth)"}; stCombo("Texture filter", "graphics.filter", 0, fl, 2, "How the final picture is scaled to the window. Applies immediately.");
             const char *ar[] = {"4:3 (original)", "16:9 widescreen", "Stretch"}; stCombo("Aspect ratio (in development)", "graphics.aspect", 0, ar, 3, "Needs the Vulkan presenter (P5).");
-            const char *rs[] = {"1x native", "2x", "3x", "4x"}; stCombo("Internal resolution / SSAA (in development)", "graphics.scale", 0, rs, 4, "paraLLEl-GS super-sampling; native 1x keeps the 1:1 look.");
+            const char *rs[] = {"1x native", "1x + SSAA 4x", "2x", "2x + SSAA 8x"}; stCombo("Internal resolution (restart)", "graphics.internalRes", 0, rs, 4, "paraLLEl-GS super-sampling; native 1x keeps the 1:1 look.");
             stCheck("VSync (in development)", "graphics.vsync", 1, "Needs the Vulkan swapchain presenter (P5).");
             stSlider("Frame rate cap (in development)", "graphics.fpsCap", 60.0f, 30.0f, 240.0f, "%.0f fps", "60 fps mode needs the game's frame pacing work.");
             stCheck("Deinterlace / anti-blur (in development)", "graphics.antiBlur", 1, "paraLLEl-GS scanout option.");
@@ -2291,7 +2291,7 @@ namespace
         {
             ImGui::TextWrapped("Per-bug switches and developer flags are in the \"SVR06 Flags\" tab. Other tabs: GS viewer, memory, logs, threads.");
             stCheck("Chara update guard", "fix.charaGuard", 1, "Skips updates on destroyed wrestlers (demo-freeze guard). Needs restart; env SVR06_NOCHARAGUARD=1 disables.", true, "controlled by the environment variable today (in development)");
-            if (ImGui::Button("Preset: Original 1:1")) { ps2settings::set("graphics.scale", 0); ps2settings::set("graphics.aspect", 0); ps2settings::set("graphics.filter", 0); }
+            if (ImGui::Button("Preset: Original 1:1")) { ps2settings::set("graphics.internalRes", 0); ps2settings::set("graphics.aspect", 0); ps2settings::set("graphics.filter", 0); }
             ImGui::SameLine();
             if (ImGui::Button("Preset: Smooth")) { ps2settings::set("graphics.filter", 1); }
             ImGui::SameLine();

@@ -1,14 +1,26 @@
 @echo off
-rem close any running instance safely: window-close request, wait up to ~15 s, force only if it is still there
-taskkill /IM svr06run.exe >nul 2>&1
-taskkill /IM ps2EntryRunner.exe >nul 2>&1
+rem per-region executable: SVR06_<REGION>.exe, so a PAL and a USA instance can run side by side (only the same region is closed here)
+if not defined SVR06_LOGTAG set "SVR06_LOGTAG=pal"
+set "RGN=%SVR06_LOGTAG%"
+for %%r in (pal usa ita jpn kor) do if /i "%SVR06_LOGTAG%"=="%%r" call set "RGN=%%r"
+if /i "%RGN%"=="pal" set "RGN=PAL"
+if /i "%RGN%"=="usa" set "RGN=USA"
+if /i "%RGN%"=="ita" set "RGN=ITA"
+if /i "%RGN%"=="jpn" set "RGN=JPN"
+if /i "%RGN%"=="kor" set "RGN=KOR"
+set "EXE=SVR06_%RGN%.exe"
+rem close a running instance of THIS region safely: window-close request, wait up to ~15 s, force only if it is still there
+taskkill /IM %EXE% >nul 2>&1
+if /i "%RGN%"=="PAL" taskkill /IM svr06run.exe >nul 2>&1
 for /l %%i in (1,1,15) do (
-  tasklist /fi "imagename eq svr06run.exe" 2>nul | find /i "svr06run.exe" >nul || tasklist /fi "imagename eq ps2EntryRunner.exe" 2>nul | find /i "ps2EntryRunner.exe" >nul || goto :closed
+  tasklist /fi "imagename eq %EXE%" 2>nul | find /i "%EXE%" >nul || goto :closed
   timeout /t 1 /nobreak >nul
 )
 :closed
-taskkill /F /IM svr06run.exe >nul 2>&1
-taskkill /F /IM ps2EntryRunner.exe >nul 2>&1
+  timeout /t 1 /nobreak >nul
+)
+:closed
+taskkill /F /IM %EXE% >nul 2>&1
 rem Region-aware launcher: set SVR06_ELF to a specific boot ELF, otherwise the PAL (SLES_536.76) ELF is searched for under assets\
 set "ELF=%SVR06_ELF%"
 if not defined ELF for /r "%~dp0..\..\assets" %%e in (SLES_536.76) do if exist "%%e" set "ELF=%%e"
@@ -41,10 +53,11 @@ if not exist "%SVR06_SHOTDIR%" mkdir "%SVR06_SHOTDIR%"
 del /q "%SVR06_SHOTDIR%\*.png" 2>nul
 if not defined SVR06_BUILDPATH set "SVR06_BUILDPATH=%~dp0..\..\PS2Recomp\build_svr06b_clang"
 cd /d "%SVR06_BUILDPATH%"
-taskkill /F /IM svr06run.exe >nul 2>&1
+if not exist analysis\live mkdir analysis\live
+taskkill /F /IM %EXE% >nul 2>&1
 for %%f in (ps2EntryRunner.exe ps2xRuntime\ps2EntryRunner.exe) do if exist %%f (
-  copy /y %%f "%%~dpfsvr06run.exe" >nul
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0runcap.ps1" "%%~dpfsvr06run.exe" "%ELF%" %SVR06_MAXSECS%
+  copy /y %%f "%%~dpf%EXE%" >nul
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0runcap.ps1" "%%~dpf%EXE%" "%ELF%" %SVR06_MAXSECS%
   goto :eof
 )
 echo ps2EntryRunner.exe not found - run scripts\link_runtime.ps1 first

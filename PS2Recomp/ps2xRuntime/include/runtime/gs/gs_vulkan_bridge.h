@@ -32,6 +32,7 @@ bool readVramPages(uint32_t firstPage, uint32_t numPages, uint8_t *dst); // [gss
 // Flush, vsync and read the scanned-out frame back as tightly packed RGBA8.
 // Returns false if no image is available this vsync.
 bool presentFrame(const GSRegisters &privRegs, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
+int outputScale(); // [scale] 1 or 2: host presentation frame is 640x512 times this
 bool lastPresentWasQueueFill(); // [nopink] CL-0115: true when the last presentFrame() returned false only because the frame queue was refilling
 } // namespace gsvk
 

@@ -10,6 +10,8 @@
 #include "ps2_settings.h"
 
 std::atomic<int> g_svr06ForceBtn{0};
+void svr06RevTick(int player, uint16_t &btns);
+std::atomic<uint64_t> g_svr06PadView[2] = {{0xFFFFull}, {0xFFFFull}}; // what the game would see per player: low 16 bits = buttons (active low), then LX LY RX RY bytes (input viewer in the F1 menu)
 // SvR06: a real START press that skipped the title movie is carried over to the game's own PRESS START prompt (one physical press = one menu step).
 std::atomic<long long> g_svr06StartCarryNs{0};
 std::atomic<bool> g_svr06StartDown{false}; // true while the pad data handed to the game has START pressed // bit mask of PS2 pad buttons held by test hooks (0x0008 = START)
@@ -60,6 +62,17 @@ int bindingFor(int player, int i)
     char k[64]; std::snprintf(k, sizeof k, "input.p%d.btn.%s", player + 1, kPadBinds[i].name);
     return ps2settings::getInt(k, kPadBinds[i].defBtn);
 }
+int defaultKey(int i, int alt)
+{
+    static const int kDef[16][2] = {{KEY_UP, KEY_W}, {KEY_DOWN, KEY_S}, {KEY_LEFT, KEY_A}, {KEY_RIGHT, KEY_D}, {KEY_X, KEY_SPACE}, {KEY_C, KEY_ESCAPE}, {KEY_Z, KEY_KP_0}, {KEY_V, KEY_KP_1},
+                                    {KEY_Q, 0}, {KEY_E, 0}, {KEY_LEFT_SHIFT, 0}, {KEY_RIGHT_SHIFT, 0}, {0, 0}, {0, 0}, {KEY_TAB, 0}, {KEY_ENTER, 0}};
+    return kDef[i & 15][alt ? 1 : 0];
+}
+int keyFor(int player, int i, int alt)
+{
+    char k[72]; std::snprintf(k, sizeof k, "input.p%d.key%s.%s", player + 1, alt ? "2" : "", kPadBinds[i].name);
+    return ps2settings::getInt(k, defaultKey(i, alt));
+}
 // Which raylib gamepad drives this player (-1 = none).
 int gamepadFor(int player)
 {
@@ -103,7 +116,6 @@ bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
     if ((port != 0 && port != 1) || slot != 0)
         return true;
     const int player = port;
-    { extern std::atomic<bool> g_svr06MenuOpen; if (g_svr06MenuOpen.load()) return true; } // menu open: game sees an idle pad
 
     uint16_t btns = 0xFFFFu;
     const int kGamepad = svr06input::gamepadFor(player);
@@ -136,6 +148,13 @@ bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
             if (ly < -0.5f) clearBit(PAD_UP);
             if (ly > 0.5f) clearBit(PAD_DOWN);
         }
+        {
+            char k1[40], k2[40]; std::snprintf(k1, sizeof k1, "input.p%d.swapsticks", player + 1); std::snprintf(k2, sizeof k2, "input.p%d.invertry", player + 1);
+            if (ps2settings::getInt(k1, 0)) { std::swap(lx, rx); std::swap(ly, ry); }
+            if (ps2settings::getInt(k2, 0)) ry = -ry;
+            std::snprintf(k2, sizeof k2, "input.p%d.invertly", player + 1);
+            if (ps2settings::getInt(k2, 0)) ly = -ly;
+        }
         data[6] = static_cast<uint8_t>(128 + lx * 127);
         data[7] = static_cast<uint8_t>(128 + ly * 127);
         data[4] = static_cast<uint8_t>(128 + rx * 127);
@@ -143,35 +162,34 @@ bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
     }
     if (svr06input::keyboardFor(player))
     {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
+        for (int i = 0; i < 16; ++i)
+            for (int alt = 0; alt < 2; ++alt)
+            {
+                const int key = svr06input::keyFor(player, i, alt);
+                if (key > 0 && IsKeyDown(key)) clearBit(svr06input::kPadBinds[i].mask);
+            }
     }
+    {   // accessibility: mash assist (hold Cross to pulse it) and sticky shoulders
+        char k[40];
+        std::snprintf(k, sizeof k, "input.p%d.mashAssist", player + 1);
+        if (ps2settings::getInt(k, 0) && !(btns & PAD_CROSS))
+        {
+            const double hz = std::max(2.0, (double)ps2settings::getFloat("input.mashHz", 12.0f));
+            if (std::fmod(GetTime() * hz, 1.0) < 0.5) btns |= PAD_CROSS; // off half of each cycle
+        }
+        std::snprintf(k, sizeof k, "input.p%d.sticky", player + 1);
+        if (ps2settings::getInt(k, 0))
+        {
+            static uint16_t s_latched[2] = {0, 0}, s_prev[2] = {0, 0};
+            const uint16_t sh = PAD_L1 | PAD_R1 | PAD_L2 | PAD_R2;
+            const uint16_t down = (uint16_t)(~btns & sh), edge = down & ~s_prev[player];
+            s_prev[player] = down; s_latched[player] ^= edge;
+            btns |= sh; btns &= ~s_latched[player];
+        }
+    }
+    svr06RevTick(player, btns);
+    g_svr06PadView[player].store((uint64_t)btns | ((uint64_t)data[6] << 16) | ((uint64_t)data[7] << 24) | ((uint64_t)data[4] << 32) | ((uint64_t)data[5] << 40));
+    { extern std::atomic<bool> g_svr06MenuOpen; if (g_svr06MenuOpen.load()) { data[2] = data[3] = 0xFF; data[4] = data[5] = data[6] = data[7] = kPadStickCenter; return true; } } // menu open: game sees an idle pad
 
     if (player != 0)
     {

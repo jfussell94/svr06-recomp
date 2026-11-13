@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cctype>
 
+static uint32_t g_svr06CdRa = 0; // [cdra] caller of the last sceCdRead, printed in the [cdlog] line
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -445,7 +446,7 @@ namespace
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
             const uint64_t offset = relativeLbn * kCdSectorSize;
             { static int n_=0, sp_=0; const bool past_ = (offset + byteCount) > entry.sizeBytes;
-              if (n_++ < 8000 || (past_ && sp_++ < 400)) std::cerr << std::hex << "[cdlog] lbn=" << lbn << " sec=" << sectors << " bytes=" << byteCount << " dst=" << reinterpret_cast<uintptr_t>(dst) << " file=" << entry.hostPath.filename().string() << " off=" << offset << " fsize=" << entry.sizeBytes << (past_ ? " PAST_EOF" : "") << std::dec << std::endl; }
+              if (n_++ < 8000 || (past_ && sp_++ < 400)) std::cerr << std::hex << "[cdlog] lbn=" << lbn << " sec=" << sectors << " bytes=" << byteCount << " dst=" << reinterpret_cast<uintptr_t>(dst) << " file=" << entry.hostPath.filename().string() << " off=" << offset << " fsize=" << entry.sizeBytes << " ra=" << g_svr06CdRa << (past_ ? " PAST_EOF" : "") << std::dec << std::endl; }
             return readHostRange(entry.hostPath, offset, dst, byteCount);
         }
 

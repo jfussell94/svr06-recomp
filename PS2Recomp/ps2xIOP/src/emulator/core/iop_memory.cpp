@@ -1,3 +1,4 @@
+#include <vector>
 #include "ps2x/iop/spu2.h"
 #include <cstdio>
 #include "iop_memory.h"
@@ -388,7 +389,11 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        // ISS-162 / CL-0180: first-fit from the heap base so freed blocks are reused (AllocSysMemory semantics).
+        // The old bump cursor never went back, so every per-request IOP thread stack / transfer buffer leaked address
+        // space; after ~8 sound-bank loads (fn 0x67: CreateThread + 0x2F000 buffer) CreateThread failed, the EE waited
+        // forever for the bank callback -> NOW LOADING hang.
+        uint32_t candidate = alignUp(HeapBase, alignment);
         for (;;)
         {
             bool overlap = false;
@@ -426,9 +431,30 @@ namespace ps2x::iop::detail
         return true;
     }
 
+    void IopMemory::dumpAllocations(const char *why) const
+    {
+        std::vector<Allocation> b(m_allocations.begin(), m_allocations.end());
+        std::sort(b.begin(), b.end(), [](const Allocation &x, const Allocation &y) { return x.size > y.size; });
+        uint64_t total = 0; for (const auto &x : b) total += x.size;
+        std::fprintf(stderr, "[iopheap] %s: %zu blocks, %llu bytes allocated, maxFree=0x%x, heap=[0x%x,0x%x)\n", why, b.size(), (unsigned long long)total, maxFreeMemory(), HeapBase, HeapLimit);
+        for (size_t i = 0; i < b.size() && i < 14; ++i) std::fprintf(stderr, "[iopheap]   0x%x size=0x%x\n", b[i].address, b[i].size);
+    }
+
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        // largest free gap (QueryMaxFreeMemSize semantics) now that freed blocks are reused
+        std::vector<Allocation> blocks;
+        for (const auto &b : m_allocations)
+            if (b.address + b.size > HeapBase && b.address < HeapLimit) blocks.push_back(b);
+        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b) { return a.address < b.address; });
+        uint32_t best = 0u, cur = HeapBase;
+        for (const auto &b : blocks)
+        {
+            if (b.address > cur) best = std::max(best, b.address - cur);
+            cur = std::max(cur, b.address + b.size);
+        }
+        if (HeapLimit > cur) best = std::max(best, HeapLimit - cur);
+        return best;
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

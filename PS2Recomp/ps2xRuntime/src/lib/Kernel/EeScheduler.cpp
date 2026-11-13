@@ -189,6 +189,7 @@ void EeScheduler::run()
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
                 publishSnapshot();
+                m_runtime.flushIopEeCycles(); // IOP batching: bring the IOP up to date before the EE sleeps
                 waitForEvent();
                 continue;
             }
@@ -1994,7 +1995,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         svr06MtgsWaitIdle(); // CL-0040: finish this frame's GS work before the flip
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
-        if (std::getenv("SVR06_EEDUMP") && (m_vsyncTick == 1500u || m_vsyncTick == 3000u || m_vsyncTick == 6000u || m_vsyncTick == 7900u)) // [fps60] CL-0112: 32 MB dumps at fixed ticks stalled the intro/title; now opt-in
+        static const bool s_eeDumpEnv = std::getenv("SVR06_EEDUMP") != nullptr;
+        if (s_eeDumpEnv && (m_vsyncTick == 1500u || m_vsyncTick == 3000u || m_vsyncTick == 6000u || m_vsyncTick == 7900u)) // [fps60] CL-0112: 32 MB dumps at fixed ticks stalled the intro/title; now opt-in
         {
             char nm[256];
             std::snprintf(nm, sizeof(nm), "analysis\\ee_dump_%u.bin", (unsigned)m_vsyncTick);

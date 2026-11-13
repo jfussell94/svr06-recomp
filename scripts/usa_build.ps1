@@ -11,13 +11,18 @@ $bdir = 'build_svr06_usa'
 . (Join-Path $PSScriptRoot 'progress_lib.ps1')
 "==== USA BUILD START $(Get-Date)" | Out-File -Encoding ascii $log
 function Say($t) { Write-Host $t -ForegroundColor Cyan; $t | Out-File -Append -Encoding ascii $log }
-Get-Process svr06run, ps2EntryRunner -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch {} }
+Get-Process SVR06_USA, ps2EntryRunner -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch {} }
 
 # 1. address map + USA recompiler config (idempotent)
 if (-not (Test-Path (Join-Path $root 'config\svr06_usa_ps2recomp.toml')) -or $Regen) {
   Say '1/4 Building the PAL->USA address map and USA config...'
   Push-Location $root; python tools\usa_map.py 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
 }
+# 1b. CL-0167: keep the USA stub list identical to what the PAL build really runs (PAL runner = reference). Functions the PAL
+#     build executes as real recompiled code (e.g. the game's own sceMpeg/sceIpu library, which decodes the in-memory
+#     arena/menu videos) must not become HLE stubs in USA. Writes the toml only on change; report analysis\usa\stub_sync_report.txt
+Say '1b/4 Syncing the USA stub list with the PAL build...'
+Push-Location $root; python tools\usa_stub_sync.py 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
 # 2. recompile the USA ELF
 $exe = Join-Path $palrt 'ps2xRecomp\build\ps2xRecomp\Release\ps2_recomp.exe'
 $regf = Join-Path $gen 'register_functions.cpp'
@@ -44,14 +49,19 @@ Get-ChildItem (Join-Path $root 'overrides') -File -Filter *.cpp -ErrorAction Sil
   if ($keep -contains $_.Name) { Copy-Item $_.FullName $t -Force } elseif (Test-Path $t) { Remove-Item $t -Force }
 }
 Get-ChildItem (Join-Path $root 'overrides') -File -Filter *.h -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName (Join-Path $usart 'ps2xRuntime\include') -Force }
-# PAL address hooks must not be installed on the USA executable
-$ov = Join-Path $rd 'svr06_overrides.cpp'
-$c = [System.IO.File]::ReadAllText($ov)
-$c = $c.Replace('runtime.registerFunction(', 'SVR06_NOREG(')
-$c = "#define SVR06_NOREG(...) ((void)0)`n" + $c
-[System.IO.File]::WriteAllText($ov, $c)
+# CL-0154: the PAL game overrides (CD timing, RPC loop, IPU/syscall stubs, movie + music hooks, guards) are translated to USA addresses
+# (code via the PAL->USA map, data +DATA_DELTA) and the override descriptor is retargeted to SLUS_212.86. Report: analysis\usa\port\usa_port_report.txt
+$portdir = Join-Path $root 'analysis\usa\port'
+Push-Location $root; python tools\usa_port_overrides.py $portdir 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
+foreach ($f in 'svr06_overrides.cpp','svr06_funcs.h') { $src = Join-Path $portdir $f; if (Test-Path $src) { Copy-Item $src (Join-Path $rd $f) -Force } else { Write-Host "USA port output missing: $f" -ForegroundColor Red } }
+foreach ($f in 'svr06_funcs.h','svr06_engine.h') { $src = Join-Path $portdir $f; if (Test-Path $src) { Copy-Item $src (Join-Path $usart "ps2xRuntime\include\$f") -Force } }
 Copy-Item (Join-Path $gen '*.cpp') $rd -Force
 Copy-Item (Join-Path $gen '*.h') $rd -Force
+# overlay banks recompiled from the USA BIN.PAC overlays (tools\usa_ovl_all.sh -> out\usa_ovl\x\<bank>\final)
+Get-ChildItem (Join-Path $root 'out\usa_ovl\x') -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+  $f = Join-Path $_.FullName 'final'
+  if (Test-Path $f) { Copy-Item (Join-Path $f '*.cpp') $rd -Force; Copy-Item (Join-Path $f '*.h') $rd -Force }
+}
 # 4. configure + build
 $elf = Get-ChildItem -LiteralPath (Join-Path $root '..\assets') -Filter 'SLUS_212.86' -File -Recurse | Select-Object -First 1
 if (-not $elf) { Write-Host 'SLUS_212.86 not found under assets' -ForegroundColor Red; Read-Host 'Press Enter to close'; exit 1 }

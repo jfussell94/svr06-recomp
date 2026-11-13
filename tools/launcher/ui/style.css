@@ -193,7 +193,36 @@ html,body{height:100%}
 .dis{opacity:.4;pointer-events:none}
 .seg button:disabled{cursor:not-allowed}
 
-.buildsel{display:flex;align-items:center;gap:12px;margin-top:16px}
-.buildsel label{font-size:12px;letter-spacing:.12em;text-transform:uppercase;opacity:.65}
-.buildsel select{background:var(--panel2,rgba(255,255,255,.06));color:inherit;border:1px solid rgba(255,255,255,.18);border-radius:8px;padding:9px 12px;font:inherit;min-width:340px;max-width:100%}
-.buildsel select option{color:#111}
+.buildsel{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-top:12px}
+.buildsel label{font-size:12px;letter-spacing:.12em;text-transform:uppercase;opacity:.65;flex:0 0 112px}
+.buildsel select{background:var(--panel);color:var(--text);color-scheme:dark;border:1px solid rgba(255,255,255,.18);border-radius:8px;padding:9px 12px;font:inherit;min-width:0;width:300px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.buildsel .btn{white-space:nowrap}
+
+
+select,.sel{background:var(--panel);color:var(--text);border:1px solid var(--line2);border-radius:10px;padding:8px 12px;font:inherit;outline:none}
+select option,.sel option{background:var(--panel);color:var(--text)}
+select option:disabled{color:var(--muted)}
+html[data-theme="light"] select,html[data-theme="light"] .sel{color-scheme:light}
+html:not([data-theme="light"]) select,html:not([data-theme="light"]) .sel{color-scheme:dark}
+.fld{margin-top:12px}.fld label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;letter-spacing:.04em}
+.fld .wide,.fld .sel{width:100%;box-sizing:border-box}.fld.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+textarea.in{resize:vertical;min-height:70px;font:inherit}
+.tk{border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:10px}.tk.verify{border-color:#0e8a16;background:color-mix(in srgb,#0e8a16 10%,transparent)}
+.tk-h{display:flex;justify-content:space-between;gap:10px;align-items:center}.tk-h a{color:var(--text);font-weight:600;text-decoration:none}.tk-h a:hover{text-decoration:underline}
+
+/* CL-0160: typed text in inputs/textareas must follow the theme (textarea does not inherit colour by default) */
+.in,input,textarea,select{color:var(--text);caret-color:var(--accent);background-color:var(--panel)}
+.in::placeholder,input::placeholder,textarea::placeholder{color:var(--muted);opacity:.8}
+input:-webkit-autofill{-webkit-text-fill-color:var(--text);box-shadow:0 0 0 100px var(--panel) inset}
+
+.chkwrap{display:flex;flex-direction:column;align-items:flex-end;gap:8px;max-width:340px}
+.chklist{width:320px;max-height:260px;overflow:auto;background:var(--panel3);border:1px solid var(--line);border-radius:12px;padding:8px}
+.chkbar{display:flex;gap:6px;margin-bottom:6px;position:sticky;top:0;background:var(--panel3)}
+.chkrow{display:flex;align-items:center;gap:8px;padding:4px 2px;cursor:pointer;font-size:13px}
+.chkrow input{width:16px;height:16px;accent-color:var(--accent,#7c5cff)}
+
+.chkwrap{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.chkgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:2px 16px;padding:6px 18px 14px}
+.chkgrid .chkrow{background:none}
+
+.seg button{white-space:nowrap;flex:0 0 auto}

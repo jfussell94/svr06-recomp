@@ -468,6 +468,8 @@ namespace ps2x::iop::detail
         uint64_t next = fallback;
         for (const Timer &timer : m_timers)
         {
+            if (!timer.running) // serviceDue() ignores stopped timers; a stale cycle here made the idle IOP loop crawl 1 cycle/iteration
+                continue;
             next = std::min(next, timer.compareCycle);
             next = std::min(next, timer.overflowCycle);
         }

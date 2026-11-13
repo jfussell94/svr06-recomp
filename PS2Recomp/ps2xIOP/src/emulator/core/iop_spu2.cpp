@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdlib>
 #include "ps2x/iop/spu2.h"
 
@@ -141,11 +142,11 @@ namespace ps2x::iop
             decodeBlock(vo);
             vo.pos = 0.0;
             c.endx &= ~(1u << idx);
-            if (g.koncount < 400 && (vo.ssa != 0x2800 || vo.volL || vo.volR))
+            if (g.koncount < 30000 && (vo.ssa != 0x2800 || vo.volL || vo.volR))
             {
                 ++g.koncount;
-                std::fprintf(stderr, "[spu2] KON core=%d v=%d ssa=0x%x(bytes 0x%x) pitch=0x%x vol=%04x/%04x adsr=%04x/%04x\n",
-                             coreIdx, idx, vo.ssa, vo.ssa * 2u, vo.pitch, vo.volL, vo.volR, vo.adsr1, vo.adsr2);
+                std::fprintf(stderr, "[spu2] KON t=%llu core=%d v=%d ssa=0x%x(bytes 0x%x) pitch=0x%x vol=%04x/%04x adsr=%04x/%04x\n",
+                             (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), coreIdx, idx, vo.ssa, vo.ssa * 2u, vo.pitch, vo.volL, vo.volR, vo.adsr1, vo.adsr2);
             }
         }
 

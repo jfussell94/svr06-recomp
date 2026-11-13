@@ -1,3 +1,5 @@
+#include <cstdint>
+uint32_t svr06LaunchSeed();
 #include <ctime>
 #include "Common.h"
 #include "LibC.h"
@@ -115,7 +117,8 @@ namespace ps2_stubs
                 break;
             }
 
-            ::memcpy(hostDest, hostSrc, chunk);
+            // overlapping ranges are UB for memcpy; the guest newlib copies forward, memmove is a safe superset
+            ::memmove(hostDest, hostSrc, chunk);
             copied += chunk;
             curDst += chunk;
             curSrc += chunk;
@@ -1102,14 +1105,14 @@ namespace ps2_stubs
     static bool s_randSeeded = false;
     void rand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        if (!s_randSeeded) { s_randSeeded = true; std::srand(static_cast<unsigned>(std::time(nullptr)) ^ static_cast<unsigned>(std::clock())); }
+        if (!s_randSeeded) { s_randSeeded = true; std::srand(svr06LaunchSeed()); }
         setReturnS32(ctx, std::rand() & 0x7FFF);
     }
 
     void srand(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         s_randSeeded = true;
-        std::srand(getRegU32(ctx, 4) ^ static_cast<unsigned>(std::time(nullptr)));
+        std::srand(getRegU32(ctx, 4) ^ svr06LaunchSeed());
         setReturnS32(ctx, 0);
     }
 

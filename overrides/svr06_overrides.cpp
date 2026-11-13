@@ -623,8 +623,10 @@ namespace
     // SVR06_VOICE_PTID="22:PBPPAC,18:ANNOUNCE" forces the mapping when the game's own partition load never runs
     static void voicePtidFromEnv()
     {
+        // Default map from PACLISTP.H/ADDLISTP.H order (bgm/pbppac, bg_env, sfx_env, cheer, announce, casvoice = ptid 18..23); verified against
+        // the fids the game requests (ptid 18 fids up to 3722 = PBPPAC 4728 clips, ptid 20 fid<=6, ptid 21 fid 0/11/23/26).
         const char *e = std::getenv("SVR06_VOICE_PTID");
-        if (!e) return;
+        if (!e) e = "18:PBPPAC,19:BG_ENV,20:SFX_ENV,21:CHEER,22:ANNOUNCE,23:CASVOICE";
         std::string tok;
         std::stringstream ss(e);
         while (std::getline(ss, tok, ','))
@@ -965,7 +967,9 @@ namespace
         else if (pt >= 18u && pt < 64u && !g_ptidArc[pt].empty())
         {
             const char *arc = g_ptidArc[pt].c_str();
-            const bool loop = adxFileLoops(arc, (int)fid);
+            const std::string arcs(arc); // speech archives are one-shot clips: their ADX headers carry a loop flag that made one line repeat forever
+            const bool speech = arcs.find("PBPPAC") != std::string::npos || arcs.find("ANNOUNCE") != std::string::npos || arcs.find("CASVOICE") != std::string::npos;
+            const bool loop = !speech && adxFileLoops(arc, (int)fid);
             const bool ok = svr06_music_start(h, arc, (int)fid, loop); // the game's own handle, so Stop/GetStat/SetOutVol keep working
             std::fprintf(stderr, "[voice] StartAfs handle=%X ptid=%u fid=%u %s loop=%d free=%d -> %s\n",
                          h, pt, fid, arc, loop ? 1 : 0, svr06_voice_free_slots(), ok ? "native" : "FAILED");

@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <chrono>
+#include <cstdio>
 #include <cstdio>
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
@@ -500,6 +503,17 @@ namespace ps2x::iop::detail
             if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
                 return;
 
+            // Honour CpuSuspendIntr critical sections: a DMA-complete handler must not run while the guest has interrupts
+            // disabled. The interrupt state is global here (real IOP keeps it per thread), so cap the deferral to avoid a
+            // stall if a thread blocks while holding the section.
+            static uint32_t s_intrDeferred = 0;
+            if (memory.interruptControl() == 0u && s_intrDeferred < 256u)
+            {
+                ++s_intrDeferred;
+                return;
+            }
+            s_intrDeferred = 0;
+
             servicingDmaInterrupts = true;
 
             std::vector<int> completed;
@@ -586,13 +600,25 @@ namespace ps2x::iop::detail
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
+                        static uint64_t sIter = 0, sAdv = 0, sSrc[4] = {0, 0, 0, 0}, sRuns = 0; static auto sLast = std::chrono::steady_clock::now();
+                        const uint64_t w0 = kernel.nextWakeCycle(target);
+                        uint64_t nextWake = w0, wT = target, wD = UINT64_MAX, wC = UINT64_MAX;
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
-                            nextWake = std::min(nextWake, completionCycle);
+                            wD = std::min(wD, completionCycle);
+                        nextWake = std::min(nextWake, wD);
                         if (!pendingGuestCallbacks.empty())
-                            nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                        {
+                            wC = pendingGuestCallbacks.begin()->first;
+                            nextWake = std::min(nextWake, wC);
+                        }
+                        const uint64_t beforeT = nextWake;
                         nextWake = timrman.nextEventCycle(nextWake);
-                        totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                        const uint64_t newTotal = std::max(totalCycles + 1u, std::min(target, nextWake));
+                        ++sIter; sAdv += newTotal - totalCycles;
+                        ++sSrc[nextWake < beforeT ? 3 : (wD <= nextWake ? 1 : (wC <= nextWake ? 2 : (w0 <= nextWake ? 0 : 0)))];
+                        (void)wT;
+                        totalCycles = newTotal;
+                        if ((sIter & 1023u) == 0u) { const auto now = std::chrono::steady_clock::now(); if (now - sLast > std::chrono::seconds(3)) { sLast = now; std::fprintf(stderr, "[iopidle] 3s: iters=%llu avgAdvance=%.1f src(thr/dma/cb/timer)=%llu/%llu/%llu/%llu\n", (unsigned long long)sIter, sIter ? (double)sAdv / sIter : 0.0, (unsigned long long)sSrc[0], (unsigned long long)sSrc[1], (unsigned long long)sSrc[2], (unsigned long long)sSrc[3]); sIter = sAdv = sSrc[0] = sSrc[1] = sSrc[2] = sSrc[3] = 0; } }
                         continue;
                     }
                     const uint64_t before = totalCycles;
@@ -767,10 +793,27 @@ namespace ps2x::iop::detail
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+        // Batch: the EE reports ~1000 cycles at a time (270k calls/s); entering the scheduler that often cost ~25% of the game thread.
+        static const uint64_t kBatch = [] { const char *v = std::getenv("SVR06_IOPBATCH"); return v ? (uint64_t)std::strtoull(v, nullptr, 10) : 16384ull; }();
+        if (total < kBatch)
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
         if (iopCycles)
             m_impl->runCycles(iopCycles);
+    }
+
+    void IopEmulator::flushEeCycles() noexcept
+    {
+        const uint64_t total = m_impl->eeCycleCarry;
+        const uint64_t iopCycles = total / 8u;
+        if (!iopCycles)
+            return;
+        m_impl->eeCycleCarry = total % 8u;
+        m_impl->runCycles(iopCycles);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

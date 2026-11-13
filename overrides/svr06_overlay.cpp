@@ -20,6 +20,7 @@ namespace svr06ovl
             uint32_t sigWord[8]{};
             uint32_t sigCount = 0;
             std::vector<PS2Runtime::RecompiledFunction> table; // dense, (addr-lo)>>2
+            std::vector<PS2Runtime::RecompiledFunction> mid;   // memo: enclosing function for mid-function targets (same index as table)
             std::vector<uint32_t> labels;                       // sorted: every address the bank's code can be entered at
 
         };
@@ -45,6 +46,7 @@ namespace svr06ovl
             b.sigWord[i] = sigWords[i];
         }
         b.table.assign(static_cast<size_t>((winHi - winLo) >> 2) + 1, nullptr);
+        b.mid.assign(b.table.size(), nullptr);
         banks().push_back(std::move(b));
         return static_cast<int>(banks().size()) - 1;
     }
@@ -103,12 +105,14 @@ namespace svr06ovl
     {
         if ((addr & 3u) != 0u || !rdram)
             return nullptr;
-        for (const Bank &b : banks())
+        for (Bank &b : banks())
         {
             if (addr < b.lo || addr > b.hi)
                 continue;
             PS2Runtime::RecompiledFunction fn = b.table[(addr - b.lo) >> 2];
-            if (!fn)
+            if (!fn && b.mid[(addr - b.lo) >> 2])
+                fn = b.mid[(addr - b.lo) >> 2]; // memoized enclosing function (skips the backward table scan + diagnostics)
+            else if (!fn)
             {
                 // Mid-function target: resume inside the nearest preceding function (generated code dispatches on ctx->pc).
                 uint32_t a = addr;
@@ -120,6 +124,7 @@ namespace svr06ovl
                 }
                 if (!fn)
                     continue;
+                b.mid[(addr - b.lo) >> 2] = fn;
                 // The generated function dispatches on ctx->pc; an address it has no label for silently runs the
                 // function from its START. Report each such address once (it needs an entry point in ovl_recomp).
                 if (!b.labels.empty() && !std::binary_search(b.labels.begin(), b.labels.end(), addr))

@@ -482,6 +482,7 @@ private:
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void advanceIopEeCycles(uint64_t eeCycles) noexcept;
+    void flushIopEeCycles() noexcept;
     void resetIop();
 
     friend class PS2IopTransport;

@@ -1,0 +1,14 @@
+{
+  "id": "jpn",
+  "name": "Japan (NTSC-J, Exciting Pro Wres)",
+  "short": "Japan - NTSC-J",
+  "serial": "SLPM-66268",
+  "boot_elf": "SLPM_662.68",
+  "status": "planned",
+  "recomp_config": "config/svr06_jpn_ps2recomp.toml",
+  "generated_dir": "out/generated_jpn",
+  "runtime_dir": "PS2Recomp_jpn",
+  "build_dir": "build_svr06_jpn",
+  "state": "planned",
+  "tags": []
+}

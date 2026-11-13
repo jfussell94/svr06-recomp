@@ -1,3 +1,4 @@
+#include <map>
 // SvR06 live console: lets the developer poke the running game without rebuilding.
 // Each frame the presenter calls svr06_console_poll(); if analysis/live/cmd.txt exists its lines are executed,
 // results are appended to analysis/live/out.txt and cmd.txt is renamed to cmd_done.txt.
@@ -61,9 +62,62 @@ std::atomic<uint8_t *> g_svr06Vu0Data{nullptr};
 std::atomic<uint8_t *> g_svr06Vu0Code{nullptr}; // ISS-139: VU0 micro memory for the vu0c command
 std::atomic<int> g_svr06CmdBtn{0};       // PS2 pad mask held by console "press"
 std::atomic<int> g_svr06CmdBtnFrames{0}; // frames left
+#include "ps2_settings.h"
+#include "../../ps2_cheat_tables.h"
+// ---- launcher options kept in svr06_settings.json (F1 menu > Settings > Game) -> the SVR06_* environment, before anything reads it.
+// A key that is absent leaves the launcher's value alone, so a launcher start and a plain start behave the same.
+namespace
+{
+void svr06PutEnv(const char *name, const char *val)
+{
+    std::string kv = std::string(name) + "=" + (val ? val : "");
+#if defined(_WIN32)
+    _putenv(kv.c_str());
+#else
+    if (val) setenv(name, val, 1); else unsetenv(name);
+#endif
+}
+bool svr06IsUsaExe()
+{
+#if defined(_WIN32)
+    char b[520] = {0}; GetModuleFileNameA(nullptr, b, sizeof b - 1);
+    std::string n = b; for (auto &c : n) c = (char)std::tolower((unsigned char)c);
+    return n.find("usa") != std::string::npos;
+#else
+    return false;
+#endif
+}
+struct LauncherEnv
+{
+    LauncherEnv()
+    {
+        using namespace ps2settings;
+        static const char *kIcons[] = {"", "xboxone", "xbox360", "ps3", "ps4", "ps5", "switchpro", "switchpro2", "mypack"};
+        auto has = [](const char *k) { Store &st = store(); std::lock_guard<std::mutex> l(st.m); st.load(); return st.v.find(k) != st.v.end(); };
+        if (has("game.mode")) { if (getInt("game.mode", 0) == 1) svr06PutEnv("SVR06_FLAGS", "536870912"); else svr06PutEnv("SVR06_FLAGS", nullptr); }
+        if (has("game.probes")) { if (getInt("game.probes", 1)) svr06PutEnv("SVR06_NOPROBES", nullptr); else { svr06PutEnv("SVR06_NOPROBES", "1"); svr06PutEnv("SVR06_PROBES", nullptr); } }
+        if (has("game.skipMovies")) svr06PutEnv("SVR06_SKIPMOVIES", getInt("game.skipMovies", 0) ? "1" : nullptr);
+        if (has("game.arcade")) { if (getInt("game.arcade", 0) && std::getenv("SVR06_PSPDIR")) svr06PutEnv("SVR06_ARCADE", "1"); else svr06PutEnv("SVR06_ARCADE", nullptr); }
+        if (!svr06IsUsaExe())      // icon sets and the HD pack are matched against PAL addresses / hashes
+        {
+            if (has("game.iconSet"))
+            {
+                const int i = std::max(0, std::min(8, getInt("game.iconSet", 0)));
+                svr06PutEnv("SVR06_ICONSET", kIcons[i][0] ? kIcons[i] : nullptr);
+            }
+            if (has("game.texpack"))
+            {
+                const char *d = std::getenv("SVR06_TEXPACK_DIR");
+                svr06PutEnv("SVR06_TEXPACK", (getInt("game.texpack", 0) && d) ? d : nullptr);
+            }
+        }
+    }
+} g_launcherEnv;
+}
 static int svr06InitFlags()
 {   // launcher modes pass SVR06_FLAGS (decimal or 0x hex); SVR06_VUAB keeps its old meaning (bit 10)
     int v = std::getenv("SVR06_VUAB") ? 1024 : 0;
+    if (!std::getenv("SVR06_VU0SLOW")) v |= (1 << 30); // CL-0206: VU0 microprograms use the fast interpreter (A/B-checked vs exact at runtime); SVR06_VU0SLOW=1 opts out
     if (const char *e = std::getenv("SVR06_FLAGS")) v |= static_cast<int>(std::strtoul(e, nullptr, 0));
     return v;
 }
@@ -148,6 +202,210 @@ static std::string svrPineRoundTrip(int port, const std::vector<uint8_t> &body)
     return "pine reply size=" + std::to_string(sz) + " hex=" + hex;
 }
 
+// ---- F1 > Cheats: applied by the game itself (no launcher needed). Keys: cheat.<id>[.p1|.p2|.<itemNo>] in svr06_settings.json.
+namespace
+{
+struct CheatMap { uint32_t save, shop; };
+const CheatMap kPal{0x3D9BF8u, 0x591FF8u}, kUsa{0x3DAF78u, 0x593378u};
+const CheatMap &svr06CheatMap() { static const bool usa = svr06IsUsaExe(); return usa ? kUsa : kPal; }
+inline uint32_t rd32(uint8_t *r, uint32_t a) { uint32_t v; std::memcpy(&v, r + (a & 0x1FFFFFFu), 4); return v; }
+inline void wr32(uint8_t *r, uint32_t a, uint32_t v) { std::memcpy(r + (a & 0x1FFFFFFu), &v, 4); }
+std::string ckey(const char *id, const char *sfx = "") { return std::string("cheat.") + id + (sfx[0] ? "." : "") + sfx; }
+bool con(const char *id, const char *sfx = "") { return ps2settings::getInt(ckey(id, sfx).c_str(), 0) != 0; }
+int cval(const char *id, const char *sfx = "") { return ps2settings::getInt(ckey(id, sfx).c_str(), 0); }
+}
+namespace {
+// The four shop-ownership bitmaps (0x12 bytes each, S0..S3) sit right in front of a constant marker block (41 50 10 08 00 01 00 01 01 01 0A 01), but the
+// block moves between saves (it was at save+0x6A3D4 in one save and +0x7C084 in another), so find the marker instead of trusting a fixed offset.
+std::vector<uint32_t> svr06FindShopBitmaps(uint8_t *r, uint32_t saveBase)
+{   // every copy of the marker (the game keeps more than one profile copy in RAM; the live one is whichever the shop reads)
+    std::vector<uint32_t> v;
+    for (uint32_t a = saveBase + 0x40000u; a < saveBase + 0xC0000u; a += 4)
+        if (rd32(r, a) == 0x08105041u && rd32(r, a + 4) == 0x01000100u && rd32(r, a + 8) == 0x010A0101u) v.push_back(a - 0x48u);
+    return v;
+}
+}
+
+// ---- reversal research recorder (dev): ring of Chara objects + pad state, dumped around every L2/R2 press ----
+namespace {
+uint8_t *g_revRdram = nullptr;
+struct RevFrame { uint32_t frame, b1, b2; std::vector<uint32_t> addrs; std::vector<uint8_t> data; };
+std::deque<RevFrame> g_revRing;
+std::vector<uint32_t> g_revObjs;
+uint32_t g_revFrame = 0, g_revBtn[2] = {0xFFFF, 0xFFFF}, g_revScanAt = 0, g_revAfter = 0, g_revN = 0;
+bool g_revArmed = true;
+uint16_t g_arPress = 0; uint32_t g_arPrev[2] = {0, 0}, g_arStart[2] = {0, 0}, g_arId[2] = {0, 0}; bool g_arOk[2] = {false, false}; std::map<uint32_t, int> g_arCombo;
+}
+void svr06RevTick(int player, uint16_t &btns)
+{
+    const bool rec = ps2settings::getInt("dev.revrec", 0) != 0 && false;
+    const bool autoRev = ps2settings::getInt("cheat.auto_reversal.p1", 0) != 0 || ps2settings::getInt("cheat.auto_reversal.p2", 0) != 0;
+    if (!g_revRdram || (!rec && !autoRev)) return;
+    // Auto reversal: L2 + R2 are held for 3 frames, 8 frames after a wrestler starts a new move (the recorded manual reversals were pressed at that moment).
+    if (g_arPress && ps2settings::getInt(player == 0 ? "cheat.auto_reversal.p1" : "cheat.auto_reversal.p2", 0) != 0)
+        btns &= (uint16_t)~g_arPress;
+    g_revBtn[player & 1] = btns;
+    if (player != 0) return;                       // one record per game frame (player 0 is read first)
+    ++g_revFrame;
+    if (g_revFrame - g_revScanAt > 90u || g_revObjs.empty())   // rescan for Chara objects (primary vtable 0x37EAE0 at +0)
+    {
+        g_revScanAt = g_revFrame; g_revObjs.clear();
+        for (uint32_t a = 0x800000u; a < 0x1F00000u && g_revObjs.size() < 8; a += 16)
+            if (rd32(g_revRdram, a) == 0x37EAE0u) g_revObjs.push_back(a);
+    }
+    {   // per-frame move tracker for the (last two) wrestler objects. L2 = strike reversal, R2 = grapple reversal, L2+R2 = finisher reversal. The move type of an
+        // attack id is not known up front, so each id starts with L2 and rotates L2 -> R2 -> L2+R2 whenever the reversal did not happen; a success keeps the combo.
+        g_arPress = 0;
+        const size_t n = g_revObjs.size();
+        static const uint16_t kCombo[3] = {0x0100u, 0x0200u, 0x0300u};
+        if (n >= 2) for (size_t k = 0; k < 2; ++k)
+        {
+            const uint32_t st = rd32(g_revRdram, g_revObjs[n - 2 + k] + 0x4D0u);
+            const bool idle = st == 0 || st == 0x6A4u || st == 0x6F9u || st == 0x6FCu || st == 0x19D2u || st == 0x329u || st == 0x10328u;
+            if (st != g_arPrev[k])
+            {
+                if (!idle) { g_arStart[k] = g_revFrame; g_arId[k] = st; g_arOk[k] = false; }
+                else if (st == 0x329u || st == 0x10328u) { for (int j = 0; j < 2; ++j) g_arOk[j] = true; }
+                else if (g_arStart[k] && g_revFrame - g_arStart[k] < 40u && !g_arOk[k] && g_arPrev[k] == g_arId[k]) { int &c = g_arCombo[g_arId[k]]; c = (c + 1) % 3; g_arStart[k] = 0; }
+                g_arPrev[k] = st;
+            }
+            if (!idle && g_arStart[k] && g_revFrame - g_arStart[k] >= 7u && g_revFrame - g_arStart[k] <= 10u) g_arPress = kCombo[g_arCombo[g_arId[k]] % 3];
+        }
+    }
+    if (!rec) return;
+    RevFrame f; f.frame = g_revFrame; f.b1 = g_revBtn[0]; f.b2 = g_revBtn[1]; f.addrs = g_revObjs;
+    f.data.resize(g_revObjs.size() * 0x810u);
+    for (size_t i = 0; i < g_revObjs.size(); ++i) std::memcpy(f.data.data() + i * 0x810u, g_revRdram + g_revObjs[i], 0x810u);
+    g_revRing.push_back(std::move(f));
+    while (g_revRing.size() > 150u) g_revRing.pop_front();
+    const bool press = (btns & 0x0100u) == 0 || (btns & 0x0200u) == 0 || (btns & 0x0400u) == 0 || (btns & 0x0800u) == 0; // L2 R2 L1 R1 (active low)
+    if (g_revAfter) { if (--g_revAfter == 0)
+    {
+        char fn[96]; std::snprintf(fn, sizeof fn, "analysis/live/rev_%03u.bin", ++g_revN);
+        if (FILE *o = std::fopen(fn, "wb"))
+        {
+            for (auto &r : g_revRing)
+            {
+                uint32_t hdr[4] = {r.frame, r.b1, r.b2, (uint32_t)r.addrs.size()}; std::fwrite(hdr, 4, 4, o);
+                std::fwrite(r.addrs.data(), 4, r.addrs.size(), o); std::fwrite(r.data.data(), 1, r.data.size(), o);
+            }
+            std::fclose(o); std::fprintf(stderr, "[revrec] wrote %s (%zu frames, %zu objects)\n", fn, g_revRing.size(), g_revObjs.size());
+        }
+        g_revArmed = true; } }
+    else if (press && g_revArmed) { g_revArmed = false; g_revAfter = 70u; std::fprintf(stderr, "[revrec] trigger at frame %u btns=%04X\n", g_revFrame, btns); }
+}
+void svr06ApplyCheats(uint8_t *rdram)
+{
+    g_revRdram = rdram;
+    using namespace svr06cheat;
+    const CheatMap &m = svr06CheatMap();
+    const bool all = con("unlock_all"), free = con("free_shop"), npc = con("unlock_npc"), gm = con("gm_money"), gmr = con("gm_money_raw"), inf = con("infinite_money");
+    // single shop entries ticked in the Shop Unlocks page
+    std::vector<int> picks;
+    for (int c = 0; c < kCheatCount; ++c)
+        if (kCheats[c].kind == 2)
+            for (int i = 0; i < kCheats[c].count; ++i)
+            {
+                const int n = kShop[kCheats[c].first + i].n;
+                if (ps2settings::getInt((ckey(kCheats[c].id) + "." + std::to_string(n)).c_str(), 0)) picks.push_back(n - 1); // menu item numbers are 1-based, the ownership bitmap / shop table are 0-based
+            }
+    const std::vector<uint32_t> bms = (all || !picks.empty()) ? svr06FindShopBitmaps(rdram, m.save) : std::vector<uint32_t>();
+    if (all)
+        for (uint32_t bm : bms) for (uint32_t a : {bm, bm + 0x12u})
+        {
+            wr32(rdram, a, 0xFFFFFFF8u); wr32(rdram, a + 4, 0xFFFFFFFFu); wr32(rdram, a + 8, 0xFFFFFFFFu); wr32(rdram, a + 12, 0xFFFFFFFFu);
+            wr32(rdram, a + 16, (rd32(rdram, a + 16) & 0xFFFF0000u) | 0x01FFu);
+        }
+    if (!picks.empty() && !all)
+        for (uint32_t bm : bms) for (uint32_t a : {bm, bm + 0x12u})
+            for (int n : picks) rdram[(a + (uint32_t)(n >> 3)) & 0x1FFFFFFu] |= (uint8_t)(1u << (n & 7));
+    if (all || free || !picks.empty())   // shop table lives in the menu overlay: only touch it while it is really loaded
+    {
+        const uint32_t kTab = m.shop;
+        for (uint32_t i = 0; i < 137; ++i)
+        {
+            uint32_t *e = reinterpret_cast<uint32_t *>(rdram + ((kTab + i * 0x28u) & 0x1FFFFFFu));
+            if (e[6] > 20 || e[7] > 1 || e[8] > 5000000u) { if (i > 8) break; continue; }
+            if (e[6] == 0) continue;
+            const bool picked = std::find(picks.begin(), picks.end(), (int)i) != picks.end();
+            if (free && e[8]) e[8] = 0;
+            if (all && i >= 3) { e[7] = 1; e[9] = 0; }
+            if (picked) { e[7] = 1; e[9] = 0; }
+        }
+    }
+    if (npc)
+    {
+        static const uint32_t kOffs[] = {0x3DA9C4, 0x3DAA64, 0x3DBB44, 0x3DBBE4, 0x3DBC84, 0x3DBD24, 0x3DBDC4, 0x3DBE64, 0x3DBF04, 0x3DD264, 0x3DD3A4, 0x3DD444, 0x3DD4E4, 0x3DD584, 0x3DD624};
+        for (uint32_t o : kOffs)
+        {
+            const uint32_t a = m.save + (o - 0x3D9BF8u);
+            const uint32_t w = rd32(rdram, a);
+            if ((w & 0xFF) != 3) wr32(rdram, a, (w & 0xFFFFFF00u) | 3u);
+        }
+        struct Nm { uint32_t off; const char *name; };
+        static const Nm kNames[] = {{0x3DD4E4, "Bar Guy"}, {0x3DD584, "Bar Maid"}, {0x3DD624, "Green Model"}};
+        for (const Nm &n : kNames)
+        {
+            const uint32_t rec = m.save + (n.off - 0x3D9BF8u) - 0x7E;
+            for (uint32_t f : {rec, rec + 0x5Cu})      // fill only an EMPTY name
+            {
+                uint8_t *d = rdram + (f & 0x1FFFFFFu);
+                if (d[0]) continue;
+                std::memcpy(d, n.name, std::strlen(n.name) + 1);
+            }
+        }
+    }
+    if (gm) wr32(rdram, m.save + (0x430AC0u - 0x3D9BF8u), 9999999u);
+    // GM roster records: 0x30 bytes per superstar id at save+0x59F30 + id*0x30 (PAL 0x433B28; byte +0 = id). Found 2026-11-11 by diffing a GM week:
+    // +0x15..+0x17 = fatigue, +0x28 = injured (1 -> filtered out of match booking). Batista (id 0x3C) cleared live -> fatigue reset, bookable again.
+    if (con("gm_no_fatigue"))
+        for (uint32_t id = 1; id < 0x100u; ++id)
+        {
+            const uint32_t r = m.save + 0x59F30u + id * 0x30u;
+            if ((rd32(rdram, r) & 0xFFFFu) != id) continue;
+            wr32(rdram, r + 0x14u, rd32(rdram, r + 0x14u) & 0x000000FFu);   // fatigue bytes +0x15..+0x17
+            wr32(rdram, r + 0x28u, rd32(rdram, r + 0x28u) & 0xFFFFFF00u);   // injury flag +0x28
+        }
+    // GM show cards: 6 match entries of 0x18 bytes (SmackDown! card PAL 0x430B70, Raw card 0x42E560); +2 = played, +4 = match rating (about 25 per star:
+    // 89 = 3.5, 84/77 = 3 stars). Played matches are raised to 125 (5 stars, user-confirmed 11-11).
+    if (con("gm_five_stars"))
+        for (uint32_t card : {0x430B70u, 0x42E560u})
+            for (uint32_t k = 0; k < 6; ++k)
+            {
+                const uint32_t e = m.save + (card - 0x3D9BF8u) + k * 0x18u;
+                const uint32_t w = rd32(rdram, e);
+                if (((w >> 16) & 0xFFu) == 1u && (rd32(rdram, e + 4u) & 0xFFu) != 0u) wr32(rdram, e + 4u, (rd32(rdram, e + 4u) & 0xFFFFFF00u) | 125u);
+            }
+    if (con("gm_five_stars"))   // overall show rating byte (same scale): SmackDown! PAL 0x430C11 (18 = half a star; 125 -> 5 stars, user-confirmed 11-11), Raw 0x42E600 (61 seen)
+        for (uint32_t a : {0x430C11u, 0x42E600u})
+        {
+            const uint32_t addr = m.save + (a - 0x3D9BF8u), w = rd32(rdram, addr & ~3u), sh = (addr & 3u) * 8u;
+            if (((w >> sh) & 0xFFu) != 0u) wr32(rdram, addr & ~3u, (w & ~(0xFFu << sh)) | (125u << sh));
+        }
+    if (inf) wr32(rdram, m.save + 0x6DD6Cu, 99999999u); // WWE Shop "Your Cash" (found by region bisection, PAL 0x447964)
+    if (gmr) { wr32(rdram, m.save + (0x42E4B0u - 0x3D9BF8u), 9999999u); wr32(rdram, m.save + (0x42E4B0u - 0x3D9BF8u) + 4, 0u); }
+    // hooks inside the recompiled code read these diag bits
+    uint32_t want = 0;
+    if (con("exh_open_titles")) want |= 1u << 9;
+    if (con("gm_open_titles")) want |= 1u << 10;
+    if (con("god_mode", "p1") || con("god_mode", "p2")) want |= 1u << 11;
+    auto fin = [&](const char *id, uint32_t b1, uint32_t b2)
+    {
+        int v = cval(id, "p1"); if (!v) v = cval(id, "p2");      // 1 / 2 stored finishers, 3 = unlimited
+        if (v == 1) want |= 1u << b1;
+        if (v == 2 || v == 3) want |= 1u << b2;
+    };
+    fin("finisher_start", 12, 13); fin("finisher_always", 14, 15);
+    static uint32_t s_last = 0;
+    constexpr uint32_t kMask = (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13) | (1u << 14) | (1u << 15);
+    if (want != s_last)
+    {
+        uint32_t cur = g_svr06Diag.load();
+        while (!g_svr06Diag.compare_exchange_weak(cur, (cur & ~kMask) | want)) {}
+        s_last = want;
+    }
+}
+
 std::string svr06AudioDump();
 void svr06_console_poll(uint8_t *rdram)
 {
@@ -166,29 +424,7 @@ void svr06_console_poll(uint8_t *rdram)
         }
     }
     lk0.unlock();
-    // ---- F1 > Settings > Cheats (shop): applied every 4 frames straight to guest RAM ----
-    if ((frame & 3u) == 0 && rdram)
-    {
-        const bool cUnlock = ps2settings::getInt("cheat.unlockAll", 0) != 0, cMoney = ps2settings::getInt("cheat.money", 0) != 0;
-        if (cUnlock || cMoney)
-        {
-            // Shop item table (PAL SLES-536.76): stride 0x28 from 0x591FF8; word6=category, word7=buyable, word8=price, word9=owned.
-            const uint32_t kTab = 0x591FF8u, kSave = 0x3D9BF8u;
-            for (uint32_t i = 0; i < 137; ++i)  // table has 137 entries (0..136), categories up to 17
-            {
-                uint32_t *e = reinterpret_cast<uint32_t *>(rdram + kTab + i * 0x28u);
-                if (e[6] > 20 || e[7] > 1 || e[8] > 5000000u) { if (i > 8) break; continue; }
-                if (e[6] == 0) continue;
-                if (cMoney && e[8]) e[8] = 0;                       // everything costs $0
-                if (cUnlock && i >= 3 && e[6] >= 1) { e[7] = 1; e[9] = 0; if (cMoney) e[8] = 0; } // make locked/hidden entries buyable
-                if (cUnlock && i < 137)  // also the non-buyable (locked-behind-others) entries                               // purchased bit n (n = index in table) in both save bitmaps
-                {
-                    rdram[kSave + 0x6A38Cu + (i >> 3)] |= uint8_t(1u << (i & 7));
-                    rdram[kSave + 0x6A39Eu + (i >> 3)] |= uint8_t(1u << (i & 7));
-                }
-            }
-        }
-    }
+    if (rdram && (frame & 7u) == 0) svr06ApplyCheats(rdram);
     if (rdram) svr06PineStart(rdram);
     if (!g_threadStarted.exchange(true))
         std::thread([rdram] { for (;;) { std::this_thread::sleep_for(std::chrono::milliseconds(150)); svr06con::runCommands(rdram); } }).detach();
@@ -476,9 +712,9 @@ void svr06con::runCommands(uint8_t *rdram)
             out << (g_svr06ThreadDumpFn ? g_svr06ThreadDumpFn() : std::string("not registered yet\n"));
         else if (c == "diag")
         {
-            static const char *nm[] = {"imgw", "storeimg", "save", "anim", "vmgr", "bt", "atlas", "cpy", "vifgarb"};
+            static const char *nm[] = {"imgw", "storeimg", "save", "anim", "vmgr", "bt", "atlas", "cpy", "vifgarb", "opentitles", "opentitles_gm", "godmode", "fin_start1", "fin_start2", "fin_all1", "fin_all2"};   // bit 9 = Exhibition any-gender titles, bit 10 = GM Mode (launcher cheats)
             std::string n, st; ls >> n >> st;
-            for (int i = 0; i < 9; ++i)
+            for (int i = 0; i < 16; ++i)
                 if (n == nm[i]) { if (st == "off") g_svr06Diag.fetch_and(~(1u << i)); else g_svr06Diag.fetch_or(1u << i); }
             out << "diag=" << std::hex << g_svr06Diag.load() << std::dec << "\n";
         }

@@ -310,6 +310,11 @@ private:
     // CL-0133: inline fast-path versions (defined in src/lib/vu/ps2_vu1_inline.h); valid only when m_fast && !m_fastExact
     inline void pushFmacFlagsInl(uint32_t mac, uint32_t status);
     inline void fmacStoreFast(float *dst, const float *result, uint8_t dest);
+    // lazy flag mode (programs that never read MAC/status): last 4 FMAC flag results kept in a ring instead of the pipeline queue
+    struct LazyFlag { uint64_t issue; uint32_t mac, cur; };
+    LazyFlag m_lz[4]{}; uint32_t m_lzCount = 0u; bool m_lzHaveRet = false; uint32_t m_lzRetMac = 0u, m_lzRetCur = 0u, m_lzSticky = 0u; bool m_lazyFlags = false;
+    void materializeLazy(uint64_t limit);   // apply entries ready by `limit`, push the rest into the real flag queue (same order/ready cycles)
+    void pushFmacFlagsAt(uint64_t issue, uint32_t mac, uint32_t status);
     inline void commitFlagsOnlyInl();
     inline bool execUpperFast(uint32_t instr);
     inline void execUpperPre(const DecodedInstructionPair &d);

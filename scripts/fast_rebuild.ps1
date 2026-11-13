@@ -22,7 +22,7 @@ function Read-Log($path) {
 
 # --- single-build guard: two builds at once make ninja fail with "failed recompaction: Permission denied"
 function Clear-BuildLocks([string]$rtDir, [string]$bd) {
-  Get-Process ninja, cmake, clang, 'clang++', 'clang-cl', 'lld-link', 'llvm-lib', lib, link, cl, svr06run, ps2EntryRunner -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill(); $_.WaitForExit(5000) } catch {} }
+  Get-Process ninja, cmake, clang, 'clang++', 'clang-cl', 'lld-link', 'llvm-lib', lib, link, cl, SVR06_PAL, ps2EntryRunner -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill(); $_.WaitForExit(5000) } catch {} }
   foreach ($f in '.ninja_log.restat', '.ninja_deps.tmp', '.ninja_log.tmp') {
     $p = Join-Path (Join-Path $rtDir $bd) $f
     if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
@@ -37,15 +37,15 @@ Clear-Host
 Write-Host 'SvR06 fast rebuild' -ForegroundColor Cyan
 # close the game safely first (window-close request, wait up to 15 s), force only if it is still alive afterwards
 Write-Host 'Closing any running game instance...' -ForegroundColor Yellow
-foreach ($n in 'svr06run', 'ps2EntryRunner') {
+foreach ($n in 'SVR06_PAL', 'ps2EntryRunner') {
   Get-Process $n -ErrorAction SilentlyContinue | ForEach-Object { try { [void]$_.CloseMainWindow() } catch {} }
 }
-for ($i = 0; $i -lt 15; $i++) { if (-not (Get-Process svr06run, ps2EntryRunner -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Seconds 1 }
-foreach ($n in 'svr06run', 'ps2EntryRunner') {
+for ($i = 0; $i -lt 15; $i++) { if (-not (Get-Process SVR06_PAL, ps2EntryRunner -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Seconds 1 }
+foreach ($n in 'SVR06_PAL', 'ps2EntryRunner') {
   $left = Get-Process $n -ErrorAction SilentlyContinue
   if ($left) { Write-Host ("  {0} did not close, forcing" -f $n) -ForegroundColor Red; $left | ForEach-Object { try { $_.Kill(); [void]$_.WaitForExit(10000) } catch {} } }
 }
-Get-Process ninja, cmake, clang, 'clang++', 'clang-cl', 'lld-link', 'llvm-lib', lib, link, cl, svr06run, ps2EntryRunner -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill(); $_.WaitForExit(5000) } catch {} }
+Get-Process ninja, cmake, clang, 'clang++', 'clang-cl', 'lld-link', 'llvm-lib', lib, link, cl, SVR06_PAL, ps2EntryRunner -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill(); $_.WaitForExit(5000) } catch {} }
 Start-Sleep -Seconds 2
 Copy-Item (Join-Path $root 'overrides\*.cpp') (Join-Path $rt 'ps2xRuntime\src\runner\') -Force
 Copy-Item (Join-Path $root 'overrides\*.h')   (Join-Path $rt 'ps2xRuntime\include\') -Force

@@ -1,0 +1,11 @@
+[
+  {"name": "from-launcher", "color": "1d76db", "description": "Opened from the launcher Report page"},
+  {"name": "needs-triage", "color": "fbca04", "description": "Not looked at yet"},
+  {"name": "fixed-awaiting-confirmation", "color": "0e8a16", "description": "Fix pushed; reporter should confirm in the launcher"},
+  {"name": "still-broken", "color": "d93f0b", "description": "Reporter says the fix did not work"},
+  {"name": "region:pal", "color": "ededed"}, {"name": "region:usa", "color": "ededed"}, {"name": "region:ita", "color": "ededed"},
+  {"name": "region:jpn", "color": "ededed"}, {"name": "region:kor", "color": "ededed"},
+  {"name": "area:boot", "color": "c5def5"}, {"name": "area:graphics", "color": "c5def5"}, {"name": "area:audio", "color": "c5def5"},
+  {"name": "area:controls", "color": "c5def5"}, {"name": "area:menus", "color": "c5def5"}, {"name": "area:gameplay", "color": "c5def5"},
+  {"name": "area:launcher", "color": "c5def5"}, {"name": "area:other", "color": "c5def5"}
+]

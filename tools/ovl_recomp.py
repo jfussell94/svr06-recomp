@@ -4,6 +4,7 @@ usage: ovl_recomp.py <bankName> <dump.bin> <hdrAddr> <outdir> [overlay.bin]
 With overlay.bin (decoded from BIN\\BIN.PAC) the image is placed into a copy of the dump at its base first.
 Header at hdrAddr: 'MWo3', id, base, textSize, dataSize, bssSize, ctorStart, ctorEnd, name[32] at +0x20."""
 import struct, sys, os, re, glob, subprocess
+CODE_END = int(os.environ.get('SVR06_CODE_END', '0x30C4D0'), 16)   # end of the main executable's code (PAL 0x30C4D0, USA 0x30D750)
 bank, dump, hdr, outdir = sys.argv[1], sys.argv[2], int(sys.argv[3], 16), sys.argv[4]
 ram = bytearray(open(dump, 'rb').read())
 if len(sys.argv) > 5:
@@ -48,7 +49,7 @@ def _scan(lo, hi, getw):
         if op == 3 or op == 2:
             t = ((a+4) & 0xF0000000) | ((i & 0x3FFFFFF) << 2)
             if code_lo <= t < code_hi and w(t): eps.add(t)
-_scan(0x100000, 0x30C4D0, w)
+_scan(0x100000, CODE_END, w)
 _scan(code_lo, code_hi, w)
 for _lo, _hi, _b, _ob in _others:
     _scan(_lo, _hi, lambda a, _b=_b, _ob=_ob: struct.unpack_from('<I', _b, a - _ob)[0])
@@ -84,7 +85,7 @@ def _luirefs(lo, hi, getw):
                 t = ((up + (imm - 0x10000 if imm & 0x8000 else imm)) if op == 9 else (up | imm)) & 0xFFFFFFFF
                 if code_lo <= t < code_hi and t % 4 == 0 and w(t): eps.add(t)
                 break
-_luirefs(0x100000, 0x30C4D0, w)
+_luirefs(0x100000, CODE_END, w)
 _luirefs(code_lo, code_hi, w)
 for _lo, _hi, _b, _ob in _others:
     _luirefs(_lo, _hi, lambda a, _b=_b, _ob=_ob: struct.unpack_from('<I', _b, a - _ob)[0] if 0 <= a - _ob < len(_b) - 3 else 0)

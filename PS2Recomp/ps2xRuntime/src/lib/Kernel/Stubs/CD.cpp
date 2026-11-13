@@ -208,7 +208,7 @@ namespace ps2_stubs
 
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        SVR06_CNT("sceCdRead");
+        SVR06_CNT("sceCdRead"); g_svr06CdRa = getRegU32(ctx, 31);
         { const uint32_t l_=getRegU32(ctx,4); if (l_>=0x124ab1u && l_<0x14cb0au) { static const struct {uint32_t b,e;const char*n;} F[]={{0x124ab1,0x124ab1+0x4cd7,"EVT"},{0x129789,0x129789+0xf42f,"EVT2"},{0x138bb9,0x138bb9+0x4688,"EVT3"},{0x13d242,0x13d242+0x12b6,"EVT4"},{0x13e4f9,0x13e4f9+0xe611,"EVT5"}}; for (auto&f:F) if (l_>=f.b&&l_<f.e) { std::cerr<<std::hex<<"[evtrd] "<<f.n<<" sec="<<(l_-f.b)<<" n="<<getRegU32(ctx,5)<<" ra="<<getRegU32(ctx,31)<<std::dec<<std::endl; break; } } } // [evtrd] ISS-128
         { static int bc_=0; const uint32_t l_=getRegU32(ctx,4); if (l_>=0x1686AEu && l_<0x1686AEu+0x1A3AAu && bc_++<40) std::cerr<<std::hex<<"[bgmrd] lbn="<<l_<<" rel="<<(l_-0x1686AEu)<<" sec="<<getRegU32(ctx,5)<<std::dec<<std::endl; }
         { static int c=0; if(getRegU32(ctx,4)>=0x1f0000u && c++<80) std::cerr<<std::hex<<"[cdrd] lbn="<<getRegU32(ctx,4)<<" sec="<<getRegU32(ctx,5)<<" buf="<<getRegU32(ctx,6)<<" ra="<<getRegU32(ctx,31)<<std::dec<<std::endl; }

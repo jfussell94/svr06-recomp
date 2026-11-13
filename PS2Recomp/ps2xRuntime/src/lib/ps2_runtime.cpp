@@ -64,6 +64,12 @@ static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
 static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
+namespace gsvk { int outputScale(); }
+// [scale] the host frame texture is 640x512 times the internal-resolution output scale (1 or 2)
+static int hostScale() { static const int s = gsvk::outputScale(); return s < 1 ? 1 : s; }
+#define TEX_W (FB_WIDTH * hostScale())
+#define TEX_H (FB_HEIGHT * hostScale())
+#define DISP_H (DEFAULT_DISPLAY_HEIGHT * hostScale())
 static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
@@ -409,7 +415,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint32_t s_lastHeight = 0u;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    static std::vector<uint8_t> s_uploadBuffer(static_cast<size_t>(TEX_W) * TEX_H * 4u, 0u);
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
@@ -426,8 +432,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                 (nowNs() - g_svr06LastDrawNs.load() < 4000000LL || !svr06MtgsIdle()))
             {
                 ++s_movieSkips;
-                outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-                outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+                outWidth = (s_lastWidth != 0u) ? s_lastWidth : TEX_W;
+                outHeight = (s_lastHeight != 0u) ? s_lastHeight : DISP_H;
                 return;
             }
             s_movieSkips = 0;
@@ -442,8 +448,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
     else if (s_hasUploadedFrame)
     {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outWidth = (s_lastWidth != 0u) ? s_lastWidth : TEX_W;
+        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DISP_H;
         return;
     }
 
@@ -460,11 +466,11 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(TEX_W, TEX_H, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
-        outWidth = FB_WIDTH;
-        outHeight = DEFAULT_DISPLAY_HEIGHT;
+        outWidth = TEX_W;
+        outHeight = DISP_H;
         s_lastWidth = outWidth;
         s_lastHeight = outHeight;
         s_hasUploadedFrame = true;
@@ -499,10 +505,10 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t copyWidth = std::min<uint32_t>(width, TEX_W);
+        const uint32_t copyHeight = std::min<uint32_t>(height, TEX_H);
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(TEX_W) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
         for (uint32_t y = 0; y < copyHeight; ++y)
         {
@@ -538,9 +544,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             const double runSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_shotT0).count();
             std::cout << "[shot] frame=" << s_frames << " t=" << static_cast<int>(runSecs / 60) << ":" << (static_cast<int>(runSecs) % 60 < 10 ? "0" : "") << (static_cast<int>(runSecs) % 60)
                       << " vsync=" << currentTick << " litSamples=" << lit << " of " << (n / 7) << std::endl;
-            static std::vector<uint8_t> s_shotBuf; const uint32_t sw = std::max<uint32_t>(1u, std::min<uint32_t>(width, FB_WIDTH)), sh = std::max<uint32_t>(1u, std::min<uint32_t>(height, FB_HEIGHT));
+            static std::vector<uint8_t> s_shotBuf; const uint32_t sw = std::max<uint32_t>(1u, std::min<uint32_t>(width, TEX_W)), sh = std::max<uint32_t>(1u, std::min<uint32_t>(height, TEX_H));
             s_shotBuf.assign(static_cast<size_t>(sw) * sh * 4u, 0u);
-            for (uint32_t yy = 0; yy < sh; ++yy) { std::memcpy(s_shotBuf.data() + static_cast<size_t>(yy) * sw * 4u, s_uploadBuffer.data() + static_cast<size_t>(yy) * FB_WIDTH * 4u, sw * 4u); for (uint32_t xx = 0; xx < sw; ++xx) s_shotBuf[(static_cast<size_t>(yy) * sw + xx) * 4u + 3u] = 255u; }
+            for (uint32_t yy = 0; yy < sh; ++yy) { std::memcpy(s_shotBuf.data() + static_cast<size_t>(yy) * sw * 4u, s_uploadBuffer.data() + static_cast<size_t>(yy) * TEX_W * 4u, sw * 4u); for (uint32_t xx = 0; xx < sw; ++xx) s_shotBuf[(static_cast<size_t>(yy) * sw + xx) * 4u + 3u] = 255u; }
             Image img{}; img.data = s_shotBuf.data(); img.width = static_cast<int>(sw); img.height = static_cast<int>(sh);
             img.mipmaps = 1; img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
             const std::string fn = std::string(shotDir) + "/shot_" + std::to_string(s_shotN++) + ".png";
@@ -669,6 +675,7 @@ bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+    m_iopSubsystem->flushEeCycles();
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
     return m_iopSubsystem->handleRpc(request);
@@ -676,6 +683,7 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
+    m_iopSubsystem->flushEeCycles();
     auto scope = m_iopHost->enterCall(nullptr, rdram);
     m_iopSubsystem->onSifTransfer(transfer);
 }
@@ -683,6 +691,11 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
     m_iopSubsystem->runEeCycles(eeCycles);
+}
+
+void PS2Runtime::flushIopEeCycles() noexcept
+{
+    m_iopSubsystem->flushEeCycles();
 }
 
 void PS2Runtime::resetIop()
@@ -1648,10 +1661,52 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     for (int r = 0; r < 16; ++r) s_vu0InVi[r] = ctx->vi[r];
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
-    m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
-                  vu0Data, PS2_VU0_DATA_SIZE,
-                  m_gs, &m_memory,
-                  startPC, 0u, ctx->vu0_itop, 4096);
+    {
+        extern std::atomic<int> g_svr06Flags;
+        static uint64_t s_abN = 0, s_abBad = 0; static bool s_vu0Bad[512];
+        const bool fastOn = (g_svr06Flags.load(std::memory_order_relaxed) & (1 << 30)) != 0;
+        const bool badProg = fastOn && s_vu0Bad[(startPC >> 3) & 511u];
+        const bool ab = fastOn && !badProg && (s_abN < 20000u || (s_abN & 1023u) == 0u);
+        if (fastOn) ++s_abN;
+        if (ab)
+        {   // CL-0206: run the exact (slow) VU0 path and the fast path on identical input; keep the exact result on any difference
+            static uint8_t d0[PS2_VU0_DATA_SIZE], d1[PS2_VU0_DATA_SIZE];
+            const VU1State s0 = m_vu0.state();
+            std::memcpy(d0, vu0Data, PS2_VU0_DATA_SIZE);
+            g_svr06Flags.fetch_and(~(1 << 30));
+            m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE, vu0Data, PS2_VU0_DATA_SIZE, m_gs, &m_memory, startPC, 0u, ctx->vu0_itop, 4096);
+            const VU1State s1 = m_vu0.state();
+            std::memcpy(d1, vu0Data, PS2_VU0_DATA_SIZE);
+            g_svr06Flags.fetch_or(1 << 30);
+            m_vu0.reset();
+            m_vu0.state() = s0;
+            std::memcpy(vu0Data, d0, PS2_VU0_DATA_SIZE);
+            m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE, vu0Data, PS2_VU0_DATA_SIZE, m_gs, &m_memory, startPC, 0u, ctx->vu0_itop, 4096);
+            const VU1State &s2 = m_vu0.state();
+            const bool same = !std::memcmp(s1.vf, s2.vf, sizeof s1.vf) && !std::memcmp(s1.vi, s2.vi, sizeof s1.vi) && !std::memcmp(s1.acc, s2.acc, sizeof s1.acc) &&
+                              s1.q == s2.q && s1.p == s2.p && s1.i == s2.i && s1.r == s2.r && s1.pc == s2.pc && s1.mac == s2.mac && s1.clip == s2.clip && s1.status == s2.status &&
+                              !std::memcmp(d1, vu0Data, PS2_VU0_DATA_SIZE);
+            if (!same)
+            {
+                ++s_abBad; s_vu0Bad[(startPC >> 3) & 511u] = true; // programs whose fast result ever differs (sticky status bits) stay on the exact path
+                if (s_abBad <= 30u) std::fprintf(stderr, "[vu0ab] MISMATCH #%llu start=%x n=%llu pc %x/%x mac %x/%x clip %x/%x st %x/%x data=%d\n", (unsigned long long)s_abBad, startPC, (unsigned long long)s_abN, s1.pc, s2.pc, s1.mac, s2.mac, s1.clip, s2.clip, s1.status, s2.status, (int)!!std::memcmp(d1, vu0Data, PS2_VU0_DATA_SIZE));
+                m_vu0.state() = s1;
+                std::memcpy(vu0Data, d1, PS2_VU0_DATA_SIZE);
+            }
+            if ((s_abN % 5000u) == 0u) std::fprintf(stderr, "[vu0ab] n=%llu bad=%llu\n", (unsigned long long)s_abN, (unsigned long long)s_abBad);
+        }
+        else if (badProg)
+        {
+            g_svr06Flags.fetch_and(~(1 << 30));
+            m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE, vu0Data, PS2_VU0_DATA_SIZE, m_gs, &m_memory, startPC, 0u, ctx->vu0_itop, 4096);
+            g_svr06Flags.fetch_or(1 << 30);
+        }
+        else
+            m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
+                          vu0Data, PS2_VU0_DATA_SIZE,
+                          m_gs, &m_memory,
+                          startPC, 0u, ctx->vu0_itop, 4096);
+    }
     copyVu0StateToContext(m_vu0.state(), ctx);
     {
         extern std::atomic<int> g_svr06Flags;
@@ -2669,7 +2724,7 @@ void PS2Runtime::run()
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+    Image blank = GenImageColor(TEX_W, TEX_H, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
@@ -2743,8 +2798,8 @@ void PS2Runtime::run()
 
             }
         });
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        uint32_t presentWidth = TEX_W;
+        uint32_t presentHeight = DISP_H;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         BeginDrawing();

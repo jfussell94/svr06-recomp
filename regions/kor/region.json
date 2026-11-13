@@ -1,0 +1,14 @@
+{
+  "id": "kor",
+  "name": "Korea (NTSC-K)",
+  "short": "Korea - NTSC-K",
+  "serial": "SLKA-25318",
+  "boot_elf": "SLKA_253.18",
+  "status": "planned",
+  "recomp_config": "config/svr06_kor_ps2recomp.toml",
+  "generated_dir": "out/generated_kor",
+  "runtime_dir": "PS2Recomp_kor",
+  "build_dir": "build_svr06_kor",
+  "state": "planned",
+  "tags": []
+}

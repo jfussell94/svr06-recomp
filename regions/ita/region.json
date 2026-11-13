@@ -1,0 +1,14 @@
+{
+  "id": "ita",
+  "name": "Italy (PAL-I)",
+  "short": "Italy - PAL",
+  "serial": "SLES-53677",
+  "boot_elf": "SLES_536.77",
+  "status": "planned",
+  "recomp_config": "config/svr06_ita_ps2recomp.toml",
+  "generated_dir": "out/generated_ita",
+  "runtime_dir": "PS2Recomp_ita",
+  "build_dir": "build_svr06_ita",
+  "state": "planned",
+  "tags": []
+}

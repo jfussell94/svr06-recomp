@@ -3,6 +3,8 @@
 
 #include <limits>
 
+#include <cstdio>
+int g_svr06_iop_trace = 0;
 namespace ps2x::iop::detail
 {
     IopCpuCore::IopCpuCore(IopMemory &memory) noexcept
@@ -273,6 +275,7 @@ namespace ps2x::iop::detail
             newBranchTarget = (nextPc & 0xF0000000u) | ((instruction & 0x03FFFFFFu) << 2u);
             break;
         case 0x03:
+            if (g_svr06_iop_trace) { static int tn=0; if(++tn<=6000) std::fprintf(stderr,"[iopjal] pc=%x -> %x a0=%x a1=%x a2=%x\n", pc, (nextPc & 0xF0000000u) | ((instruction & 0x03FFFFFFu) << 2u), cpu.gpr[4], cpu.gpr[5], cpu.gpr[6]); }
             write(31u, pc + 8u);
             newBranch = true;
             newBranchTarget = (nextPc & 0xF0000000u) | ((instruction & 0x03FFFFFFu) << 2u);

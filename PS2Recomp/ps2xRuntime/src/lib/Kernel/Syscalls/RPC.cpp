@@ -1,3 +1,4 @@
+#include <chrono>
 #include <map>
 #include <cstdio>
 #include <cstring>
@@ -473,6 +474,39 @@ namespace ps2_syscalls
         const uint32_t receiveSize = useRegisterConvention ? receiveSizeRegisters : receiveSizeStack;
         const uint32_t endFunction = useRegisterConvention ? endFunctionRegisters : endFunctionStack;
         const uint32_t endParameter = useRegisterConvention ? endParameterRegisters : endParameterStack;
+        if (sidHint == 0x301u || sidHint == 0x300u) // sound-driver command trace (RE of SFX / commentary / crowd / announcer path)
+        {
+            static const bool sndOn = [] { const char *v = std::getenv("SVR06_SNDTRACE"); return !(v && *v == '0'); }();
+            static unsigned s_n = 0, s_bulk = 0;
+            if (sndOn && rpcNum == 0x69u) {
+                ++s_bulk;
+                if (s_bulk % 256u == 1u) std::fprintf(stderr, "[snd] bulk fn=0x69 #%u size=%u\n", s_bulk, sendSize);
+                static unsigned s_dumped = 0;
+                if (sendBuf != 0u && sendSize >= 4u && s_dumped < 4000u) {
+                    static std::vector<uint8_t> s_prev;
+                    static std::vector<uint32_t> s_mask;
+                    std::vector<uint8_t> cur(sendSize);
+                    std::memcpy(cur.data(), rdram + (sendBuf & 0x1FFFFFFFu), sendSize);
+                    std::vector<uint32_t> mask;
+                    for (uint32_t i = 0; i + 4u <= sendSize; i += 4u) { uint32_t w; std::memcpy(&w, cur.data() + i, 4); if (w) mask.push_back(i); }
+                    if (mask != s_mask || (s_bulk % 500u) == 0u) {
+                        ++s_dumped;
+                        std::fprintf(stderr, "[sndbulk] #%u buf=0x%x size=%u nz:", s_bulk, sendBuf, sendSize);
+                        for (uint32_t i = 0; i + 4u <= sendSize; i += 4u) { uint32_t w; std::memcpy(&w, cur.data() + i, 4); if (w) std::fprintf(stderr, " %x=%x", i, w); }
+                        std::fprintf(stderr, "\n");
+                        s_mask = mask;
+                    }
+                    s_prev = cur;
+                }
+            }
+            else if (sndOn && ++s_n <= 60000u)
+            {
+                std::fprintf(stderr, "[snd] #%u t=%llu sid=0x%x fn=0x%x mode=%u send=0x%x/%u ra=0x%x :", s_n, (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), sidHint, rpcNum, mode, sendBuf, sendSize, getRegU32(ctx, 31));
+                const uint32_t n = sendSize > 96u ? 96u : sendSize;
+                for (uint32_t i = 0; i + 4u <= n && sendBuf != 0u; i += 4u) { uint32_t w; std::memcpy(&w, rdram + (sendBuf & 0x1FFFFFFFu) + i, 4); std::fprintf(stderr, " %08x", w); }
+                std::fprintf(stderr, "\n");
+            }
+        }
 
         auto *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
         if (!client)

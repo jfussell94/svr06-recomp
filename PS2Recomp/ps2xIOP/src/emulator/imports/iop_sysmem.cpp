@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "iop_sysmem.h"
 
 #include "../core/iop_cpu.h"
@@ -30,6 +31,7 @@ namespace ps2x::iop::detail
             const uint32_t address = a0 == 2u
                                          ? m_memory.allocate(a1, 16u, a2)
                                          : m_memory.allocate(a1, 16u);
+            if (address == 0u) { static int s_f = 0; if (++s_f <= 6) { std::fprintf(stderr, "[iopheap] AllocSysMemory FAILED mode=%u size=0x%x\n", a0, a1); m_memory.dumpAllocations("fail"); } }
             setV0(address);
             return true;
         }

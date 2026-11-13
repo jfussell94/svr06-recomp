@@ -48,6 +48,28 @@ extern std::atomic<unsigned> g_svr06Ord;
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <cstdlib>
+#include <cstdio>
+#include <random>
+#include <chrono>
+// ISS-162: one per-launch seed for every "random" the game sees (EE timer base, libc rand). SVR06_SEED=<hex or dec> replays a launch exactly
+// (the seed is logged as [seed] at start), so a seed-dependent hang can be reproduced instead of waiting for it.
+uint32_t svr06LaunchSeed()
+{
+    static const uint32_t s_seed = [] {
+        uint32_t v;
+        const char *e = std::getenv("SVR06_SEED");
+        if (e && *e) v = static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+        else {
+            std::random_device rd;
+            v = static_cast<uint32_t>(rd() ^ static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
+        }
+        std::fprintf(stderr, "[seed] SVR06_SEED=0x%08X%s\n", v, (e && *e) ? " (fixed)" : "");
+        return v;
+    }();
+    return s_seed;
+}
+
 // ISS-144 / CL-0127: asynchronous VIF1/GIF worker (design after hctp-recomp's ChainWorker, GPL-3.0, with thanks).
 // The game thread still completes every DMA at the kick (D_STAT/CHCR/interrupts unchanged); the worker only consumes a
 // copy of the transferred bytes (VIF1 incl. VU1 runs, GIF path 3, GIF arbiter -> GS). The game thread waits (fence) only
@@ -106,6 +128,8 @@ void svr06VifFence()
     for (int n = 0; !s.cvIdle.wait_for(lk, std::chrono::seconds(2), [&] { return s.q.empty() && !s.busy; }); ++n)
         std::fprintf(stderr, "[vifasync] FENCE WAIT %ds: busy=%d queued=%zu stage=%d (game thread blocked)\n", (n + 1) * 2, (int)s.busy, s.q.size(), svr06vw::g_stage.load()); // CL-0128 diag
 }
+static std::atomic<uint64_t> g_fenceSite[16];
+void svr06VifFenceS(int site) { if (svr06vw::w().pending.load(std::memory_order_acquire)) g_fenceSite[site & 15].fetch_add(1, std::memory_order_relaxed); svr06VifFence(); }
 void svr06VifEnqueue(std::function<void()> job)
 {
     svr06vw::W &s = svr06vw::w();
@@ -123,6 +147,7 @@ void svr06VifEnqueue(std::function<void()> job)
     {
         s_last = now;
         std::fprintf(stderr, "[vifasync] 3s: jobs=%llu fences=%llu\n", (unsigned long long)s.jobs.exchange(0), (unsigned long long)s.fences.exchange(0));
+        std::fprintf(stderr, "[fencesite] gspriv=%llu vu1code=%llu vu1data=%llu fifo=%llu wio=%llu rb=%llu rio=%llu seq=%llu\n", (unsigned long long)g_fenceSite[1].exchange(0), (unsigned long long)g_fenceSite[2].exchange(0), (unsigned long long)g_fenceSite[3].exchange(0), (unsigned long long)g_fenceSite[4].exchange(0), (unsigned long long)g_fenceSite[5].exchange(0), (unsigned long long)g_fenceSite[6].exchange(0), (unsigned long long)g_fenceSite[7].exchange(0), (unsigned long long)g_fenceSite[8].exchange(0));
     }
 }
 
@@ -155,7 +180,7 @@ namespace
     inline bool isGsPrivReg(uint32_t addr)
     {
         const bool r = Ps2AddressInRange(addr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE);
-        if (r) svr06VifFence(); // CL-0127: GS privileged registers belong to the async worker's GS stream
+        if (r) svr06VifFenceS(1); // CL-0127: GS privileged registers belong to the async worker's GS stream
         return r;
     }
 
@@ -679,11 +704,11 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     }
     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
     {
-        svr06VifFence(); // CL-0127: VU1 memory belongs to the async worker
+        svr06VifFenceS(2); // CL-0127: VU1 memory belongs to the async worker
         return ptr;
     }
     const uint8_t *vu1d = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
-    if (vu1d) svr06VifFence();
+    if (vu1d) svr06VifFenceS(3);
     return vu1d;
 }
 
@@ -1223,7 +1248,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     {
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
-        svr06VifFence();
+        svr06VifFenceS(4);
         processVIF1Data(fifoData, sizeof(fifoData));
         return;
     }
@@ -1267,7 +1292,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
-    if (address >= 0x10003000u && address < 0x10004000u) svr06VifFence(); // CL-0127: GIF/VIF registers
+    if (address >= 0x10003000u && address < 0x10004000u) svr06VifFenceS(5); // CL-0127: GIF/VIF registers
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1479,7 +1504,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             // Previously this was treated as a from-memory send, so readbacks never filled guest RAM.
             if (channelBase == 0x10009000u && (value & 1u) == 0u)
             {
-                svr06VifFence();
+                svr06VifFenceS(6);
                 if (m_gifArbiter)
                     m_gifArbiter->drain();
                 const uint32_t bytes = qwc * 16u;
@@ -2055,7 +2080,7 @@ void PS2Memory::processPendingTransfers()
         });
     }
     else if (!svr06VifOnWorker())
-        svr06VifFence(); // synchronous transfers run after everything already queued
+        svr06VifFenceS(8); // synchronous transfers run after everything already queued
 
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
@@ -2691,7 +2716,7 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
-    if (address >= 0x10003000u && address < 0x10004000u) svr06VifFence(); // CL-0127: GIF/VIF registers
+    if (address >= 0x10003000u && address < 0x10004000u) svr06VifFenceS(7); // CL-0127: GIF/VIF registers
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -2704,10 +2729,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
             // Per-launch constant offset: the emulated timers are cycle-driven and so identical every run; real hardware
             // had been counting since power-on. Constant offset keeps every delta the game measures unchanged while
             // making timer-derived seeds (song / loading picture choice) differ between launches.
-            static const uint32_t s_launchOffset = [] {
-                std::random_device rd;
-                return static_cast<uint32_t>(rd() ^ static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
-            }();
+            const uint32_t s_launchOffset = svr06LaunchSeed();
             return (timer.count + (s_launchOffset >> (static_cast<uint32_t>(timerIndex) * 3u))) & 0xFFFFu;
         }
         case kEeTimerModeOffset:

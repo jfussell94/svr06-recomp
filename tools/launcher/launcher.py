@@ -32,7 +32,9 @@ def main():
         prof = os.path.join(server.ROOT, 'config', 'launcher_profile')
         os.makedirs(prof, exist_ok=True)
         proc = subprocess.Popen([exe, '--app=' + url, '--user-data-dir=' + prof, '--window-size=1280,820', '--no-first-run', '--no-default-browser-check',
-                                 '--disable-features=Translate', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble'])
+                                 '--disable-features=Translate', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble',
+                                 # a fullscreen game covers/minimises this window; without these flags Chromium throttles its timers to ~1/min, the pings stop and the watchdog below kills the launcher
+                                 '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--disable-features=Translate,CalculateNativeWinOcclusion,IntensiveWakeUpThrottling'])
     else:
         webbrowser.open(url)
     # watchdog: the window pings every few seconds; when it stops (window closed) the launcher exits too
@@ -40,6 +42,10 @@ def main():
     while True:
         time.sleep(1.5)
         last = server.LAST_PING[0]
+        # window still alive (just hidden behind the game / throttled) -> keep running; only quit when the window process is gone
+        if proc is not None and proc.poll() is None:
+            if not last and time.time() - t0 > 90: break
+            continue
         if last and time.time() - last > 25: break
         if not last and time.time() - t0 > 90: break
         if proc is not None and proc.poll() is not None and time.time() - t0 > 8 and last and time.time() - last > 8: break

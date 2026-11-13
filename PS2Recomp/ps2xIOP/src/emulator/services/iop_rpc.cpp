@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cstdio>
 #include "iop_rpc.h"
 
@@ -12,6 +13,7 @@
 #include <limits>
 #include <vector>
 
+extern int g_svr06_iop_trace;
 namespace ps2x::iop::detail
 {
     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
@@ -279,9 +281,24 @@ namespace ps2x::iop::detail
             m_kernel.sleepCurrent(cpu);
             setV0(0);
             return true;
-        case 23:
+        case 23: // sceSifGetOtherData(rd, src(EE), dest(IOP), size, mode): pull EE memory into IOP RAM (Yukes sound driver loads HD/BD banks this way)
+        {
+            const uint32_t src = cpu.gpr[5];
+            const uint32_t dest = cpu.gpr[6];
+            const uint32_t size = cpu.gpr[7];
+            static int s_god = 0;
+            bool ok = false;
+            if (src != 0u && dest != 0u && size != 0u && m_memory.ownsRamRange(dest, size))
+            {
+                std::vector<uint8_t> tmp(size);
+                if (m_host.readGuest(src, tmp.data(), size))
+                    ok = m_memory.writeRam(IopMemory::physicalAddress(dest), tmp.data(), size);
+            }
+            if (++s_god <= 40)
+                std::fprintf(stderr, "[iop-sif] GetOtherData src(EE)=0x%x dest(IOP)=0x%x size=0x%x -> %s\n", src, dest, size, ok ? "ok" : "FAILED");
             setV0(0);
             return true;
+        }
         case 24: // RemoveRpc
         {
             const uint32_t serverData = cpu.gpr[4];
@@ -332,12 +349,31 @@ namespace ps2x::iop::detail
             }
         }
 
+        static int s_t69=0; const bool trc = (request.sid==0x301u && request.function==0x69u && ++s_t69>=2 && s_t69<=3);
+        if (trc) g_svr06_iop_trace = 1;
+        if (request.sid==0x301u && request.function==0x69u) { static int s_p=0; if(++s_p<=5 || s_p%300==0){ auto rd=[&](uint32_t a){uint32_t v=0; std::memcpy(&v,m_memory.ram().data()+a,4); return v;};
+            std::fprintf(stderr,"[sndslot] n=%d slot1:",s_p); for(int i=0;i<15;i++) std::fprintf(stderr," %x",rd(0x47850+i*4));
+            uint32_t hd=rd(0x47850+0x34); std::fprintf(stderr," | hd[%x]:",hd); if(hd<IopMemory::RamSize-16) for(int i=0;i<16;i++) std::fprintf(stderr,"%02x",m_memory.ram()[hd+i]); std::fprintf(stderr,"\n"); } }
+        if (request.sid==0x301u && (request.function==0x67u || request.function==0x68u) && request.send.size>=40u) {
+            static int s_b=0; if(++s_b<=12){
+                uint32_t pw[12]={0}; std::vector<uint8_t> pl(std::min<uint32_t>(request.send.size,48u)); if(m_host.readGuest(request.send.address,pl.data(),pl.size())) std::memcpy(pw,pl.data(),pl.size());
+                std::fprintf(stderr,"[sndbank] fn=0x%x w:",request.function); for(int i=0;i<12;i++) std::fprintf(stderr," %x",pw[i]);
+                for (int which=0; which<2; ++which){ uint32_t a = which? pw[12>11?11:11] : pw[9]; uint32_t ph=IopMemory::physicalAddress(a); if(ph<IopMemory::RamSize-16){ std::fprintf(stderr," | iop[%x]=",a); for(int i=0;i<16;i++) std::fprintf(stderr,"%02x",m_memory.ram()[ph+i]); } }
+                std::fprintf(stderr,"\n"); }
+        }
         uint32_t returnPointer = executor.executeGuestFunction(server.function,
                                                                request.function,
                                                                server.buffer,
                                                                request.send.size,
                                                                0u,
                                                                server.gp);
+        if (trc) g_svr06_iop_trace = 0;
+        if (request.sid==0x301u && (request.function==0x67u || request.function==0x68u) && request.send.size>=40u) {
+            static int s_c=0; if(++s_c<=12){ uint32_t sw[12]={0}; std::vector<uint8_t> pl(48); if(m_host.readGuest(request.send.address,pl.data(),pl.size())) std::memcpy(sw,pl.data(),48);
+                uint32_t a=sw[9], ph=IopMemory::physicalAddress(a); std::fprintf(stderr,"[sndbank-post] fn=0x%x ret=%x iop[%x]=",request.function,returnPointer,a);
+                if(ph<IopMemory::RamSize-16) for(int i=0;i<16;i++) std::fprintf(stderr,"%02x",m_memory.ram()[ph+i]);
+                std::fprintf(stderr," slot1:"); for(int i=0;i<15;i++){ uint32_t v=0; std::memcpy(&v,m_memory.ram().data()+0x47850+i*4,4); std::fprintf(stderr," %x",v);} std::fprintf(stderr,"\n"); }
+        }
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)

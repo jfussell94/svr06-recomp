@@ -49,16 +49,26 @@ VU1_FORCE_INLINE void VU1Interpreter::fmacStoreFast(float *dst, const float *res
 {
     uint32_t mac, status;
     if (vu1fast::fmacFinish(dst, result, dest, mac, status) && !m_skipFlags)
-        pushFmacFlagsInl(mac, status);
+    {
+        if (m_lazyFlags)
+        {
+            LazyFlag &e = m_lz[m_lzCount & 3u];
+            if (m_lzCount >= 4u) { m_lzRetMac = e.mac; m_lzRetCur = e.cur; m_lzSticky |= e.cur; m_lzHaveRet = true; }
+            e.issue = m_cycle; e.mac = mac; e.cur = status & 0xFu;
+            ++m_lzCount;
+        }
+        else
+            pushFmacFlagsInl(mac, status);
+    }
 }
 
 VU1_FORCE_INLINE void VU1Interpreter::commitFlagsOnlyInl()
 {   // valid when (m_pendMask & ~1u) == 0: flags + FDIV only, same order as commitReadyPipelines()
-    uint32_t readyFlags = 0u;
+    uint32_t readyList[8]; uint32_t readyN = 0u;
     if (m_pendMask & 1u)
     while (m_flagFifoCount != 0u && m_flagPipeline[m_flagFifo[m_flagFifoHead]].readyCycle <= m_cycle)
     {
-        readyFlags |= 1u << m_flagFifo[m_flagFifoHead];
+        readyList[readyN++] = m_flagFifo[m_flagFifoHead];
         m_flagFifoHead = (m_flagFifoHead + 1u) & 7u;
         --m_flagFifoCount;
     }
@@ -69,9 +79,9 @@ VU1_FORCE_INLINE void VU1Interpreter::commitFlagsOnlyInl()
         keep = 1u;
         nm = m_flagPipeline[m_flagFifo[m_flagFifoHead]].readyCycle;
     }
-    for (uint32_t bits = readyFlags; bits != 0u; bits &= bits - 1u)
-    {
-        const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(bits));
+    for (uint32_t rk = 0; rk < readyN; ++rk)
+    {   // FIFO (push) order, as on hardware
+        const uint32_t slot = readyList[rk];
         FlagPipelineEntry &entry = m_flagPipeline[slot];
         m_flagValid &= ~(1u << slot);
         if (entry.writesMac)
