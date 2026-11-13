@@ -86,7 +86,7 @@ for f in ('ps2xRuntime/CMakeLists.txt', 'ps2xIOP/CMakeLists.txt'):
     if rel not in seen and os.path.exists(os.path.join(RT_SRC, f)): put(os.path.join(RT_SRC, f), rel)
 # ---- repo scaffolding
 shutil.copyfile(os.path.join(ROOT, 'tools', 'github_templates', '.gitignore'), os.path.join(out, '.gitignore')) if os.path.exists(os.path.join(ROOT, 'tools', 'github_templates', '.gitignore')) else None
-for f in ('.gitignore', '.gitattributes', 'README.md', 'BUILDING.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'release/README.md', 'release/package_release.py',
+for f in ('.gitignore', '.gitattributes', 'README.md', 'BUILDING.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'THIRD_PARTY_NOTICES.md', 'release/README.md', 'release/package_release.py',
           '.github/workflows/ci.yml', '.github/workflows/release.yml', '.github/workflows/issue-lifecycle.yml', '.github/ISSUE_TEMPLATE/bug_report.yml', '.github/ISSUE_TEMPLATE/config.yml', '.github/labels.json', 'tools/launcher/build_launcher.ps1'):
     t = os.path.join(HERE, 'github_templates', f.replace('/', os.sep))
     if os.path.exists(t): put(t, f)
