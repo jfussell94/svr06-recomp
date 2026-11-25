@@ -13,6 +13,11 @@ struct Svr06HotApi
     std::atomic<int> *flags;                            // g_svr06Flags (svrlive "flag N 0/1")
     void (*log)(const char *);
     uint32_t generation;                                // 1,2,3... increments per reload
+    // version 2 (CL-0347): overlay-bank hooks. Overlay functions are dispatched by svr06ovl (BIN.PAC banks), not the runtime
+    // table, so replace() cannot reach them. The exe pre-registers trampolines for the addresses in kOvlHotAddrs
+    // (svr06_hotload.cpp); ovlSet(addr, fn) points one at a DLL hook (nullptr = original); ovlOrig(rdram, addr) = bank function.
+    bool (*ovlSet)(uint32_t, PS2Runtime::RecompiledFunction);
+    PS2Runtime::RecompiledFunction (*ovlOrig)(uint8_t *, uint32_t);
 };
 // DLL exports (extern "C", __declspec(dllexport)):
 //   void svr06HotLoad(const Svr06HotApi *api);    install hooks

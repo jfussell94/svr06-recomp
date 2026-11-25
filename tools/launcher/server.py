@@ -5,7 +5,7 @@ A tiny dependency-free HTTP server bound to 127.0.0.1 that powers the launcher U
 Every API call needs the per-session token that is injected into index.html, so other web pages
 cannot talk to it. Files are only served from a fixed set of project sub folders.
 """
-import glob, json, mimetypes, os, re, secrets, subprocess, sys, threading, time
+import glob, json, mimetypes, os, re, secrets, shutil, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -18,6 +18,7 @@ if getattr(sys, 'frozen', False):                   # packaged SvR06Launcher.exe
         if os.path.isdir(os.path.join(_c, 'scripts')) and os.path.isdir(os.path.join(_c, 'tools')): _r = _c; break
     ROOT = os.path.abspath(os.environ.get('SVR06_LAUNCHER_ROOT') or _r or _d)
     TOOLS = os.path.join(ROOT, 'tools')
+    if os.path.isfile(os.path.join(TOOLS, 'launcher', 'ui', 'app.js')): UI = os.path.join(TOOLS, 'launcher', 'ui')  # live UI files win over the bundled copy
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
     UI = os.path.join(HERE, 'ui')
@@ -68,13 +69,19 @@ ICON_SETS = [
     {'id': 'switchpro2', 'name': 'Switch Pro 2', 'sub': 'Alternate style'},
     {'id': 'mypack', 'name': 'Custom pack', 'sub': 'mods/icons/mypack'},
 ]
-DEFAULT_PREFS = {'mode': 'normal', 'icons': '', 'texpack': False, 'probes': True, 'skipmovies': False,
+DEFAULT_PREFS = {'mode': 'normal', 'icons': '', 'texpack': False, 'probes': True, 'skipmovies': False, 'hz': 0,
                  'accent': '#e11d48', 'theme': 'dark', 'autoquit': True, 'logfilter': '', 'page': 'home',
-                 'games': {}, 'psp_primary': '', 'arcade': False, 'cheats': {}, 'per_build': {}, 'build': '', 'last_launched': '', 'card_format': 'folder', 'card_file': '', 'gh_repo': 'jfussell94/svr06-recomp', 'tickets': []}
+                 'games': {}, 'psp_primary': '', 'arcade': False, 'cheats': {}, 'per_build': {}, 'build': '', 'last_launched': '', 'card_format': 'folder', 'card_file': '', 'gpu': '', 'gh_repo': 'jfussell94/svr06-recomp', 'tickets': []}
 # Settings that change how a game runs are stored PER GAME VERSION (prefs['per_build'][build_id]); the rest (theme, GitHub, library ...) is global.
 # load_prefs() resolves these keys for the selected build, so the rest of the launcher keeps reading p['mode'], p['icons'] ...
-GAME_KEYS = ('mode', 'icons', 'texpack', 'probes', 'skipmovies', 'arcade')
-TEXPACK_REL = os.path.join('mods', 'texturepack', 'emulation_lovers_hd', 'replacements')
+GAME_KEYS = ('mode', 'icons', 'texpack', 'probes', 'skipmovies', 'arcade', 'hz')
+# CL-0287: the pack now lives in mods/texturepack/<USA|PAL>_Textures/replacements (identical file lists); first existing folder wins
+def _texpack_rel(region='usa'):
+    cands = [os.path.join('mods', 'texturepack', ('PAL' if region == 'pal' else 'USA') + '_Textures', 'replacements'),
+             os.path.join('mods', 'texturepack', ('USA' if region == 'pal' else 'PAL') + '_Textures', 'replacements'),
+             os.path.join('mods', 'texturepack', 'emulation_lovers_hd', 'replacements')]
+    return next((c for c in cands if os.path.isdir(os.path.join(ROOT, c))), cands[0])
+TEXPACK_REL = _texpack_rel()
 TEXPACK = os.path.join(ROOT, TEXPACK_REL)
 SERVE_DIRS = ['mods', os.path.join('analysis', 'shots'), os.path.join('analysis', 'live', 'shots'), 'docs']
 
@@ -142,10 +149,13 @@ def build_env(p):
     ic = p.get('icons') or ''
     if ic: e['SVR06_ICONSET'] = ic; e['SVR06_ICONDIR'] = os.path.join(ROOT, 'mods', 'icons')
     else: e.pop('SVR06_ICONSET', None)
-    if p.get('texpack'): e['SVR06_TEXPACK'] = TEXPACK
+    if p.get('texpack'): e['SVR06_TEXPACK'] = os.path.join(ROOT, _texpack_rel(selected_build(p)['id']))  # CL-0287: stage 2 = HD replacement in paraLLEl-GS
     else: e.pop('SVR06_TEXPACK', None)
     if p.get('probes', True): e.pop('SVR06_NOPROBES', None)
     else: e['SVR06_NOPROBES'] = '1'; e.pop('SVR06_PROBES', None)
+    hzv = int(p.get('hz') or 0)  # CL-0249: refresh rate 0 = region default, 1 = 50 Hz, 2 = 60 Hz (same key as the in-game Settings > Refresh Rate)
+    if hzv in (1, 2): e['SVR06_HZ'] = '50' if hzv == 1 else '60'
+    else: e.pop('SVR06_HZ', None)
     if p.get('skipmovies'): e['SVR06_SKIPMOVIES'] = '1'
     else: e.pop('SVR06_SKIPMOVIES', None)
     try:
@@ -162,24 +172,72 @@ def build_env(p):
     e['SVR06_MCFORMAT'] = p.get('card_format') or 'folder'      # 'folder' = native host folder card (supported); 'pcsx2' = .ps2 card image (runtime support not built yet)
     if p.get('card_format') == 'pcsx2' and p.get('card_file'): e['SVR06_MCFILE'] = p['card_file']
     else: e.pop('SVR06_MCFILE', None)
+    if (p.get('gpu') or '').strip(): e['SVR06_GPU'] = p['gpu'].strip()   # graphics card by (part of) its Vulkan device name; empty = automatic (needs a game restart)
+    else: e.pop('SVR06_GPU', None)
     sb = selected_build(p)
     e['SVR06_LOGTAG'] = sb['id']      # runcap.ps1 writes run_err_<id>.txt for non-PAL versions
     if sb['id'] != 'pal':
         # controller-icon sets and the HD texture pack are matched against PAL memory addresses / texture hashes: on other versions they corrupt text and textures
-        e.pop('SVR06_ICONSET', None); e.pop('SVR06_TEXPACK', None)
-        e.setdefault('SVR06_GSDUMPTICK', '4800'); e['SVR06_GSDUMPLEN'] = '20'      # USA bring-up: capture the GS packets of ~20 frames at ~80 s so a broken scene can be analysed
+        e.pop('SVR06_ICONSET', None)
+        if sb['id'] != 'usa': e.pop('SVR06_TEXPACK', None)  # CL-0287: pack hashes are content-based and the pack is a USA pack; other regions untested
+        pass  # CL-0284: bring-up GS dump disabled (caused a hitch every run); set SVR06_GSDUMPTICK yourself to capture      # USA bring-up: capture the GS packets of ~20 frames at ~80 s so a broken scene can be analysed
         e['SVR06_BUILDPATH'] = os.path.abspath(os.path.join(ROOT, '..', sb['dir'], sb['bdir']))
         el = find_named(sb['elf'])
         if el: e['SVR06_ELF'] = el
     else:
         e.pop('SVR06_BUILDPATH', None); e.pop('SVR06_ELF', None)
+    # CL-0305: test switches without a launcher restart: config/test_env.txt, one KEY=VALUE per line ('#' = comment,
+    # KEY= with no value removes the variable). Read at every game start; used for one-off diagnostics such as SVR06_NOFNR=1.
+    try:
+        with open(os.path.join(ROOT, 'config', 'test_env.txt'), encoding='utf-8') as tf:
+            for ln in tf:
+                ln = ln.strip()
+                if not ln or ln.startswith('#') or '=' not in ln: continue
+                k, v = ln.split('=', 1); k = k.strip(); v = v.strip()
+                if not k: continue
+                if v: e[k] = v
+                else: e.pop(k, None)
+    except OSError:
+        pass
     return e
+
+
+_GPU_CACHE = [0.0, []]
+def gpu_list():
+    """Graphics cards the game can pick from: names the game itself logged ("Found Vulkan GPU: ...", exact Vulkan names) plus the Windows video controllers."""
+    if time.time() - _GPU_CACHE[0] < 60 and _GPU_CACHE[1]: return _GPU_CACHE[1]
+    seen, out = set(), []
+    def add(name, src):
+        n = (name or '').strip()
+        if n and n.lower() not in seen: seen.add(n.lower()); out.append({'name': n, 'source': src})
+    try:
+        files = sorted(glob.glob(os.path.join(ROOT, 'analysis', '*run_err*.txt')) + glob.glob(os.path.join(ROOT, '..', 'PS2Recomp*', 'build_*', 'analysis', '*run_err*.txt')), key=lambda f: -os.path.getmtime(f))[:6]
+        for f in files:
+            with open(f, 'rb') as fh: head = fh.read(400_000).decode('utf-8', 'replace')
+            for m in re.finditer(r'Found Vulkan GPU: (.+)', head): add(m.group(1), 'vulkan')
+    except Exception: pass
+    if os.name == 'nt':
+        try:
+            r = subprocess.run(['powershell', '-NoProfile', '-Command', '(Get-CimInstance Win32_VideoController).Name'], capture_output=True, text=True, timeout=8, creationflags=0x08000000)
+            for line in r.stdout.splitlines(): add(line, 'windows')
+        except Exception: pass
+    _GPU_CACHE[0], _GPU_CACHE[1] = time.time(), out
+    return out
+
+
+def gpu_used():
+    try:
+        f = max(glob.glob(os.path.join(ROOT, 'analysis', 'run_err*.txt')), key=os.path.getmtime)
+        with open(f, 'rb') as fh: head = fh.read(400_000).decode('utf-8', 'replace')
+        m = re.findall(r'Using Vulkan GPU: (.+)', head)
+        return m[-1].strip() if m else ''
+    except Exception: return ''
 
 
 def env_summary(p):
     e = build_env(p)
     out = []
-    for k in ('SVR06_FLAGS', 'SVR06_ICONSET', 'SVR06_TEXPACK', 'SVR06_NOPROBES', 'SVR06_SKIPMOVIES', 'SVR06_PSPDIR', 'SVR06_ARCADE'):
+    for k in ('SVR06_FLAGS', 'SVR06_ICONSET', 'SVR06_TEXPACK', 'SVR06_NOPROBES', 'SVR06_SKIPMOVIES', 'SVR06_PSPDIR', 'SVR06_ARCADE', 'SVR06_GPU'):
         if k in e: out.append([k, os.path.basename(e[k].rstrip('\\/')) if k in ('SVR06_TEXPACK', 'SVR06_PSPDIR') else e[k]])
     return out
 
@@ -236,6 +294,28 @@ def game_running_cached():
     return _proc_cache[1]
 
 
+_SPEED = []  # (wall time, vsync) samples while the game runs (launcher-native: live session speed)
+
+
+def session_speed(hb):
+    """Guest frames per second over the last ~10 s, from heartbeat.txt's vsync counter; plus a 60-sample history."""
+    try:
+        if not hb or not hb.get('alive'): _SPEED.clear(); return None
+        v = int(hb['fields'].get('vsync', '0')); t = time.time()
+        if _SPEED and v < _SPEED[-1][1]: _SPEED.clear()
+        if not _SPEED or t - _SPEED[-1][0] >= 1.0: _SPEED.append((t, v))
+        del _SPEED[:-120]
+        old = [x for x in _SPEED if t - x[0] <= 10.5]
+        rate = (old[-1][1] - old[0][1]) / max(0.5, old[-1][0] - old[0][0]) if len(old) >= 2 else None
+        hist = []
+        for a, b in zip(_SPEED, _SPEED[1:]):
+            dt = b[0] - a[0]
+            if dt > 0: hist.append(round((b[1] - a[1]) / dt, 1))
+        return {'rate': round(rate, 1) if rate is not None else None, 'hist': hist[-60:], 'fps': hb['fields'].get('fps')}
+    except Exception:
+        return None
+
+
 def heartbeat():
     hb = os.path.join(cur_live(), 'heartbeat.txt')
     try:
@@ -249,9 +329,9 @@ def heartbeat():
 
 BUILDS = [
     {'id': 'pal', 'name': 'PAL - Europe/Australia', 'serial': 'SLES-53676', 'elf': 'SLES_536.76', 'dir': 'PS2Recomp', 'bdir': 'build_svr06b_clang',
-     'log': 'build_log.txt', 'rebuild': 'FAST_REBUILD_AND_RUN.cmd', 'build': 'BUILD_ONLY.cmd', 'note': 'Main build. Matches run; known crashes and glitches remain, so it is not release quality yet.'},
+     'log': 'build_log.txt', 'rebuild': 'FAST_REBUILD_AND_RUN.cmd', 'build': 'BUILD_ONLY.cmd', 'note': 'Secondary build. USA fixes are mirrored here when cheap; test on USA first.'},
     {'id': 'usa', 'name': 'USA - NTSC-U', 'serial': 'SLUS-21286', 'elf': 'SLUS_212.86', 'dir': 'PS2Recomp_usa', 'bdir': 'build_svr06_usa',
-     'log': 'usa_build_log.txt', 'rebuild': 'USA_BUILD.cmd', 'build': 'USA_BUILD.cmd', 'note': 'Early build in separate folders. The PAL fixes are being ported over; expect a black screen or stalls before the menus.'},
+     'log': 'usa_build_log.txt', 'rebuild': 'USA_BUILD.cmd', 'build': 'USA_BUILD.cmd', 'note': 'Main build (1.0 target). Built from the PAL sources plus the USA port step; known Season promo / loading stalls are being fixed.'},
 ]
 def _load_regions():
     try:
@@ -335,8 +415,12 @@ def build_state(logname=None):
     tail, sz = read_tail(lg, 65536)
     if not sz: return {'state': 'none'}
     mt = os.path.getmtime(lg)
-    endm = re.findall(r'BUILD END[^\n]*exit=(-?\d+)', tail)
-    done = 'BUILD STEP FINISHED' in tail or bool(endm)
+    # CL-0215: BUILD_ONLY.cmd writes '==== BUILD END <time>' WITHOUT exit=; that left the state at 'interrupted' (stuck notification).
+    # Only a BUILD END after the last BUILD START counts as finished; an exit code is optional.
+    _bs = tail.rfind('BUILD START'); _tail_end = tail[_bs:] if _bs >= 0 else tail
+    _ends = re.findall(r'BUILD END([^\n]*)', _tail_end)
+    endm = [(re.search(r'exit=(-?\d+)', e).group(1) if re.search(r'exit=(-?\d+)', e) else '0') for e in _ends]
+    done = 'BUILD STEP FINISHED' in _tail_end or bool(endm)
     m = re.findall(r'\[(\d+)/(\d+)\]', tail)
     n, tot = (int(m[-1][0]), int(m[-1][1])) if m else (0, 0)
     bad = bool(re.search(r'(?<![A-Za-z-])error:', tail)) or 'FAILED:' in tail or (bool(endm) and endm[-1] != '0')
@@ -725,6 +809,170 @@ def games_op(body):
     return {'message': msg, 'library': library(True)}
 
 
+# ---------------------------------------------------------------- character import (CL-0315)
+# Imports wrestlers from an older SvR game into SvR 2006 as a disc override (tools/cutslots/char_import.py).
+# Nothing in the game's own files changes: <build dir>/mods/disc/PAC/CH*.PAC + characters.json + cutslots.txt.
+_CHAR_BUSY = [False]
+def _chars_paths(b=None):
+    b = b or selected_build()
+    base = os.path.abspath(os.path.join(ROOT, '..', b['dir'], b['bdir']))
+    mods = os.path.join(base, 'mods', 'disc')
+    lib = library()
+    stock = ''
+    for d in lib.get('ps2', []):
+        if d.get('slot_id') == ('ps2_usa' if b['id'] == 'usa' else 'ps2_pal') and d.get('path'): stock = d['path']
+    return mods, stock
+
+def chars_op(body):
+    import io, contextlib
+    op = body.get('op')
+    sys.path.insert(0, os.path.join(TOOLS, 'cutslots'))
+    import importlib, char_import
+    importlib.reload(char_import) if False else None
+    b = selected_build(); mods, stock = _chars_paths(b)
+    p = load_prefs()
+    if op == 'browse':
+        path = browse_folder('chars')
+        if path: p['chars_src'] = path; save_prefs(p)
+        return {'path': path}
+    if op == 'state':
+        out = {'build': b['name'], 'mods': mods, 'stock': stock, 'src': p.get('chars_src', ''), 'busy': _CHAR_BUSY[0], 'imported': char_import._manifest(mods)}
+        if not stock or not char_import._find(stock, 'CH.PAC'):
+            out['error'] = 'Link the %s game files on the Library page first (the importer needs PAC\\CH.PAC from it).' % b['name']; return out
+        out['free'] = char_import.list_targets(stock, mods)['free']
+        src = p.get('chars_src', '')
+        if src and os.path.isdir(src):
+            r = char_import.list_source(src)
+            out['source'] = r.get('wrestlers', []); 
+            if not r.get('ok'): out['source_error'] = r.get('error')
+        return out
+    if not stock: return {'ok': False, 'error': 'Link the %s game files on the Library page first.' % b['name']}
+    if _CHAR_BUSY[0]: return {'ok': False, 'error': 'An import is already running.'}
+    _CHAR_BUSY[0] = True
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            if op == 'import':
+                src = p.get('chars_src', '')
+                r = char_import.do_import(stock, mods, src, int(body['src']), int(body['dst']), body.get('full') or 'Wrestler', body.get('short') or body.get('full') or 'Wrestler')
+            elif op == 'remove': r = char_import.do_remove(stock, mods, int(body['dst']))
+            elif op == 'rebuild': r = char_import.rebuild(stock, mods)
+            else: r = {'ok': False, 'error': 'unknown op'}
+        r['log'] = buf.getvalue()[-800:]
+        return r
+    except Exception as e:
+        return {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
+    finally:
+        _CHAR_BUSY[0] = False
+
+
+
+# ---------------------------------------------------------------- custom entrances (CL-0319)
+# Per-wrestler custom entrance song + Titantron. The game's slots stay stock; assignments are kept by registry CID in
+# <build dir>/Custom Entrances/assign.json and exported as entrances.txt ("slot|song|video") which the runtime reads.
+_AUDIO = ('.ogg', '.mp3', '.flac', '.wav', '.adx', '.m4a', '.opus', '.aac', '.wma')
+_VIDEO = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.m4v', '.bik', '.mpg', '.mpeg', '.ogv', '.flv')
+def _ent_paths(b=None):
+    b = b or selected_build()
+    base = os.path.abspath(os.path.join(ROOT, '..', b['dir'], b['bdir']))
+    return base, os.path.join(base, 'Custom Entrances'), os.path.join(base, 'Custom Music', 'Entrances'), os.path.join(base, 'Custom Titantrons')
+def _norm(s): return ''.join(c for c in s.lower() if c.isalnum())
+def _ent_files(root, exts):
+    out = []
+    for dp, dn, fn in os.walk(root):
+        for f in fn:
+            if f.lower().endswith(exts): out.append(os.path.relpath(os.path.join(dp, f), root).replace('\\', '/'))
+    return sorted(out, key=str.lower)
+def ent_op(body):
+    op = body.get('op'); b = selected_build()
+    base, edir, mdir, tdir = _ent_paths(b)
+    for d in (edir, mdir, tdir): os.makedirs(d, exist_ok=True)
+    afile = os.path.join(edir, 'assign.json')
+    try: assign = json.load(open(afile, encoding='utf-8'))
+    except Exception: assign = {}
+    reg = json.load(open(os.path.join(TOOLS, 'registry', 'wrestlers.json'), encoding='utf-8'))
+    mods, stock = _chars_paths(b)
+    imported = {}
+    try:
+        sys.path.insert(0, os.path.join(TOOLS, 'cutslots')); import char_import
+        for m in char_import._manifest(mods): imported[_norm(m['full'])] = m['dst']
+    except Exception: pass
+    key = 'svr06u' if b['id'] == 'usa' else 'svr06p'
+    try: mi = json.load(open(os.path.join(base, 'media_index.json'), encoding='utf-8'))
+    except Exception: mi = {}
+    ALI = {'stonecold': 'stevaustin', 'stonecoldsteveaustin': 'steveaustin', 'hhh': 'triplehw', 'theundertaker': 'undertaker', 'rvd': 'robvandam', 'jbl': 'jblayfield', 'vincemcmahon': 'mrmcmahon'}
+    def nk(x):
+        k = _norm(x); return ALI.get(k, k)
+    byp = {}
+    import re as _re
+    def pname(rel):
+        f = os.path.basename(rel).rsplit('.', 1)[0]
+        f = _re.sub(r'\([^)]*\)', ' ', f); f = f.split(' - ')[0]
+        f = _re.sub(r"\s+'\d\d\b", ' ', f); f = _re.sub(r'_\d+$', '', f)
+        return f.strip()
+    for rel, m in mi.items(): byp.setdefault(nk(pname(rel)), []).append((m['kind'], rel))
+    people = []
+    try:
+        sys.path.insert(0, os.path.join(TOOLS, 'registry')); import moveset_import as msi; msd = msi.load()
+        mv = {e['cid']: e['games'] for e in msd['people']}
+    except Exception: msi = None; msd = None; mv = {}
+    for pp in reg['people']:
+        if pp.get('kind') != 'wrestler': continue
+        s6 = pp['sources'].get(key) or pp['sources'].get('svr06u') or {}
+        slot = None
+        if s6.get('model'): slot = s6.get('slot')
+        elif _norm(pp['name']) in imported: slot = imported[_norm(pp['name'])]
+        elif _norm(pp.get('short', '')) in imported: slot = imported[_norm(pp['short'])]
+        a = assign.get(str(pp['cid']), {})
+        people.append({'cid': pp['cid'], 'name': pp['name'], 'group': pp['group'], 'slot': slot, 'song': a.get('song', ''), 'video': a.get('video', ''), 'moveGame': a.get('moveGame', ''), 'moveDonor': a.get('moveDonor', 2),
+                       'sugSongs': [r[len('Custom Music/Entrances/'):] for k2, r in byp.get(nk(pp['name']), []) + byp.get(nk(pp.get('short', '')), []) if k2 == 'song'],
+                       'sugVideos': [r[len('Custom Titantrons/'):] for k2, r in byp.get(nk(pp['name']), []) + byp.get(nk(pp.get('short', '')), []) if k2 == 'video'],
+                       'moveGames': [g for g in ('svr05', 'hctp') if g in ((mv.get(pp['cid']) or {}))]})
+    # CL-0325: fold edits made in the in-game Entrance Editor (game_assign.txt) back into assign.json, then clear the overlay
+    gfile = os.path.join(edir, 'game_assign.txt')
+    if os.path.exists(gfile):
+        try:
+            bys = {pp['slot']: pp for pp in people if pp['slot'] is not None}
+            for ln in open(gfile, encoding='utf-8'):
+                ln = ln.rstrip('\r\n')
+                if not ln or ln.startswith('#'): continue
+                pt = ln.split('|')
+                pp = bys.get(int(pt[0]))
+                if not pp or len(pt) < 2: continue
+                a2 = assign.get(str(pp['cid']), {}); a2['song'] = pt[1]; a2['video'] = pt[2] if len(pt) > 2 else ''
+                a2.setdefault('moveGame', ''); a2.setdefault('moveDonor', 2)
+                if a2['song'] or a2['video'] or a2['moveGame']: assign[str(pp['cid'])] = a2
+                else: assign.pop(str(pp['cid']), None)
+                pp['song'], pp['video'] = a2['song'], a2['video']
+            json.dump(assign, open(afile, 'w', encoding='utf-8'), indent=1)
+            os.remove(gfile)
+        except Exception as e: print('[entrances] game_assign merge failed:', e)
+    if op == 'set':
+        cid = str(int(body['cid'])); a = {'song': body.get('song', ''), 'video': body.get('video', ''), 'moveGame': body.get('moveGame', ''), 'moveDonor': int(body.get('moveDonor') or 2)}
+        if a['song'] or a['video'] or a['moveGame']: assign[cid] = a
+        else: assign.pop(cid, None)
+        json.dump(assign, open(afile, 'w', encoding='utf-8'), indent=1)
+        for pp in people:
+            if str(pp['cid']) == cid: pp['song'], pp['video'], pp['moveGame'], pp['moveDonor'] = a['song'], a['video'], a['moveGame'], a['moveDonor']
+    if op in ('set', 'export', 'state'):
+        lines = ['# slot|song|video  (written by the launcher from assign.json)']
+        for pp in people:
+            if pp['slot'] is not None and (pp['song'] or pp['video']):
+                lines.append('%d|%s|%s' % (pp['slot'], pp['song'], pp['video']))
+        with open(os.path.join(edir, 'entrances.txt'), 'w', encoding='utf-8', newline='\n') as f: f.write('\n'.join(lines) + '\n')
+        with open(os.path.join(edir, 'slots.txt'), 'w', encoding='utf-8', newline='\n') as f:
+            f.write('# slot|name  (for the in-game Entrance Editor)\n' + ''.join('%d|%s\n' % (pp['slot'], pp['name']) for pp in people if pp['slot'] is not None))
+        ml = ['# slot|152 move ids (hex, space separated)  built by moveset_import.py from the chosen older game']
+        for pp in people:
+            if pp['slot'] is not None and pp['moveGame'] and msi:
+                ids, msg = msi.build(pp['moveGame'], pp['cid'], int(pp['moveDonor'] or 2), msd)
+                if ids: ml.append('%d|%s' % (pp['slot'], ' '.join('%04x' % x for x in ids)))
+        with open(os.path.join(edir, 'movesets.txt'), 'w', encoding='utf-8', newline='\n') as f: f.write('\n'.join(ml) + '\n')
+    order = {'Legend': 0, 'Superstar': 1, 'Diva': 2}
+    people.sort(key=lambda x: (order.get(x['group'], 1), x['name'].lower()))
+    return {'build': b['name'], 'people': people, 'songs': _ent_files(mdir, _AUDIO), 'videos': _ent_files(tdir, _VIDEO),
+            'folders': {'songs': mdir, 'videos': tdir}}
+
 
 # ---------------------------------------------------------------- cheats
 # status: 'working' = address known and verified, 'untested' = implemented but not checked in game, 'todo' = address not mapped yet
@@ -787,6 +1035,19 @@ GSET = {
     'menu.highContrast': {'restart': False, 'min': 0, 'max': 1}, 'menu.boldText': {'restart': False, 'min': 0, 'max': 1}, 'menu.reduceMotion': {'restart': False, 'min': 0, 'max': 1},
     'input.p1.mashAssist': {'restart': False, 'min': 0, 'max': 1}, 'input.p2.mashAssist': {'restart': False, 'min': 0, 'max': 1}, 'input.p1.sticky': {'restart': False, 'min': 0, 'max': 1},
     'audio.master': {'restart': False, 'min': 0, 'max': 100}, 'audio.mute': {'restart': False, 'min': 0, 'max': 1},
+    # CL-0223 per-category volumes (F1 > Settings > Audio > Mixer reads the same keys)
+    'audio.music': {'restart': False, 'min': 0, 'max': 100}, 'audio.commentary': {'restart': False, 'min': 0, 'max': 100},
+    'audio.announcer': {'restart': False, 'min': 0, 'max': 100}, 'audio.crowd': {'restart': False, 'min': 0, 'max': 100},
+    'audio.stream': {'restart': False, 'min': 0, 'max': 100}, 'audio.sfx': {'restart': False, 'min': 0, 'max': 100},
+    # CL-0259 video page: window resolution / display mode / scaling (applied live by the game) and the F1 image adjustments
+    'graphics.resolution': {'restart': False, 'min': 0, 'max': 5}, 'graphics.fullscreen': {'restart': False, 'min': 0, 'max': 1},
+    'graphics.fsMode': {'restart': False, 'min': 0, 'max': 1}, 'graphics.integer': {'restart': False, 'min': 0, 'max': 1},
+    'graphics.frameQueue': {'restart': False, 'min': 1, 'max': 16},
+    'image.brightness': {'restart': False, 'min': -100, 'max': 100}, 'image.contrast': {'restart': False, 'min': -100, 'max': 100},
+    'image.saturation': {'restart': False, 'min': 0, 'max': 200}, 'image.vibrance': {'restart': False, 'min': -100, 'max': 100},
+    'image.gamma': {'restart': False, 'min': 50, 'max': 200}, 'image.black': {'restart': False, 'min': 0, 'max': 50},
+    'image.temp': {'restart': False, 'min': -100, 'max': 100}, 'image.hue': {'restart': False, 'min': -180, 'max': 180},
+    'image.sharp': {'restart': False, 'min': 0, 'max': 100},
 }
 _GS_LAST = {}
 
@@ -850,6 +1111,7 @@ def _launcher_values(p, bid):
     vals['game.probes'] = 1 if p.get('probes', True) else 0; defs['game.probes'] = 1
     vals['game.skipMovies'] = 1 if p.get('skipmovies') else 0; defs['game.skipMovies'] = 0
     vals['game.arcade'] = 1 if p.get('arcade') else 0; defs['game.arcade'] = 0
+    vals['game.hz'] = max(0, min(2, int(p.get('hz') or 0))); defs['game.hz'] = 0
     return vals, defs
 
 
@@ -887,6 +1149,7 @@ def gs_sync_all(bid):
         elif k == 'game.probes': p['probes'] = bool(v)
         elif k == 'game.skipMovies': p['skipmovies'] = bool(v)
         elif k == 'game.arcade': p['arcade'] = bool(v)
+        elif k == 'game.hz': p['hz'] = max(0, min(2, int(v)))
     c = dict(p.get('cheats') or {}); c[bid] = ch; p['cheats'] = c; save_prefs(p)
 
 
@@ -1215,7 +1478,19 @@ def _cards_info(b):
             try: return sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(os.path.join(cd, n)) for f in fs)
             except Exception: return 0
         if not _is_link(mc0) and os.path.isdir(mc0): names = ['Default'] + [n for n in names if n != 'Default']
-        return {'items': [{'name': n, 'kb': round(sz(n) / 1024)} for n in names], 'current': cur, 'ready': _is_link(mc0), 'build': b['id']}
+        def saves(n):
+            d = mc0 if (n == 'Default' and not _is_link(mc0)) else os.path.join(cd, n); out = []
+            try:
+                for e in sorted(os.listdir(d)):
+                    sp = os.path.join(d, e)
+                    if os.path.isdir(sp): out.append({'dir': e, 'kb': round(sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(sp) for f in fs) / 1024)})
+            except Exception: pass
+            return out
+        bdir = os.path.join(base, 'cards_backup')
+        def backups(n):
+            try: return sorted(os.listdir(os.path.join(bdir, n)), reverse=True)
+            except Exception: return []
+        return {'items': [{'name': n, 'kb': round(sz(n) / 1024), 'saves': saves(n), 'backups': backups(n)} for n in names], 'current': cur, 'ready': _is_link(mc0), 'build': b['id']}
     except Exception as e:
         return {'items': [], 'current': '', 'ready': False, 'error': str(e)}
 
@@ -1238,6 +1513,85 @@ def card_select(name, create=False):
     return ('New blank memory card "%s" created and selected' if create else 'Memory card "%s" selected') % name + ' for ' + b['name'] + '.'
 
 
+def browse_file(title, filt):
+    if not IS_WIN: return ''
+    ps = ("Add-Type -AssemblyName System.Windows.Forms;$d=New-Object System.Windows.Forms.OpenFileDialog;"
+          "$d.Title='%s';$d.Filter='%s';$f=New-Object System.Windows.Forms.Form;$f.TopMost=$true;"
+          "if($d.ShowDialog($f) -eq 'OK'){[Console]::Out.Write($d.FileName)}" % (title.replace("'", ''), filt.replace("'", '')))
+    try:
+        return subprocess.run(['powershell', '-NoProfile', '-STA', '-Command', ps], capture_output=True, text=True, creationflags=NOWIN, timeout=300).stdout.strip()
+    except Exception:
+        return ''
+
+
+def _card_dir(b):
+    hb = heartbeat()
+    if hb and hb['alive']: return None, 'Close the game first, then change memory cards.'
+    base = cards_ensure(b)
+    if not base: return None, 'Game files for %s are not linked yet.' % b['name']
+    return os.path.join(base, 'cards'), ''
+
+
+def _card_clean(name):
+    return re.sub(r'[\\/:*?"<>|]', '', (name or '')).strip().rstrip('.')
+
+
+def card_rename(arg):
+    """CL-0223: rename a memory card folder (arg 'old\nnew'). Re-points mc0 if it is the active card."""
+    b = selected_build(); cd, err = _card_dir(b)
+    if err: return err
+    old, _, new = (arg or '').partition('\n'); old = _card_clean(old); new = _card_clean(new)
+    if not old or not os.path.isdir(os.path.join(cd, old)): return 'No such memory card.'
+    if not new: return 'Enter a new name.'
+    if new == old: return 'The name did not change.'
+    if os.path.exists(os.path.join(cd, new)): return 'A card called "%s" already exists.' % new
+    base = os.path.dirname(cd); mc0 = os.path.join(base, 'mc0')
+    active = _is_link(mc0) and os.path.normcase(os.path.realpath(mc0)) == os.path.normcase(os.path.realpath(os.path.join(cd, old)))
+    if active and os.path.lexists(mc0): os.rmdir(mc0)          # drop the junction first so the folder is not in use
+    try:
+        os.rename(os.path.join(cd, old), os.path.join(cd, new))
+    finally:
+        if active: _junction(mc0, os.path.join(cd, new if os.path.isdir(os.path.join(cd, new)) else old))
+    p = load_prefs(); cards = p.setdefault('cards', {})
+    for k, v in list(cards.items()):
+        if v == old: cards[k] = new
+    save_prefs(p); _CI[1] = None
+    return 'Memory card "%s" renamed to "%s".' % (old, new)
+
+
+def card_import(kind):
+    """CL-0223: import a memory card as a new named card. kind 'folder': copy a card folder (saves as sub folders);
+    kind 'file': extract a PCSX2 card image (.ps2/.mcd/.bin). The source is only read; nothing is overwritten."""
+    b = selected_build(); cd, err = _card_dir(b)
+    if err: return err
+    if kind == 'file':
+        src = browse_file('Pick a PCSX2 memory card file', 'PS2 memory card (*.ps2;*.mcd;*.bin)|*.ps2;*.mcd;*.bin|All files (*.*)|*.*')
+    else:
+        src = browse_folder('card')
+    if not src: return 'Import cancelled.'
+    stem = _card_clean(os.path.splitext(os.path.basename(src.rstrip('\\/')))[0]) or 'Imported'
+    name, i = 'Imported ' + stem, 2
+    while os.path.exists(os.path.join(cd, name)): name = 'Imported %s (%d)' % (stem, i); i += 1
+    dst = os.path.join(cd, name)
+    try:
+        if kind == 'file':
+            import ps2mc
+            saves = ps2mc.extract(src, dst)
+            if not saves: shutil.rmtree(dst, ignore_errors=True); return 'That card has no saves on it.'
+            what = '%d save%s' % (len(saves), '' if len(saves) == 1 else 's')
+        else:
+            if os.path.normcase(os.path.abspath(src)).startswith(os.path.normcase(os.path.abspath(cd))): return 'That folder is already one of your cards.'
+            subs = [d for d in os.listdir(src) if os.path.isdir(os.path.join(src, d))]
+            if not subs: return 'That folder has no save folders in it (expected one sub folder per save, e.g. BESLES-53676SD7).'
+            shutil.copytree(src, dst)
+            what = '%d save folder%s' % (len(subs), '' if len(subs) == 1 else 's')
+    except Exception as e:
+        shutil.rmtree(dst, ignore_errors=True)
+        return 'Import failed: %s' % e
+    _CI[1] = None
+    return 'Imported %s as memory card "%s". Pick it in the Memory card list to use it.' % (what, name)
+
+
 def card_prepare_for_launch(b):
     # re-apply the card chosen for this version before the game starts (cheap no-op when already selected)
     try:
@@ -1248,6 +1602,47 @@ def card_prepare_for_launch(b):
             if os.path.basename(os.path.realpath(mc0)) != want: _junction(mc0, os.path.join(base, 'cards', want))
     except Exception:
         pass
+    card_backup(b)
+
+
+def card_backup(b):
+    """Launcher-native: copy the active card to <boot folder>/cards_backup/<card>/<yyyymmdd_hhmmss> before every launch, keep 10."""
+    try:
+        base = _card_base(b)
+        if not base: return
+        mc0 = os.path.join(base, 'mc0')
+        if not os.path.isdir(mc0): return
+        name = os.path.basename(os.path.realpath(mc0)) if _is_link(mc0) else 'Default'
+        if not any(os.scandir(mc0)): return
+        root = os.path.join(base, 'cards_backup', name)
+        os.makedirs(root, exist_ok=True)
+        shutil.copytree(mc0, os.path.join(root, time.strftime('%Y%m%d_%H%M%S')))
+        olds = sorted(os.listdir(root))
+        for o in olds[:-10]: shutil.rmtree(os.path.join(root, o), ignore_errors=True)
+    except Exception as e:
+        print('[cards] backup failed:', e)
+
+
+def card_restore(arg):
+    """Restore a backup ('card\nstamp') as a NEW card named '<card> (restored <stamp>)'. Never overwrites."""
+    b = selected_build(); cd, err = _card_dir(b)
+    if err: return err
+    name, _, stamp = (arg or '').partition('\n'); name = _card_clean(name); stamp = re.sub(r'[^0-9_]', '', stamp)
+    src = os.path.join(os.path.dirname(cd), 'cards_backup', name, stamp)
+    if not os.path.isdir(src): return 'No such backup.'
+    dst = os.path.join(cd, '%s (restored %s)' % (name, stamp))
+    if os.path.exists(dst): return 'That backup was already restored as "%s".' % os.path.basename(dst)
+    shutil.copytree(src, dst); _CI[1] = None
+    return 'Backup restored as memory card "%s". Pick it in the card list to use it.' % os.path.basename(dst)
+
+
+def card_open(arg):
+    b = selected_build(); base = cards_ensure(b)
+    if not base: return 'Game files are not linked yet.'
+    d = os.path.join(base, 'cards', _card_clean(arg)) if arg else os.path.join(base, 'cards')
+    if not os.path.isdir(d): return 'No such memory card.'
+    if IS_WIN: os.startfile(d)
+    return 'Opened in Explorer.'
 
 # ---------------------------------------------------------------- actions
 def spawn(cmd):
@@ -1280,6 +1675,14 @@ def do_action(name, arg, body):
         return card_select(arg, create=True)
     if name == 'cardsel':
         return card_select(arg)
+    if name == 'cardrename':
+        return card_rename(arg)
+    if name == 'cardimport':
+        return card_import(arg)
+    if name == 'cardrestore':
+        return card_restore(arg)
+    if name == 'cardopen':
+        return card_open(arg)
     if name == 'quit':
         r = None
         if svrlive:
@@ -1309,7 +1712,8 @@ def do_action(name, arg, body):
     if name == 'open':
         targets = {'root': ROOT, 'logs': os.path.join(ROOT, 'analysis'), 'shots': os.path.join(ROOT, 'analysis', 'shots'),
                    'icons': os.path.join(ROOT, 'mods', 'icons'), 'texpack': os.path.join(ROOT, 'mods', 'texturepack'),
-                   'changelog': os.path.join(ROOT, 'docs', 'CHANGELOG-2026-10-28.md'), 'mods': os.path.join(ROOT, 'mods')}
+                   'changelog': os.path.join(ROOT, 'docs', 'CHANGELOG-2026-10-28.md'), 'mods': os.path.join(ROOT, 'mods'),
+                   'entsongs': _ent_paths()[2], 'enttitans': _ent_paths()[3]}
         t = targets.get(arg)
         if not t: return 'Unknown folder'
         if not os.path.exists(t) and not t.endswith('.md'): os.makedirs(t, exist_ok=True)
@@ -1345,11 +1749,11 @@ def state():
     lr = last_run()
     ex = exe_path()
     return {
-        'now': time.time(), 'version': current_version(), 'prefs': p, 'env': env_summary(p),
+        'now': time.time(), 'version': current_version(), 'prefs': p, 'env': env_summary(p), 'gpus': gpu_list(), 'gpu_used': gpu_used(),
         'modes': MODES, 'icon_sets': [dict(s, ready=(not s['id']) or os.path.exists(os.path.join(ROOT, 'mods', 'icons', s['id'], 'glyph_idx.bin'))) for s in ICON_SETS],
-        'texpack': {'count': count_files(TEXPACK, '.png'), 'path': TEXPACK_REL, 'stage': 'detect'},
+        'texpack': {'count': count_files(TEXPACK, '.png'), 'path': TEXPACK_REL, 'stage': 'hd'},
         'builds': builds_info(), 'cards': cards_info(selected_build(p)), 'states': STATES, 'sel_build': selected_build(p)['id'],
-        'game': {'running': game_running_cached(), 'heartbeat': heartbeat(), 'exe_mtime': os.path.getmtime(ex) if os.path.exists(ex) else 0},
+        'game': {'running': game_running_cached(), 'heartbeat': heartbeat(), 'speed': session_speed(heartbeat()), 'exe_mtime': os.path.getmtime(ex) if os.path.exists(ex) else 0},
         'build': build_state(), 'last_run': lr, 'scenarios': sorted(os.listdir(os.path.join(TOOLS, 'scenarios'))) if os.path.isdir(os.path.join(TOOLS, 'scenarios')) else [],
         'gset': gs_read(selected_build(p)['id']), 'gset_meta': GSET, 'cheats': {'defs': CHEATS, 'msg': _CH['msg'], 'verified': {k: v['verified'] and bool(v['shop_table']) for k, v in CHEAT_MAPS.items()}}, 'library': library(), 'root': ROOT, 'platform': 'windows' if IS_WIN else sys.platform,
     }

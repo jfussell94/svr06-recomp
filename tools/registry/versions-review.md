@@ -1,0 +1,67 @@
+# Version tags (review)
+Fill gimmick names in versions_overrides.json as {"<cid>:<game>": "Rated R Superstar"}.
+- The Rock: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Stone Cold Steve Austin: Just Bring It 2001, Here Comes the Pain 2003, SvR 2006 2006
+- Triple H: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Undertaker: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Kurt Angle: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Kane: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Chris Jericho: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Big Show: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Rikishi: Just Bring It 2001, Here Comes the Pain 2003
+- Chris Benoit: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Edge: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Christian: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Bubba Ray Dudley: Here Comes the Pain 2003, SvR 2005 2005
+- D-Von Dudley: Here Comes the Pain 2003, SvR 2005 2005
+- Matt Hardy: Here Comes the Pain 2003, SvR 2005 2005
+- Lita: Just Bring It 2001, Here Comes the Pain 2003, SvR 2006 2006
+- William Regal: Just Bring It 2001, SvR 2006 2006
+- Tazz: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Steven Richards: Just Bring It 2001, Here Comes the Pain 2003, SvR 2006 2006
+- Eddie Guerrero: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Trish Stratus: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Michael Cole: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Vince McMahon: Just Bring It 2001, Here Comes the Pain 2003
+- Stephanie McMahon: Just Bring It 2001, Here Comes the Pain 2003
+- Earl Hebner: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Rhyno: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005
+- Spike Dudley: Just Bring It 2001, SvR 2006 2006
+- Tajiri: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- ROUGH NECK: Just Bring It 2001, Here Comes the Pain 2003, SvR 2005 2005
+- Rob Van Dam: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Booker T: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Eric Bischoff: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Rey Mysterio: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Ric Flair: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Stacy Keibler: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Rico: Here Comes the Pain 2003, SvR 2005 2005
+- Chavo Guerrero: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Victoria: Here Comes the Pain 2003, SvR 2005 2005
+- John Cena: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- The Hurricane: Here Comes the Pain 2003, SvR 2006 2006
+- Torrie Wilson: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Shawn Michaels: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Sable: Here Comes the Pain 2003, SvR 2005 2005
+- Mike Chioda: Here Comes the Pain 2003, SvR 2005 2005
+- Jim Ross: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Jerry Lawler: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Jonathan Coachman: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Batista: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Randy Orton: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- A-Train: Here Comes the Pain 2003, SvR 2005 2005
+- Roddy Piper: Here Comes the Pain 2003, SvR 2005 2005
+- Ted DiBiase: Here Comes the Pain 2003, SvR 2006 2006
+- Jimmy Snuka: Here Comes the Pain 2003, SvR 2005 2005
+- Shelton Benjamin: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Charlie Haas: Here Comes the Pain 2003, SvR 2005 2005, SvR 2006 2006
+- Road Warrior Animal: Here Comes the Pain 2003, SvR 2005 2005
+- Road Warrior Hawk: Here Comes the Pain 2003, SvR 2005 2005
+- Mr. McMahon: SvR 2005 2005, SvR 2006 2006
+- J. B. Layfield: SvR 2005 2005, SvR 2006 2006
+- Mark Jindrak: SvR 2005 2005, SvR 2006 2006
+- Rene Dupree: SvR 2005 2005, SvR 2006 2006
+- Scotty 2 Hotty: SvR 2005 2005, SvR 2006 2006
+- Andre The Giant: SvR 2005 2005, SvR 2006 2006
+- Mankind: SvR 2005 2005, SvR 2006 2006
+- Bret Hart: SvR 2005 2005, SvR 2006 2006

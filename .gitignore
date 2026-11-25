@@ -54,3 +54,16 @@ Thumbs.db
 
 # local secrets
 config/github_token.txt
+
+# CL-0218: game-derived VU1 microcode images and generated native code - never publish
+tools/vu1bench/img/
+tools/vu1bench/natlist.txt
+ps2_vu1_native_gen.cpp
+# CL-0271: project artwork is original work (the *.png rule above is for game-derived images)
+!art/*.png
+!tools/launcher/ui/icon.png
+!docs/images/logo.png
+# CL-0271: game-derived VU1 microcode images and the native programs generated from them - never publish
+tools/vu1bench/img/
+tools/vu1bench/natlist.txt
+ps2_vu1_native_gen.cpp

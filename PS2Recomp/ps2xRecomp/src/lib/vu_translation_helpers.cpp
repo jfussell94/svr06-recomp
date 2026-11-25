@@ -786,18 +786,20 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
     {
-        uint8_t vis = inst.rd;
+        // VSQI fs, (it++): fs = bits 11-15 (rd), it = bits 16-20 (rt). (ISS-139: fields were swapped; vi0 never increments)
+        uint8_t vit = inst.rt;
+        uint8_t vfs = inst.rd;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
         return fmt::format("{{ uint32_t addr = (((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4) + 0x11004000u; "
                            "__m128i old_val = READ128(addr); "
                            "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
                            "WRITE128(addr, _mm_castps_si128(res)); "
-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
-                           vis,
-                           inst.rt,
+                           "{} }}",
+                           vit,
+                           vfs,
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
-                           vis, vis);
+                           vit == 0 ? std::string() : fmt::format("ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF;", vit, vit));
     }
 
     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
@@ -818,16 +820,18 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
     {
-        uint8_t vis = inst.rd;
+        // VSQD fs, (--it): fs = bits 11-15 (rd), it = bits 16-20 (rt). vi0 never changes.
+        uint8_t vit = inst.rt;
+        uint8_t vfs = inst.rd;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+        return fmt::format("{{ {} "
                            "uint32_t addr = (((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4) + 0x11004000u; "
                            "__m128i old_val = READ128(addr); "
                            "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
                            "WRITE128(addr, _mm_castps_si128(res)); }}",
-                           vis, vis,
-                           vis,
-                           inst.rt,
+                           vit == 0 ? std::string() : fmt::format("ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF;", vit, vit),
+                           vit,
+                           vfs,
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
     }

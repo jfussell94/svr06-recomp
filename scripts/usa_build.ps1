@@ -30,6 +30,10 @@ if ((-not (Test-Path $regf)) -or $Regen -or ((Get-Item (Join-Path $root 'config\
   if (Test-Path $gen) { Remove-Item $gen -Recurse -Force -ErrorAction SilentlyContinue }
   Say '2/4 Recompiling SLUS_212.86 (a few minutes)...'
   if (-not (Test-Path $exe)) { Write-Host "ps2_recomp.exe not found: $exe" -ForegroundColor Red; Read-Host 'Press Enter to close'; exit 1 }
+  # CL-0273: never regenerate with a recompiler older than its sources (the 10-26 exe lacks the 64-bit branch, JAL, EE FPU, MMI and VU
+  # translator fixes; using it made the USA build hang in libmpeg and draw wrong). out\generated_usa is now produced from current sources.
+  $newestSrc = Get-ChildItem (Join-Path $palrt 'ps2xRecomp\src'), (Join-Path $palrt 'ps2xRecomp\include') -Recurse -File -Include *.cpp,*.h | Where-Object { $_.Name -notmatch '\.bak' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if ($newestSrc -and (Get-Item $exe).LastWriteTime -lt $newestSrc.LastWriteTime) { Write-Host "ps2_recomp.exe is older than its sources ($($newestSrc.Name)); rebuild it first. Keeping the existing out\generated_usa." -ForegroundColor Red; Read-Host 'Press Enter to close'; exit 1 }
   New-Item -ItemType Directory -Force $gen | Out-Null
   Push-Location (Join-Path $root 'config')
   & $exe 'svr06_usa_ps2recomp.toml' 2>&1 | Out-File -Append -Encoding ascii $log
@@ -53,8 +57,25 @@ Get-ChildItem (Join-Path $root 'overrides') -File -Filter *.h -ErrorAction Silen
 # (code via the PAL->USA map, data +DATA_DELTA) and the override descriptor is retargeted to SLUS_212.86. Report: analysis\usa\port\usa_port_report.txt
 $portdir = Join-Path $root 'analysis\usa\port'
 Push-Location $root; python tools\usa_port_overrides.py $portdir 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
-foreach ($f in 'svr06_overrides.cpp','svr06_funcs.h') { $src = Join-Path $portdir $f; if (Test-Path $src) { Copy-Item $src (Join-Path $rd $f) -Force } else { Write-Host "USA port output missing: $f" -ForegroundColor Red } }
+# CL-0305: the USA svr06_overrides.cpp / svr06_funcs.h are GENERATED here from overrides\ (PAL addresses). Edits made directly to the
+# USA copies are overwritten; keep a copy of them and say so, so a hand edit is never lost silently. Edit overrides\svr06_overrides.cpp instead.
+foreach ($f in 'svr06_overrides.cpp','svr06_funcs.h') {
+  $dst = Join-Path $rd $f; $stamp = "$dst.generated"; $src = Join-Path $portdir $f
+  if ((Test-Path $dst) -and (Test-Path $src)) {
+    $hd = (Get-FileHash $dst).Hash; $hn = (Get-FileHash $src).Hash
+    $hs = if (Test-Path $stamp) { (Get-FileHash $stamp).Hash } else { $hd }
+    if ($hd -ne $hs -and $hd -ne $hn) {
+      $bk = "$dst.handedit_" + (Get-Date -Format 'yyyyMMdd_HHmmss')
+      Copy-Item $dst $bk -Force
+      Write-Host "WARNING: $f in the USA tree had hand edits that are now replaced by the generated file. Saved as $bk - move those edits into overrides\$f." -ForegroundColor Yellow
+      "WARNING hand edits in USA $f saved as $bk" | Out-File -Append -Encoding ascii $log
+    }
+  }
+  if (Test-Path $src) { Copy-Item $src $dst -Force; Copy-Item $src $stamp -Force } else { Write-Host "USA port output missing: $f" -ForegroundColor Red }
+}
 foreach ($f in 'svr06_funcs.h','svr06_engine.h') { $src = Join-Path $portdir $f; if (Test-Path $src) { Copy-Item $src (Join-Path $usart "ps2xRuntime\include\$f") -Force } }
+# CL-0277: hand patches the PAL runner carries (ISS-123 delay slots, ISS-101 camera guard, CL-0037 VU0 flags) re-applied to the USA code (idempotent)
+Push-Location $root; python tools\usa_postgen_patches.py 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
 Copy-Item (Join-Path $gen '*.cpp') $rd -Force
 Copy-Item (Join-Path $gen '*.h') $rd -Force
 # overlay banks recompiled from the USA BIN.PAC overlays (tools\usa_ovl_all.sh -> out\usa_ovl\x\<bank>\final)
@@ -74,7 +95,7 @@ $vc = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\
 if (Test-Path $vc) {
   cmd /c "`"$vc`" >nul && set" | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') } }
 } else { Say "vcvars64.bat not found at $vc - the C compiler test may fail" }
-cmake -S . -B $bdir -G Ninja "-DCMAKE_C_COMPILER=$cl" "-DCMAKE_CXX_COMPILER=$cl" "-DCMAKE_CXX_FLAGS=/EHsc /clang:-msse4.1 /clang:-mssse3 /I$rd" -DCMAKE_EXE_LINKER_FLAGS=/FORCE:MULTIPLE -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF -DCMAKE_BUILD_TYPE=Release "-DPS2X_DEFAULT_BOOT_ELF=$($elf.FullName)" -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_FFMPEG=ON -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_RUNNER_UNITY_BUILD=ON -DPS2X_ENABLE_RUNNER_PCH=ON 2>&1 | Out-File -Append -Encoding ascii $log
+cmake -S . -B $bdir -G Ninja "-DCMAKE_C_COMPILER=$cl" "-DCMAKE_CXX_COMPILER=$cl" "-DCMAKE_CXX_FLAGS=/EHsc /clang:-mavx2 /clang:-mbmi2 /clang:-mfma /clang:-ffp-contract=off /I$rd" "-DCMAKE_EXE_LINKER_FLAGS=/FORCE:MULTIPLE /MAP:C:/Users/ajizz/Documents/Recomp/svr06-recomp/analysis/svr06_usa.map" -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF -DCMAKE_BUILD_TYPE=Release "-DPS2X_DEFAULT_BOOT_ELF=$($elf.FullName)" -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_RUNTIME_LOGS=OFF -DPS2X_ENABLE_IOP_RPC_TRACE=OFF -DPS2X_ENABLE_FFMPEG=ON -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_RUNNER_UNITY_BUILD=ON -DPS2X_ENABLE_RUNNER_PCH=ON 2>&1 | Out-File -Append -Encoding ascii $log
 $bp = Start-Process cmd.exe -ArgumentList "/c cmake --build $bdir --target ps2EntryRunner -j -- -k 0 >> `"$log`" 2>&1" -PassThru -WindowStyle Hidden
 Pop-Location
 Show-BuildProgress $bp $log 'SvR06 USA build' (Join-Path $usart $bdir)

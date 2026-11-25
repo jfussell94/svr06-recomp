@@ -1,6 +1,7 @@
 // WWE SmackDown! vs. Raw 2006 (PAL, SLES_536.76) - runtime overrides + stall watchdog.
 // Lives in svr06-recomp/overrides/ and is copied into ps2xRuntime/src/runner/ by scripts/link_runtime.ps1.
 // Contains no game data. SVR06_WATCHDOG=0 disables the watchdog.
+#include <ctime>
 #include <cmath>
 #include "game_overrides.h"
 #include "ps2_runtime.h"
@@ -29,6 +30,7 @@
 #include <cctype>
 #include <mutex>
 #include "svr06_engine.h"
+#include "runtime/gs/gs_vulkan_bridge.h" // CL-0256: title video frames -> the game's VRAM video texture
 
 bool svr06_movie_start(const char *, int, bool);
 bool svr06_movie_active();
@@ -36,11 +38,16 @@ bool svr06_movie_done();
 void svr06_movie_ack();
 void svr06_movie_stop();
 void svr06_movie_set_inworld(bool); // [entfix] ISS-127
+void svr06_movie_set_gate(bool); // [cl0215c]
+namespace ps2_stubs { void svr06_cd_watch(uint32_t, uint32_t); uint32_t svr06_cd_watch_hits(); } // [cl0215]
+namespace ps2_stubs { void sceGsSyncPath(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); } // CL-0234
 bool svr06_movie_skip_requested();
 void svr06_movie_hold();
 void svr06_movie_hold_release();
+void svr06_movie_set_vram_feed(bool); bool svr06_movie_grab_frame(std::vector<uint8_t> &, int &, int &, uint64_t &); // CL-0256
 bool svr06_music_start(uint32_t, const char *, int, bool);
 int svr06_music_stat(uint32_t);
+bool svr06_music_pause(uint32_t, bool); bool svr06_music_time(uint32_t, uint64_t &); // CL-0246 (SvrMusic.cpp)
 bool svr06_music_stop(uint32_t);
 void svr06_music_volume(uint32_t, int32_t);
 // ISS-137: native commentary / ring announcer / crowd playback (SvrMusic.cpp)
@@ -60,6 +67,9 @@ namespace svr06ovl { void setHook(uint32_t addr, PS2Runtime::RecompiledFunction 
 std::vector<std::pair<int, std::string>> svr06_custom_entrance_slots(size_t maxLen); // SvrCustomMusic.cpp (ISS-143)
 std::string svr06_custom_tag_label(const std::string &name, const std::string &yy, size_t maxLen);
 bool svr06_custom_track_path(int n, std::string &out);
+void svr06_entrance_apply(int id, uint8_t *rec);                 // CL-0319 SvrCustomMusic.cpp: per-wrestler custom song/Titantron/move-set
+bool svr06_entrance_movie(int ptid, int idx, std::string &out);  // CL-0319
+bool svr06_movie_start_file(const char *absPath, bool loop);     // CL-0319 SvrMovie.cpp: plain host video file
 void svr06_custom_set_pending(const std::string &path);
 void svr06_custom_clear_pending();
 extern volatile int g_svr06TitleReached;
@@ -88,6 +98,31 @@ namespace
                 }
                 same = (sig == lastSig) ? same + 1 : 0;
                 lastSig = sig;
+                if (same == 8)
+                {   // ISS-162 (2026-11-14): EE thread state unchanged for ~32 s (NOW LOADING hang, or a long idle menu): save the
+                    // evidence once (max 3 per run) so the user does not have to: RAM snapshot + the loader request pool area.
+                    static int s_dumps = 0;
+                    if (s_dumps < 3)
+                    {
+                        ++s_dumps;
+                        char nm[96]; const std::time_t tt = std::time(nullptr); std::tm lt{};
+#ifdef _WIN32
+                        localtime_s(&lt, &tt);
+#else
+                        localtime_r(&tt, &lt);
+#endif
+                        std::snprintf(nm, sizeof nm, "analysis/live/autohang_%02d%02d%02d.bin", lt.tm_hour, lt.tm_min, lt.tm_sec);
+                        if (FILE *f = std::fopen(nm, "wb")) { std::fwrite(rt->memory().getRDRAM(), 1, 0x2000000u, f); std::fclose(f); }
+                        std::fprintf(stderr, "[autohang] EE threads unchanged for ~32 s: wrote %s (RAM) - if the game is stuck on NOW LOADING, keep this file\n", nm);
+                        const uint8_t *ram = rt->memory().getRDRAM();
+                        for (uint32_t a = 0x1CF8200u; a < 0x1CF8400u; a += 32u)
+                        {
+                            std::fprintf(stderr, "[autohang] %08X:", a);
+                            for (uint32_t k = 0; k < 32u; k += 4u) { uint32_t w; std::memcpy(&w, ram + a + k, 4); std::fprintf(stderr, " %08X", w); }
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
+                }
                 if (same > 1 && same % 5 != 2) continue; // print on change, then every ~20 s while stuck
                 std::fprintf(stderr, "[watchdog] %s running=%d threads=%zu eeCycle=%llu vsyncTick=%llu\n", same ? "STUCK?" : "state", s.runningThreadId, s.threads.size(), (unsigned long long)s.eeCycle, (unsigned long long)rt->eeScheduler().currentVSyncTick());
                 {
@@ -266,12 +301,129 @@ namespace
     // too long without any data ever being requested (movie streaming is not implemented yet), force PLAYEND so the
     // game's own state machine moves on. Disabled with SVR06_SKIPMOVIES=0.
     static int g_reqPtid = -1, g_reqIdx = -1;
+    static std::string g_reqCustom; // CL-0319: host video file chosen for the requested Titantron marker
     static std::atomic<bool> g_movieClockTitle{false}; // [titleclock] CL-0113
+    static std::atomic<bool> g_titleClosing{false}; // CL-0256f: PRESS START object is closing (idle timeout) -> report the real status so it can finish
+    static std::atomic<bool> g_titleFeed{false}; // CL-0256: host-decoded title movie is fed to the game as a playing Sofdec movie (status 2 + frames in VRAM 0x1E00)
+    static bool titleFeedOn() { static const bool on = !(std::getenv("SVR06_TITLEFEED") && std::getenv("SVR06_TITLEFEED")[0] == '0'); return on; }
     static std::atomic<long long> g_movieClockStartNs{0}; // wall clock of the last HLE movie start (game's movie 'audio clock', see adxGetTimeHook)
+    // [cl0215d] season cutscene wrong entrance music: log the BGM request (1CEC10) and the roster-record lookups (1DCF80) made by the event overlay
+    PS2Runtime::RecompiledFunction g_bgmReqOrig = nullptr, g_recLookOrig = nullptr, g_curWrOrig = nullptr;
+    void bgmReqHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        static int n = 0;
+        if (n++ < 80) std::fprintf(stderr, "[bgmreq] #%d a0(id)=%u a1=%u a2=%u a3=%u ra=%X\n", n, GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 31));
+        g_bgmReqOrig(rdram, ctx, rt);
+    }
+    void recLookHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5), a2 = GPR_U32(ctx, 6), ra = GPR_U32(ctx, 31);
+        g_recLookOrig(rdram, ctx, rt);
+        { const uint32_t r0 = GPR_U32(ctx, 2); if (r0 > 0x100000u && r0 < 0x1FFFF00u - 0x200u && a0 < 128u) svr06_entrance_apply((int)a0, rdram + r0); } // CL-0319/CL-0325 custom entrance database
+        static int n = 0;
+        if (ra >= 0x5A0000u && ra < 0x680000u && n++ < 120)
+        {
+            const uint32_t rec = GPR_U32(ctx, 2); uint8_t b[16] = {0};
+            if (rec && rec < 0x1FFFF00u - 0x200u) std::memcpy(b, rdram + rec + 0x13C, 16);
+            std::fprintf(stderr, "[reclook] #%d id=%u(%X) a1=%d a2=%d ra=%X rec=%X music@+13C..: %02X %02X %02X %02X | +140: %02X %02X %02X %02X\n", n, a0, a0, (int)a1, (int)a2, ra, rec, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+        }
+    }
+    void curWrHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4), ra = GPR_U32(ctx, 31);
+        g_curWrOrig(rdram, ctx, rt);
+        static int n = 0; if (ra >= 0x5A0000u && n++ < 60) std::fprintf(stderr, "[curwr] #%d 27DEF0(a0=%X) -> %u ra=%X\n", n, a0, GPR_U32(ctx, 2), ra);
+    }
+    // [cl0215] HLE of ADXF_GetFnameRangeEx for the movie partitions (ptid 10-14 = Titantrons). The partition table is empty at runtime
+    // (loader 0x147A98 never runs) so the original returns an error and the game never starts its own stream.
+    PS2Runtime::RecompiledFunction g_fnrOrig = nullptr;
+    static uint32_t g_movieWatchLo = 0, g_movieWatchHi = 0;
+    // CL-0279: the Titantron AFS files are named per disc: PAL MOVIEP/NMVP00n.AFS, USA MOVIE/NMV00n.AFS. Detect the layout on the
+    // disc and find the file's {lbn,size} entry in the game's file table by its size instead of the PAL table index 104.
+    static bool svr06TitanPal()
+    {
+        static const int v = [] { std::error_code ec; return std::filesystem::exists(std::filesystem::path(PS2Runtime::getIoPaths().cdRoot) / "MOVIEP" / "NMVP000.AFS", ec) ? 1 : 0; }();
+        return v != 0;
+    }
+    static const char *svr06TitanDir() { return svr06TitanPal() ? "MOVIEP" : "MOVIE"; }
+    static std::string svr06TitanName(uint32_t pt) { char b[16]; std::snprintf(b, sizeof b, svr06TitanPal() ? "NMVP%03u" : "NMV%03u", pt - 10u); return b; }
+    static uint32_t svr06TitanLbn(uint8_t *rdram, uint32_t tblPtrAddr, uint32_t pt)
+    {
+        auto rd = [&](uint32_t ad) { uint32_t v = 0; if (ad < 0x2000000u) std::memcpy(&v, rdram + ad, 4); return v; };
+        const uint32_t tbl = rd(tblPtrAddr); if (tbl == 0 || tbl >= 0x2000000u) return 0;
+        std::error_code ec; const uint64_t sz = std::filesystem::file_size(std::filesystem::path(PS2Runtime::getIoPaths().cdRoot) / svr06TitanDir() / (svr06TitanName(pt) + ".AFS"), ec);
+        if (!ec) for (uint32_t i = 0; i < 400u; ++i) { const uint32_t z = rd(tbl + i * 8u + 4u); if ((z == (uint32_t)sz || z == (uint32_t)((sz + 2047u) / 2048u)) && rd(tbl + i * 8u) != 0u) { static int lg = 0; if (lg++ < 5) std::fprintf(stderr, "[fnr] %s/%s.AFS = file table entry %u (lbn 0x%X)\n", svr06TitanDir(), svr06TitanName(pt).c_str(), i, rd(tbl + i * 8u)); return rd(tbl + i * 8u); } }
+        return rd(tbl + (104u + (pt - 10u)) * 8u); // PAL layout fallback
+    }
+    void fnameRangeHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        const uint32_t pt = GPR_U32(ctx, 4), fl = GPR_U32(ctx, 5), pfn = GPR_U32(ctx, 6), pdir = GPR_U32(ctx, 7), pofs = GPR_U32(ctx, 8), pns = GPR_U32(ctx, 9);
+        // CL-0310: SVR06_TITAN_NOSTREAM=1 keeps the game's own Sofdec/IPU decode of in-world Titantrons (match / event overlay) off:
+        // no partition record -> the game cannot open the stream -> the native player (own host thread) only drives the movie clock.
+        // A/B test for the entrance slowdown (EE thread at 100% in the movie server while the IPU decodes on the EE thread).
+        static const bool s_titanNoStream = std::getenv("SVR06_TITAN_NOSTREAM") && std::getenv("SVR06_TITAN_NOSTREAM")[0] == '1';
+        const bool s_inWorldNow = std::strncmp((const char *)(rdram + 0x5A2720), "MainGame", 8) == 0 || std::strncmp((const char *)(rdram + 0x5A2720), "event", 5) == 0;
+        if (pt >= 10 && pt <= 14 && s_titanNoStream && s_inWorldNow) { static int s_ln = 0; if (s_ln++ < 5) std::fprintf(stderr, "[fnr] ptid=%u in-world: game stream disabled (SVR06_TITAN_NOSTREAM)\n", pt); }
+        if (pt >= 10 && pt <= 14 && !std::getenv("SVR06_NOFNR") && !(s_titanNoStream && s_inWorldNow))
+        {   // [cl0215] synthesise the ADXF partition record the (never-run) loader 0x147A98 would have built, so the game's own
+            // lookup (0x149940 + 0x149A98 name) and stream open (0x165980) work unchanged. Layout (from 0x149940): +8 file count,
+            // +0xF 1=32-bit size table, +0x10 name[0x100], +0x110 dir (file LBN), +0x114 ofst base, +0x118 first ofst, +0x11C u32 sizes[].
+            auto rdw = [&](uint32_t ad) { uint32_t v = 0; if (ad < 0x2000000u) std::memcpy(&v, rdram + ad, 4); return v; };
+            const uint32_t slot = 0x3129D0u + pt * 4u;
+            if (rdw(slot) == 0u)
+            {
+                const PS2Runtime::IoPaths &ip = PS2Runtime::getIoPaths();
+                std::ifstream af(std::filesystem::path(ip.cdRoot) / svr06TitanDir() / (svr06TitanName(pt) + ".AFS"), std::ios::binary);
+                uint8_t h8[8] = {0}; af.read((char *)h8, 8); uint32_t cnt = 0; std::memcpy(&cnt, h8 + 4, 4);
+                if (af && std::memcmp(h8, "AFS\0", 4) == 0 && cnt > 0 && cnt <= 64u)
+                {
+                    std::vector<uint32_t> tb(cnt * 2u); af.read((char *)tb.data(), cnt * 8);
+                    const uint32_t P = rt->guestCalloc(1, 0x11Cu + 4u * cnt + 16u, 16u);
+                    if (P != 0u)
+                    {
+                        auto w32 = [&](uint32_t ad, uint32_t v) { std::memcpy(rdram + ad, &v, 4); };
+                        const uint32_t baseLbn = svr06TitanLbn(rdram, 0x329600u, pt);
+                        w32(P + 8, cnt); rdram[P + 0xF] = 1;
+                        char nm[40]; { std::string d = svr06TitanDir(), f = svr06TitanName(pt); for (auto &c : d) c = (char)std::tolower((unsigned char)c); for (auto &c : f) c = (char)std::tolower((unsigned char)c); std::snprintf(nm, sizeof nm, "%s/%s.afs", d.c_str(), f.c_str()); } std::memcpy(rdram + P + 0x10, nm, std::strlen(nm) + 1);
+                        w32(P + 0x110, baseLbn); w32(P + 0x114, 0); w32(P + 0x118, tb[0] / 2048u);
+                        for (uint32_t i = 0; i < cnt; ++i) { const uint32_t nxt = (i + 1 < cnt) ? tb[(i + 1) * 2] : tb[i * 2] + tb[i * 2 + 1]; w32(P + 0x11C + i * 4, (nxt - tb[i * 2]) / 2048u + (((nxt - tb[i * 2]) % 2048u) ? 1u : 0u)); }
+                        w32(slot, P);
+                        g_movieWatchLo = baseLbn; g_movieWatchHi = baseLbn + (uint32_t)(((uint64_t)tb[(cnt - 1) * 2] + tb[(cnt - 1) * 2 + 1] + 2047u) / 2048u) + 1u;
+                        std::fprintf(stderr, "[fnr] built partition ptid=%u P=%X name=%s dir=0x%X files=%u\n", pt, P, nm, baseLbn, cnt);
+                    }
+                }
+            }
+            ps2_stubs::svr06_cd_watch(g_movieWatchLo, g_movieWatchHi);
+        }
+        g_fnrOrig(rdram, ctx, rt);
+        const int32_t r = (int32_t)GPR_U32(ctx, 2);
+        static int s_n = 0;
+        if (pt < 10 || pt > 14) return;
+        const bool s_off = std::getenv("SVR06_NOFNR") != nullptr || (s_titanNoStream && s_inWorldNow);
+        if (s_n++ < 40) std::fprintf(stderr, "[fnr] ptid=%u flid=%u orig ret=%d%s\n", pt, fl, r, s_off ? " (HLE disabled)" : "");
+        if (r >= 0 || s_off) return;
+        const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
+        std::filesystem::path afs = std::filesystem::path(paths.cdRoot) / svr06TitanDir() / (svr06TitanName(pt) + ".AFS");
+        std::ifstream f(afs, std::ios::binary);
+        uint8_t hd[8] = {0}; f.read((char *)hd, 8); uint32_t cnt = 0; std::memcpy(&cnt, hd + 4, 4);
+        if (!f || std::memcmp(hd, "AFS\0", 4) != 0 || fl >= cnt) { std::fprintf(stderr, "[fnr] cannot read AFS entry %u of %s\n", fl, afs.string().c_str()); return; }
+        uint32_t ent[2] = {0, 0}; f.seekg(8 + (std::streamoff)fl * 8); f.read((char *)ent, 8);
+        auto rd32 = [&](uint32_t ad) { uint32_t v = 0; if (ad < 0x2000000u) std::memcpy(&v, rdram + ad, 4); return v; };
+        auto wr32 = [&](uint32_t ad, uint32_t v) { if (ad != 0 && ad < 0x2000000u) std::memcpy(rdram + ad, &v, 4); };
+        // DVCI pseudo-LBN of the AFS (file table: heap ptr at [0x329600], 8-byte {lbn,size} entries, NMVP000 = index 104)
+        const uint32_t baseLbn = svr06TitanLbn(rdram, 0x329600u, pt);
+        const uint32_t ofstSect = baseLbn + ent[0] / 2048u, nsct = (ent[1] + 2047u) / 2048u;
+        char fn[64]; std::snprintf(fn, sizeof fn, "%s/%s.AFS", svr06TitanDir(), svr06TitanName(pt).c_str());
+        if (pfn >= 0x100000u && pfn < 0x1FFFF00u) std::memcpy(rdram + pfn, fn, std::strlen(fn) + 1);
+        wr32(pdir, 0); wr32(pofs, ofstSect); wr32(pns, nsct);
+        ctx->r[2] = _mm_setzero_si128();
+        std::fprintf(stderr, "[fnr] HLE ptid=%u flid=%u -> %s baseLbn=0x%X ofst=0x%X nsct=0x%X (afs off=0x%X size=%u)\n", pt, fl, fn, baseLbn, ofstSect, nsct, ent[0], ent[1]);
+    }
     void movieNameHook(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         const int pt = (int)GPR_U32(ctx, 4), ix = (int)GPR_U32(ctx, 5);
         if (pt == 15 && ix == 3) g_svr06TitleReached = 1;
+        g_reqCustom.clear(); if (pt >= 10 && pt <= 14) { std::string cu; if (svr06_entrance_movie(pt, ix, cu)) g_reqCustom = cu; }
         if (pt >= 10 && pt <= 17) { g_reqPtid = pt; g_reqIdx = ix; std::fprintf(stderr, "[movie] request ptid=%d idx=%d\n", pt, ix); }
     }
     void movieSkipHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
@@ -294,6 +446,8 @@ namespace
         static bool s_isTitle = false;
         static int s_tf = 0;
         static uint32_t s_playObj = 0;
+        static bool s_titanInWorld = false; // CL-0302: in-world Titantron (match / Season event screen): the skip button belongs to the game's cutscene, not to this movie
+        static long long s_titanT0 = 0; static uint64_t s_titanIpu0 = 0; static bool s_titanGame = false; // [cl0215]
         const uint32_t obj0 = GPR_U32(ctx, 4);
         if (obj0 != 0u && obj0 < 0x1FFFF00u)
         {
@@ -310,13 +464,30 @@ namespace
             if (st0 == 3u)
             {
                 if (s_playObj == 0u) s_playObj = obj0;
+                { // [cl0215] Titantrons: first let the game stream the movie itself (fnameRangeHook gives it a valid range); native player is the fallback
+                    static const bool s_gameTitan = (std::getenv("SVR06_GAMETITRON") && std::getenv("SVR06_GAMETITRON")[0] == '1'); // opt-in: the game's Sofdec stream layer is never initialised (sofdec=0), so its own stream cannot start; IPU activity from other screens made the watch a false positive
+                    const long long nowNs = (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    if (s_gameTitan && !s_started && g_reqPtid >= 10 && g_reqPtid <= 14)
+                    {
+                        if (s_titanT0 == 0) { s_titanT0 = nowNs; s_titanIpu0 = s_ipuSeen; s_titanGame = false; std::fprintf(stderr, "[titan] ptid=%d idx=%d: watching the game's own stream (ipu=%llu)\n", g_reqPtid, g_reqIdx, (unsigned long long)s_ipuSeen); return; }
+                        if (ps2_stubs::svr06_cd_watch_hits() != 0u) { s_titanGame = true; g_reqPtid = -1; std::fprintf(stderr, "[titan] game-owned stream active (cd hits=%u, ipu %llu -> %llu)\n", ps2_stubs::svr06_cd_watch_hits(), (unsigned long long)s_titanIpu0, (unsigned long long)s_ipuSeen); return; }
+                        if (nowNs - s_titanT0 < 4000000000LL) return;
+                        std::fprintf(stderr, "[titan] no game stream after 4s -> native clock fallback\n"); s_titanT0 = 0;
+                    }
+                    if (s_titanGame && s_titanT0 != 0 && nowNs - s_titanT0 > 120000000000LL) { endIt(); s_titanGame = false; s_titanT0 = 0; std::fprintf(stderr, "[titan] game-owned stream timeout -> PLAYEND\n"); return; }
+                    if (s_titanGame) return;
+                }
                 if (!s_started && g_reqPtid >= 0)
                 {
+                    { // CL-0252: boot sequence = LOGO (ptid 15 idx 0), OP (ptid 16 idx 2), then the title movie (ptid 15 idx 3). The first two are skipped by default; the title movie (3rd) always plays. SVR06_INTROS=1 restores them.
+                      static const bool s_keepIntros = !(std::getenv("SVR06_INTROS") && std::getenv("SVR06_INTROS")[0] == '0'); /* CL-0257: intros play again by default (user did not want them removed); SVR06_INTROS=0 skips them */
+                      static bool s_opSkipped = false; /* the boot OP movie index varies between runs (idx 1 or 2): skip only the first OP request, so the idle attract-mode OP is untouched */
+                      if (!s_keepIntros && ((g_reqPtid == 15 && g_reqIdx == 0) || (g_reqPtid == 16 && !s_opSkipped && (s_opSkipped = true)))) { std::fprintf(stderr, "[movie] intro skipped (ptid=%d idx=%d)\n", g_reqPtid, g_reqIdx); g_reqPtid = -1; endIt(); return; } }
                     static const char *nm[] = {"NMVP000","NMVP001","NMVP002","NMVP003","NMVP004","LOGOP","OPP","ENDP"};
                     char rel[64]; std::snprintf(rel, sizeof rel, "MOVIEP/%s.AFS", nm[g_reqPtid - 10]);
                     s_tf = 0; s_isTitle = (g_reqPtid == 15 && g_reqIdx == 3);
                     { static const bool s_gameTitle = !(std::getenv("SVR06_GAMETITLE") && std::getenv("SVR06_GAMETITLE")[0] == '0'); if (s_isTitle && s_gameTitle) { svr06_music_start(0xFFFF0001u, "BGM/BGM1.AFS", 1, true); std::fprintf(stderr, "[movie] title movie left to the game's own IPU path (ISS-122); music started\n"); g_reqPtid = -1; s_isTitle = false; return; } }
-                    svr06_movie_set_inworld(g_reqPtid >= 10 && g_reqPtid <= 14); /* [entfix] Titantrons are in-world screens: never cover the window */ s_started = svr06_movie_start(rel, g_reqIdx, false); if (s_started) { g_movieClockTitle.store(s_isTitle); g_movieClockStartNs.store((long long)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); } /* [titleclock] CL-0113: the title movie clock used to be 0, so the game never faded in the PRESS START pill until the movie ended */ if (s_started && s_isTitle) { svr06_music_start(0xFFFF0001u, "BGM/BGM1.AFS", 1, true); std::fprintf(stderr, "[music] title theme started (BGM1 entry 1)\n"); }
+                    { const char *ov = (const char *)(rdram + 0x5A2720); const bool inMatch = std::strncmp(ov, "MainGame", 8) == 0 || std::strncmp(ov, "event", 5) == 0; /* CL-0245: Season event cutscenes show titantron clips on an in-world screen too */ if (g_reqPtid >= 10 && g_reqPtid <= 14) std::fprintf(stderr, "[titan] upper overlay=%.12s -> %s\n", ov, inMatch ? "in-world clock only" : "fullscreen preview"); s_titanInWorld = (g_reqPtid >= 10 && g_reqPtid <= 14 && inMatch); svr06_movie_set_inworld(s_titanInWorld); svr06_movie_set_gate(g_reqPtid >= 10 && g_reqPtid <= 14 && !inMatch); } /* [cl0215] CAW/locker previews have no in-world screen: show the native video */ /* [entfix] Titantrons are in-world screens: never cover the window */ { const bool cu = !g_reqCustom.empty(); s_started = cu ? svr06_movie_start_file(g_reqCustom.c_str(), false) : svr06_movie_start(rel, g_reqIdx, s_isTitle && titleFeedOn()); g_reqCustom.clear(); } /* CL-0256e: the title background loops until the game stops it (Start -> menu, 30 s idle timer -> demo), like hardware where the timer always wins */ if (s_started) { g_movieClockTitle.store(s_isTitle); g_movieClockStartNs.store((long long)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); } /* [titleclock] CL-0113: the title movie clock used to be 0, so the game never faded in the PRESS START pill until the movie ended */ if (s_started && s_isTitle) { svr06_music_start(0xFFFF0001u, "BGM/BGM1.AFS", 1, true); std::fprintf(stderr, "[music] title theme started (BGM1 entry 1)\n"); } if (s_started && s_isTitle && titleFeedOn()) { svr06_movie_set_vram_feed(true); g_titleClosing.store(false); g_titleFeed.store(true); gsvk::setUploadBlock(0x1E00u, 10u); std::fprintf(stderr, "[titlefeed] title movie fed to the game's own video texture (CL-0256): pill + text drawn by the game over it, like hardware\n"); }
                     g_reqPtid = -1;
                     if (!s_started) endIt();
                 }
@@ -332,12 +503,17 @@ namespace
                     static int s_mf = 0;
                     if (!s_isTitle && s_fast && ++s_mf > 150) { s_mf = 0; svr06_movie_stop(); s_started = false; endIt(); std::fprintf(stderr, "[movie] fast-skipped -> PLAYEND\n"); return; }
                     static int s_sf = 0; if (s_sf < 0) s_sf = 0; ++s_sf; const bool skipNow = svr06_movie_skip_requested() || g_svr06StartDown.load(); const bool skipEdge = skipNow && s_sf > 20;
-                    if (svr06_movie_done() || (!s_isTitle && skipEdge) || (s_isTitle && s_tf > 90 && g_svr06StartDown.load())) { if (s_isTitle && !svr06_movie_done() && g_svr06StartDown.load()) g_svr06StartCarryNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() + 1200000000LL); svr06_movie_stop(); if (s_isTitle) { svr06_movie_hold(); if (g_movieClockTitle.exchange(false)) g_movieClockStartNs.store(0); } else svr06_music_stop(0xFFFF0001u); g_svr06ForceBtn.store(0); s_started = false; s_sf = 0; endIt(); std::fprintf(stderr, "[movie] ended -> PLAYEND\n"); }
+                    if (s_isTitle && g_titleFeed.load()) // CL-0256: like hardware, the game itself handles Start (menu) and the idle timeout (demo) and stops the movie; we only report the natural end
+                    {
+                        if (svr06_movie_done()) { svr06_movie_stop(); g_titleFeed.store(false); svr06_movie_set_vram_feed(false); gsvk::setUploadBlock(0u, 10u); if (g_movieClockTitle.exchange(false)) g_movieClockStartNs.store(0); s_started = false; s_sf = 0; endIt(); std::fprintf(stderr, "[titlefeed] title movie finished -> PLAYEND\n"); }
+                        return;
+                    }
+                    if (svr06_movie_done() || (!s_isTitle && !s_titanInWorld && skipEdge) || (s_isTitle && s_tf > 90 && g_svr06StartDown.load())) { if (s_isTitle && !svr06_movie_done() && g_svr06StartDown.load()) g_svr06StartCarryNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() + 1200000000LL); svr06_movie_stop(); if (s_isTitle) { svr06_movie_hold(); if (g_movieClockTitle.exchange(false)) g_movieClockStartNs.store(0); } else svr06_music_stop(0xFFFF0001u); g_svr06ForceBtn.store(0); s_started = false; s_sf = 0; endIt(); std::fprintf(stderr, "[movie] ended -> PLAYEND\n"); }
                     return;
                 }
                 else if (!ipuActive && ++s_playing >= 20 && (s_playObj == 0u || s_playObj == obj0)) { endIt(); s_playing = 0; s_playObj = 0; std::fprintf(stderr, "[movie] no request -> PLAYEND\n"); }
             }
-            else { if (s_playObj == obj0 || s_playObj == 0u) { s_playing = 0; s_playObj = 0; } if (s_started && st0 != 3u && (s_playObj == obj0 || s_playObj == 0u)) { svr06_movie_stop(); if (g_movieClockTitle.exchange(false)) g_movieClockStartNs.store(0); svr06_music_stop(0xFFFF0001u); g_svr06ForceBtn.store(0); s_started = false; } }
+            else { if (s_playObj == obj0 || s_playObj == 0u) { s_playing = 0; s_playObj = 0; if (s_titanT0 != 0 || s_titanGame) { std::fprintf(stderr, "[titan] movie object left PLAYING (st=%u game=%d)\n", st0, (int)s_titanGame); s_titanT0 = 0; s_titanGame = false; } } if (s_started && st0 != 3u && (s_playObj == obj0 || s_playObj == 0u)) { if (g_titleFeed.exchange(false)) { svr06_movie_set_vram_feed(false); gsvk::setUploadBlock(0u, 10u); std::fprintf(stderr, "[titlefeed] game stopped the title movie (st=%u)\n", st0); } svr06_movie_stop(); if (g_movieClockTitle.exchange(false)) g_movieClockStartNs.store(0); svr06_music_stop(0xFFFF0001u); g_svr06ForceBtn.store(0); s_started = false; } }
         }
         return;
     }
@@ -840,9 +1016,13 @@ namespace
                     ++nCustom;
                 }
                 auto lower = [](std::string v) { for (char &ch : v) ch = (char)std::tolower((unsigned char)ch); return v; };
+                // CL-0224: stock rows keep the game's own order and positions (entrance music is stored / looked up by row, so
+                // sorting custom songs in between moved every stock song: Undertaker's entrance played Christy Hemme's theme).
+                // Custom songs follow after the last stock row, alphabetically among themselves.
                 std::stable_sort(rows.begin(), rows.end(), [&](const Row &x, const Row &y) {
-                    if (x.grp != y.grp) return x.grp < y.grp;
-                    if (x.grp != 1) return false; // BGM block and "none" keep the game's order
+                    const bool cx = x.ex == 0xFFu && x.id == 0u, cy = y.ex == 0xFFu && y.id == 0u;
+                    if (cx != cy) return !cx;
+                    if (!cx) return false;
                     return lower(x.name) < lower(y.name);
                 });
                 uint32_t t = 0;
@@ -877,7 +1057,7 @@ namespace
         const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5), a2 = GPR_U32(ctx, 6), ra = GPR_U32(ctx, 31), gp = GPR_U32(ctx, 28);
         static int s_n = 0;
         const uint32_t base = rdw(a0 + a1 * 4 + 0x4C), cnt = rdw(a0 + a1 * 4 + 0x70);
-        if (cnt == 40u) // the BGM cue manager (40 entries per partition; bank index = plain / ENVB / ENVH mix)
+        if (cnt == 40u && base < 10u) // the BGM cue manager (40 entries per partition; bank index = plain / ENVB / ENVH mix). CL-0224: base < 10 = music partitions only; the crowd bank (base 20, also 40 per partition) was being swapped for custom songs
         {   // ISS-143 extra slots: a custom track number is swapped for stock track 40 (BGM 01) and its file is queued;
             // svr06_music_start plays the queued file instead of that stock track. Works for any number the game can store.
             std::string cp;
@@ -955,10 +1135,21 @@ namespace
             std::snprintf(rb, sizeof rb, "ra=%08X ptid=%u fid=%u a3=%08X", GPR_U32(ctx, 31), pt, fid, GPR_U32(ctx, 7));
             svr06AudioLogExt("startafs", rb, (int)fid, h);
         }
+        // CL-0243: Season dialogue. ptid 24 holds BGM/SSND1.AFS or BGM/SSND2.AFS (the game swaps the file per storyline/brand); the
+        // partition loader (0x147A98) is not used for it, so take the file name from the game's current SSND path buffer (0x329728,
+        // "\\BGM\\SSND2.AFS;1") at every start. Without this the cutscene voice never starts and the scene waits for it forever.
+        if (pt >= 24u && pt < 26u)
+        {
+            std::string nm, rel;
+            // CL-0244: fixed map. The track resolver splits season lines into banks of 4000 (cnt=4000): SSND1.AFS has exactly 4000 entries
+            // (= ptid 24) and SSND2.AFS 2450 (= ptid 25), matching the PACLISTP order. The path buffer at 0x329728 is not the ptid 24 file.
+            nm = (pt == 24u) ? "SSND1" : "SSND2";
+            if (resolveAfs(nm, rel) && g_ptidArc[pt] != rel) { g_ptidArc[pt] = rel; std::fprintf(stderr, "[voice] season ptid=%u -> %s (\"%s\")\n", pt, rel.c_str(), nm.c_str()); }
+        }
         if (pt < 10u)
         {
             const bool loop = adxFileLoops(kBgmAfs[pt], (int)fid);
-            if (h != 0xFFFF0001u) { svr06_music_stop(0xFFFF0001u); svr06_movie_hold_release(); } /* the runtime-started title theme must not play under the game's own music (doubled music on PRESS START) */
+            if (h != 0xFFFF0001u) { svr06_music_stop(0xFFFF0001u); /* CL-0247: the game starts its title theme while the held movie must stay behind PRESS START; release only by button/fade/full-screen rules */ } /* the runtime-started title theme must not play under the game's own music (doubled music on PRESS START) */
             const bool ok = svr06_music_start(h, kBgmAfs[pt], (int)fid, loop);
             std::fprintf(stderr, "[music] StartAfs handle=%X ptid=%u fid=%u loop=%d -> %s\n", h, pt, fid, loop ? 1 : 0, ok ? "native" : "FAILED");
             if (ok) { SET_GPR_U32(ctx, 2, 0u); ctx->pc = GPR_U32(ctx, 31); return; }
@@ -968,7 +1159,7 @@ namespace
         {
             const char *arc = g_ptidArc[pt].c_str();
             const std::string arcs(arc); // speech archives are one-shot clips: their ADX headers carry a loop flag that made one line repeat forever
-            const bool speech = arcs.find("PBPPAC") != std::string::npos || arcs.find("ANNOUNCE") != std::string::npos || arcs.find("CASVOICE") != std::string::npos;
+            const bool speech = arcs.find("PBPPAC") != std::string::npos || arcs.find("ANNOUNCE") != std::string::npos || arcs.find("CASVOICE") != std::string::npos || arcs.find("SSND") != std::string::npos; // CL-0243: season dialogue is one-shot
             const bool loop = !speech && adxFileLoops(arc, (int)fid);
             const bool ok = svr06_music_start(h, arc, (int)fid, loop); // the game's own handle, so Stop/GetStat/SetOutVol keep working
             std::fprintf(stderr, "[voice] StartAfs handle=%X ptid=%u fid=%u %s loop=%d free=%d -> %s\n",
@@ -1006,11 +1197,102 @@ namespace
         }
         if (g_adxTimeOrig) g_adxTimeOrig(rdram, ctx, rt);
     }
+    // CL-0256: title screen rebuilt to hardware behaviour. Title.bin's PRESS START object (ctor 0x5A3E30) opens the title movie through the
+    // movie manager, sets the video texture to VRAM 0x1E00 and shows the pill once the manager status (0x1C4590 -> Sofdec state) reads 2
+    // (playing) for 5 frames (0x5A42A0); its draw (0x5A44A0) puts a 640x448 decal quad of 0x1E00 under the pill and text. With the host
+    // FFmpeg player the game's Sofdec never reaches 'playing', so the pill waited for the movie end. While the host title movie runs, this
+    // hook reports 2 and uploads each new decoded frame to 0x1E00 (DBW 10, CT32) - the same GIF image transfer the game does on PS2.
+    static PS2Runtime::RecompiledFunction g_mwStatOrig = nullptr;
+    // CL-0256f: 0x1CC9A0 = movie manager status (mgr, slot) -> 0x1C4590. Title.bin calls it from three places: the pill gate
+    // (ra 0x5A42BC), the video draw (ra 0x5A44B4) and the closing wait after the 30 s idle timeout (ra 0x5A43FC, update of phase 3
+    // set by 0x21D570). The closing wait only finishes once the movie is no longer 'playing'; our looping feed answered 'playing'
+    // forever, so the demo never started. From the closing wait on, the real status is reported (quad no longer drawn, like the
+    // fade to black on hardware), the game finishes closing, stops the movie and loads the demo.
+    static PS2Runtime::RecompiledFunction g_mgrStatOrig = nullptr;
+    void mgrStatHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        if (g_titleFeed.load() && !g_titleClosing.load() && GPR_U32(ctx, 31) == 0x5A43FCu && std::strncmp((const char *)(rdram + 0x5A2720), "Title.bin", 9) == 0)
+        { g_titleClosing.store(true); std::fprintf(stderr, "[titlefeed] PRESS START closing (idle timeout) -> movie reported stopped, demo next\n"); }
+        if (g_mgrStatOrig) g_mgrStatOrig(rdram, ctx, rt);
+    }
+    void mwStatHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        if (g_titleFeed.load() && !g_titleClosing.load())
+        {
+            static std::vector<uint8_t> s_buf; static uint64_t s_seq = 0; static bool s_any = false; static int s_pw = 640, s_ph = 448; int w = 0, h = 0;
+            if (gsvk::enabled() && svr06_movie_grab_frame(s_buf, w, h, s_seq) && w > 0 && h > 0 && w <= 1024 && h <= 512 && s_buf.size() >= (size_t)w * h * 4u)
+            {
+                const size_t n = (size_t)w * h;
+                for (size_t i = 0; i < n; ++i) s_buf[i * 4u + 3u] = 0x80u; // PS2 alpha 1.0
+                const uint64_t bitblt = (0x1E00ull << 32) | (10ull << 48); // DBP 0x1E00, DBW 10 (640), DPSM CT32
+                // CL-0256b: upload in strips of 64 rows (640x64x4 = 10240 qwords): one IMAGE packet is limited to NLOOP 32767 qwords
+                // (the whole 640x448 frame = 71680 qwords overflowed the GIF tag -> VRAM garbage and a GS hang). The game uploads in chunks too.
+                for (int y0 = 0; y0 < h; y0 += 64)
+                {
+                    const int rows = std::min(64, h - y0);
+                    const uint64_t trxpos = (uint64_t)(uint32_t)y0 << 48; // DSAX 0, DSAY y0
+                    const uint64_t trxreg = (uint64_t)(uint32_t)w | ((uint64_t)(uint32_t)rows << 32);
+                    gsvk::uploadImage(bitblt, trxpos, trxreg, 0ull, s_buf.data() + (size_t)y0 * w * 4u, (uint32_t)((size_t)rows * w * 4u));
+                }
+                static int s_log = 0; if (s_log++ < 3) std::fprintf(stderr, "[titlefeed] frame %dx%d -> VRAM 0x1E00\n", w, h);
+                s_any = true; s_pw = w; s_ph = h;
+            }
+            if (s_any)
+            {
+                // CL-0256d: the draw (0x5A44A0) sizes the video quad's UVs from the decoded picture size at player+0x1D0/+0x1D4
+                // (ints; UV = size / next power of two, 640/1024 x 448/512). The game's own decoder never decoded, so they were 0 and the
+                // quad stretched one texel (flat dark teal). a0 = player+0x10 (1cc9a0: addiu a0, player, 0x10).
+                const uint32_t pl = GPR_U32(ctx, 4) - 0x10u;
+                if (pl >= 0x100000u && pl < 0x1FFFE00u) { const int32_t pw = s_pw, ph = s_ph; std::memcpy(rdram + pl + 0x1D0, &pw, 4); std::memcpy(rdram + pl + 0x1D4, &ph, 4); }
+                SET_GPR_U32(ctx, 2, 2u); ctx->pc = GPR_U32(ctx, 31); return; // report 'playing' only once a real frame is in VRAM
+            }
+        }
+        if (g_mwStatOrig) g_mwStatOrig(rdram, ctx, rt);
+    }
+    // CL-0303: frame-engine refcount trace. [0x316134] (PAL; USA 0x3173B4 after the port) counts starts (0x14C130 / 0x14CD58)
+    // against stops (0x14C310 / 0x14CF48). In the black Season promo freeze it is 0 while the main thread sleeps in the frame step
+    // waiting for the render task, which the vblank handler no longer wakes once the engine is stopped. This log names the caller.
+    static PS2Runtime::RecompiledFunction g_feOrig[4] = {};
+    template <int K>
+    void feHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        static const char *kNm[4] = {"startA", "stopA", "startB", "stopB"};
+        uint32_t before = 0;
+        std::memcpy(&before, rdram + 0x316134u, 4);
+        const uint32_t ra = GPR_U32(ctx, 31), a0 = GPR_U32(ctx, 4);
+        g_feOrig[K](rdram, ctx, rt);
+        uint32_t after = 0;
+        std::memcpy(&after, rdram + 0x316134u, 4);
+        static std::atomic<int> s_n{0};
+        if (s_n.fetch_add(1) < 800)
+            std::fprintf(stderr, "[frameeng] %s ra=%X a0=%X ref %d -> %d\n", kNm[K], ra, a0, (int)before, (int)after);
+    }
     void adxGetStatHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
         const int st = svr06_music_stat(GPR_U32(ctx, 4));
         if (st >= 0) { SET_GPR_U32(ctx, 2, (uint32_t)st); ctx->pc = GPR_U32(ctx, 31); return; }
         if (g_adxStatOrig) g_adxStatOrig(rdram, ctx, rt);
+    }
+    // CL-0246: adxt_Pause (0x156040, a0=adxt, a1=on) and adxt_GetTime (0x154850, a0=adxt, a1=&count, a2=&scale) for natively played
+    // handles. Season cutscenes pause the scene dialogue while an entrance plays and time their events from the dialogue clock.
+    static PS2Runtime::RecompiledFunction g_adxPauseOrig = nullptr, g_adxGetTime2Orig = nullptr;
+    void adxPauseHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        const uint32_t h = GPR_U32(ctx, 4); const bool on = GPR_U32(ctx, 5) != 0u;
+        if (svr06_music_pause(h, on)) { static int n = 0; if (n++ < 60) std::fprintf(stderr, "[music] Pause handle=%X on=%d\n", h, on ? 1 : 0); if (h < 0x1FFFF80u) rdram[h + 0x72] = on ? 1 : 0; ctx->pc = GPR_U32(ctx, 31); return; }
+        if (g_adxPauseOrig) g_adxPauseOrig(rdram, ctx, rt);
+    }
+    void adxGetTime2Hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
+    {
+        uint64_t fr = 0;
+        if (svr06_music_time(GPR_U32(ctx, 4), fr))
+        {
+            const uint32_t pc = GPR_U32(ctx, 5), ps = GPR_U32(ctx, 6), cnt = static_cast<uint32_t>(fr), scl = 48000u;
+            if (pc && pc < 0x1FFFFFCu) std::memcpy(rdram + pc, &cnt, 4);
+            if (ps && ps < 0x1FFFFFCu) std::memcpy(rdram + ps, &scl, 4);
+            ctx->pc = GPR_U32(ctx, 31); return;
+        }
+        if (g_adxGetTime2Orig) g_adxGetTime2Orig(rdram, ctx, rt);
     }
     void adxStopHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
@@ -1019,6 +1301,7 @@ namespace
     }
     void adxVolHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *rt)
     {
+        { static int s_vn = 0; if (s_vn++ < 600) std::fprintf(stderr, "[music] SetOutVol handle=%X vol=%d ra=%X\n", GPR_U32(ctx, 4), (int)(int32_t)GPR_U32(ctx, 5), GPR_U32(ctx, 31)); } // CL-0296 crowd diag
         svr06_music_volume(GPR_U32(ctx, 4), (int32_t)GPR_U32(ctx, 5));
         if (g_adxVolOrig) g_adxVolOrig(rdram, ctx, rt);
     }
@@ -1035,6 +1318,21 @@ namespace
         const int ver = h[0x12];
         const uint32_t flag = ver == 3 ? ((h[0x18] << 24) | (h[0x19] << 16) | (h[0x1A] << 8) | h[0x1B]) : ((h[0x24] << 24) | (h[0x25] << 16) | (h[0x26] << 8) | h[0x27]);
         return flag != 0u;
+    }
+    // CL-0296: log the other ADXT start variants (StartFname 156F68, StartMem-like 157160, 156E70, 156BB8) so the crowd/SFX path is visible
+    static PS2Runtime::RecompiledFunction g_adxProbeOrig[4] = {};
+    static const uint32_t g_adxProbeAddr[4] = {0x156F68u, 0x157160u, 0x156E70u, 0x156BB8u};
+    template <int K>
+    void adxProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static int n = 0;
+        if (n++ < 300)
+        {
+            const uint32_t a1 = GPR_U32(ctx, 5); std::string nm;
+            if (a1 > 0x100000u && a1 < 0x1FFFF00u) for (int i = 0; i < 48 && rdram[a1 + i] >= 32 && rdram[a1 + i] < 127; ++i) nm += (char)rdram[a1 + i];
+            std::fprintf(stderr, "[adxprobe] %X a0=%X a1=%X a2=%X a3=%X ra=%X str=\"%s\"\n", g_adxProbeAddr[K], GPR_U32(ctx, 4), a1, GPR_U32(ctx, 6), GPR_U32(ctx, 7), GPR_U32(ctx, 31), nm.c_str());
+        }
+        if (g_adxProbeOrig[K]) g_adxProbeOrig[K](rdram, ctx, runtime);
     }
     static PS2Runtime::RecompiledFunction g_aliasOrig[4] = {};
     static const uint32_t g_aliasAddr[4] = {0x1CA2E0u, 0x1C3AD0u, 0x1CFCD0u, 0x1C3D00u};
@@ -1095,11 +1393,20 @@ namespace
             const bool b = g_adxStatOrig && rt.replaceFunction(0x1544B8u, adxGetStatHook);
             const bool c = g_adxStopOrig && rt.replaceFunction(0x1543C0u, adxStopHook);
             const bool d = g_adxVolOrig && rt.replaceFunction(0x1551D8u, adxVolHook);
+            { PS2Runtime::RecompiledFunction pf[4] = {adxProbe<0>, adxProbe<1>, adxProbe<2>, adxProbe<3>};
+              for (int k = 0; k < 4; ++k) { g_adxProbeOrig[k] = rt.lookupFunction(g_adxProbeAddr[k]); if (g_adxProbeOrig[k] && rt.replaceFunction(g_adxProbeAddr[k], pf[k])) std::fprintf(stderr, "[adxprobe] hooked %X\n", g_adxProbeAddr[k]); } }
+            g_adxPauseOrig = rt.lookupFunction(0x156040u); if (g_adxPauseOrig && rt.replaceFunction(0x156040u, adxPauseHook)) std::fprintf(stderr, "[music] Pause hook installed (156040)\n"); // CL-0246
+            g_adxGetTime2Orig = rt.lookupFunction(0x154850u); if (g_adxGetTime2Orig && rt.replaceFunction(0x154850u, adxGetTime2Hook)) std::fprintf(stderr, "[music] adxt_GetTime hook installed (154850)\n"); // CL-0246
+            { static const uint32_t kFe[4] = {0x14C130u, 0x14C310u, 0x14CD58u, 0x14CF48u}; // CL-0303
+              PS2Runtime::RecompiledFunction th[4] = {feHook<0>, feHook<1>, feHook<2>, feHook<3>};
+              for (int k = 0; k < 4; ++k) { g_feOrig[k] = rt.lookupFunction(kFe[k]); if (g_feOrig[k] && rt.replaceFunction(kFe[k], th[k])) std::fprintf(stderr, "[frameeng] hooked %X\n", kFe[k]); } }
+            g_mgrStatOrig = rt.lookupFunction(0x1CC9A0u); if (g_mgrStatOrig && rt.replaceFunction(0x1CC9A0u, mgrStatHook)) std::fprintf(stderr, "[titlefeed] manager status hook installed (1CC9A0)\n"); // CL-0256f
+            g_mwStatOrig = rt.lookupFunction(0x1C4590u); if (g_mwStatOrig && rt.replaceFunction(0x1C4590u, mwStatHook)) std::fprintf(stderr, "[titlefeed] movie status hook installed (1C4590)\n"); else std::fprintf(stderr, "[titlefeed] WARNING: 1C4590 not found, title stays on the old path\n"); // CL-0256
             g_adxTimeOrig = rt.lookupFunction(0x18A188u); if (g_adxTimeOrig && rt.replaceFunction(0x18A188u, adxGetTimeHook)) std::fprintf(stderr, "[music] GetTime hook installed\n");
             // ISS-137: ADXF partition registrar (only writer of the partition table at 0x3129D0) -> ptid to archive map
             voicePtidFromEnv();
             g_adxfPartOrig = rt.lookupFunction(0x147A98u);
-            svr06ovl::setHook(0x561D10u, mxBuildHook); std::fprintf(stderr, "[extraslots] music list builder hook installed at 561D10\n");
+            /* CL-0319: extra music rows retired (custom songs use per-wrestler assignment) */ // svr06ovl::setHook(0x561D10u, mxBuildHook); std::fprintf(stderr, "[extraslots] music list builder hook installed at 561D10\n");
             svr06ovl::setHook(0x610CA0u, lstFacHook); std::fprintf(stderr, "[lstfac] hook installed at 610CA0\n");
             g_lstCtorOrig = rt.lookupFunction(0x21E320u); if (g_lstCtorOrig && rt.replaceFunction(0x21E320u, lstCtorHook)) std::fprintf(stderr, "[lstctor] hook installed at 21E320\n");
             g_getTextOrig = rt.lookupFunction(0x1F0310u); if (g_getTextOrig && rt.replaceFunction(0x1F0310u, getTextHook)) std::fprintf(stderr, "[gettext] hook installed at 1F0310\n");
@@ -1113,6 +1420,13 @@ namespace
             std::fprintf(stderr, "[music] hooks StartAfs=%d GetStat=%d Stop=%d SetOutVol=%d\n", a, b, c, d);
         }
         g_o560 = rt.lookupFunction(0x114560u);
+        g_recLookOrig = rt.lookupFunction(0x1DCF80u); if (g_recLookOrig) rt.replaceFunction(0x1DCF80u, recLookHook); // CL-0325: always installed (custom entrance database)
+        if (!std::getenv("SVR06_NOBGMDBG")) {
+            g_bgmReqOrig = rt.lookupFunction(0x1CEC10u); if (g_bgmReqOrig) rt.replaceFunction(0x1CEC10u, bgmReqHook);
+            g_curWrOrig = rt.lookupFunction(0x27DEF0u); if (g_curWrOrig) rt.replaceFunction(0x27DEF0u, curWrHook);
+            std::fprintf(stderr, "[bgmdbg] hooks installed (1CEC10 / 1DCF80 / 27DEF0)\n");
+        }
+        g_fnrOrig = rt.lookupFunction(0x1498B8u); if (g_fnrOrig && rt.replaceFunction(0x1498B8u, fnameRangeHook)) std::fprintf(stderr, "[fnr] GetFnameRangeEx HLE installed\n");
         if (g_o560 && rt.replaceFunction(0x114560u, setSizeProbe)) std::fprintf(stderr, "[cov] hooked 114560 alias\n");
         std::fprintf(stderr, "[cov] hooked %d functions\n", ok);
     }
@@ -1204,6 +1518,14 @@ namespace
         ctx->pc = GPR_U32(ctx, 31);
     }
 
+    // CL-0381: the HLE sceGsSyncPath stub only sets v0 and never sets ctx->pc. Installed raw, it relied on the "pc == entry =>
+    // native stub returned" rule in dispatchGuestBranch; when an EE checkpoint fired during the call that rule is skipped, the thread
+    // resumed at the stub entry and re-ran it forever (random NOW LOADING hangs). Return to ra explicitly like the runner wrappers.
+    void gsSyncPathHle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = GPR_U32(ctx, 31);
+        ps2_stubs::sceGsSyncPath(rdram, ctx, runtime);
+    }
     void retOne(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         SET_GPR_S32(ctx, 2, 1);
@@ -1967,6 +2289,10 @@ namespace
         g_cpyOrig = runtime.lookupFunction(0x119340u); if (probes && g_cpyOrig && !std::getenv("SVR06_NOCPYWATCH")) runtime.replaceFunction(0x119340u, cpyWatch);
         if (probes && !std::getenv("SVR06_NOCOV")) installCov(runtime, std::make_integer_sequence<int, kCovMax>{});
         runtime.replaceFunction(0x12B618u, rpcLoopForever);
+        // CL-0234: the game's own statically linked sceGsSyncPath (0x1A6F20) busy-polls D1/D2 CHCR, VIF1_STAT and GIF_STAT; every
+        // VIF/GIF register read fences the async VIF1/GIF worker, so the game thread spent ~36% of a match blocked here. Route it
+        // to the HLE stub (Kernel/Stubs/GS.cpp, CL-0231/0232: no worker fence). SVR06_NOGSSYNCHLE=1 keeps the recompiled one.
+        if (!std::getenv("SVR06_NOGSSYNCHLE") && runtime.lookupFunction(0x1A6F20u)) { runtime.replaceFunction(0x1A6F20u, gsSyncPathHle); std::fprintf(stderr, "[gssync] 0x1A6F20 -> HLE sceGsSyncPath (CL-0234)\n"); }
         runtime.registerFunction(0x124920u, retOne);
         // Worker-thread teardown loops ("iSignalSema until the worker has stopped"): the HLE scheduler lets the worker
         // consume every signal, so they never end. Treat the worker as stopped.

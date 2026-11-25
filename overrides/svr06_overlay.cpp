@@ -85,6 +85,31 @@ namespace svr06ovl
         }
         bool g_anyHook = false;
     }
+    // CL-0349: lock-free dynamic overlay hooks (hot plugin), settable at any time from any thread.
+    namespace
+    {
+        constexpr int kDynN = 64;
+        std::atomic<uint32_t> g_dynAddr[kDynN];
+        std::atomic<PS2Runtime::RecompiledFunction> g_dynFn[kDynN];
+        std::atomic<int> g_dynCount{0};
+    }
+    bool setDynHook(uint32_t addr, PS2Runtime::RecompiledFunction fn)
+    {
+        int n = g_dynCount.load();
+        for (int i = 0; i < n; ++i)
+            if (g_dynAddr[i].load() == addr) { g_dynFn[i].store(fn); return true; }
+        if (!fn) return true;
+        if (n >= kDynN) return false;
+        g_dynFn[n].store(fn);
+        g_dynAddr[n].store(addr);
+        g_dynCount.store(n + 1);
+        return true;
+    }
+    void clearDynHooks()
+    {
+        const int n = g_dynCount.load();
+        for (int i = 0; i < n; ++i) g_dynFn[i].store(nullptr);
+    }
     void setHook(uint32_t addr, PS2Runtime::RecompiledFunction fn)
     {
         hookMap()[addr] = fn;
@@ -93,6 +118,13 @@ namespace svr06ovl
     PS2Runtime::RecompiledFunction findRaw(uint8_t *rdram, uint32_t addr);
     PS2Runtime::RecompiledFunction find(uint8_t *rdram, uint32_t addr)
     {
+        if (const int n = g_dynCount.load(std::memory_order_acquire))
+            for (int i = 0; i < n; ++i)
+                if (g_dynAddr[i].load(std::memory_order_relaxed) == addr)
+                {
+                    if (PS2Runtime::RecompiledFunction f = g_dynFn[i].load(); f && findRaw(rdram, addr)) return f;
+                    break;
+                }
         if (g_anyHook)
         {
             auto it = hookMap().find(addr);

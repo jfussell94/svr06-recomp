@@ -1,7 +1,15 @@
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cctype>
 
 static uint32_t g_svr06CdRa = 0; // [cdra] caller of the last sceCdRead, printed in the [cdlog] line
+// CL-0300 stall watchdog: progress counter + last-read info defined in CD.cpp
+extern uint64_t g_svr06CdReadSeq;
+extern uint32_t g_svr06CdLastLbn;
+extern uint32_t g_svr06CdLastBytes;
+extern uint64_t g_svr06CdLastOff;
+extern char g_svr06CdLastFile[40];
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -343,7 +351,16 @@ namespace
         const std::filesystem::path root = getCdRootPath();
         std::filesystem::path path = cdHostPath(ps2Path);
         std::error_code ec;
-        if (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_regular_file(path, ec))
+        bool fromMod = false;
+        { // CL-0313: disc override folder (default <working dir>/mods/disc, env SVR06_DISC_MODS). A file with the same disc path
+          // there (e.g. mods/disc/PAC/CH.PAC built by tools/cutslots) is served instead of the original; originals stay untouched.
+            static const std::filesystem::path s_modRoot = [] { const char *e = std::getenv("SVR06_DISC_MODS"); return std::filesystem::path((e && *e) ? e : "mods/disc"); }();
+            std::error_code mec; std::filesystem::path mp;
+            if (std::filesystem::is_directory(s_modRoot, mec) && resolveCaseInsensitivePath(s_modRoot, std::filesystem::path(normalizeCdPathNoPrefix(ps2Path)), mp) &&
+                std::filesystem::is_regular_file(mp, mec))
+            { path = mp; fromMod = true; std::fprintf(stderr, "[discmod] %s -> %s\n", ps2Path.c_str(), mp.string().c_str()); }
+        }
+        if (!fromMod && (!std::filesystem::exists(path, ec) || ec || !std::filesystem::is_regular_file(path, ec)))
         {
             const std::filesystem::path relative(normalizeCdPathNoPrefix(ps2Path));
             std::filesystem::path resolvedCasePath;
@@ -447,6 +464,8 @@ namespace
             const uint64_t offset = relativeLbn * kCdSectorSize;
             { static int n_=0, sp_=0; const bool past_ = (offset + byteCount) > entry.sizeBytes;
               if (n_++ < 8000 || (past_ && sp_++ < 400)) std::cerr << std::hex << "[cdlog] lbn=" << lbn << " sec=" << sectors << " bytes=" << byteCount << " dst=" << reinterpret_cast<uintptr_t>(dst) << " file=" << entry.hostPath.filename().string() << " off=" << offset << " fsize=" << entry.sizeBytes << " ra=" << g_svr06CdRa << (past_ ? " PAST_EOF" : "") << std::dec << std::endl; }
+            { ++g_svr06CdReadSeq; g_svr06CdLastLbn = lbn; g_svr06CdLastOff = offset; g_svr06CdLastBytes = static_cast<uint32_t>(byteCount);
+              const std::string f_ = entry.hostPath.filename().string(); size_t m_ = f_.size() < 39 ? f_.size() : 39; for (size_t i_ = 0; i_ < m_; ++i_) g_svr06CdLastFile[i_] = f_[i_]; g_svr06CdLastFile[m_] = 0; } // CL-0300
             return readHostRange(entry.hostPath, offset, dst, byteCount);
         }
 

@@ -1,3 +1,4 @@
+#include <filesystem>
 #include "runtime/gs/gs_vulkan_bridge.h"
 #include "svr06_prof.h"
 #include <cstdlib>
@@ -245,6 +246,7 @@ bool svr06MtgsOnWorker()
     return std::this_thread::get_id() == svr06mtgs::st().worker;
 }
 
+std::atomic<uint64_t> g_svr06WaitMaxUs{0}, g_svr06WaitSumUs{0}, g_svr06WaitN{0}; // CL-0309 live frame-wait stats (heartbeat.txt)
 static std::atomic<uint64_t> g_wpIdleNs{0}, g_wpIdleN{0}, g_wpBpNs{0}, g_wpBpN{0}, g_wpSubNs{0}, g_wpSubN{0};
 static inline uint64_t wpNow() { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static void wpReport()
@@ -263,6 +265,7 @@ void svr06MtgsWaitIdle()
     std::unique_lock<std::mutex> lk(s.m);
     s.cvIdle.wait(lk, [&] { return s.q.empty() && !s.busy; });
     g_wpIdleNs.fetch_add(wpNow() - t0, std::memory_order_relaxed); g_wpIdleN.fetch_add(1, std::memory_order_relaxed);
+    { const uint64_t us = (wpNow() - t0) / 1000ull; g_svr06WaitSumUs.fetch_add(us, std::memory_order_relaxed); g_svr06WaitN.fetch_add(1, std::memory_order_relaxed); uint64_t m = g_svr06WaitMaxUs.load(std::memory_order_relaxed); while (us > m && !g_svr06WaitMaxUs.compare_exchange_weak(m, us)) {} }
 }
 
 bool svr06MtgsIdle()
@@ -279,6 +282,7 @@ thread_local bool g_svr06InShadow = false; // [gsshadow] ISS-130: software GS fe
 bool svr06GsShadow() { static const bool e = [] { const char *v = std::getenv("SVR06_GSSHADOW"); return v && *v == '1'; }(); return e; }
 void svr06MtgsSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
 {
+    svr06prof::Zone _cl0310z(2); // CL-0310
     { // [gifcap] live-console GIF stream capture (file = repeated u32 size + data; analysis/live/gifcap.bin)
         int rem = g_svr06GifCap.load(std::memory_order_relaxed);
         if (rem > 0) {
@@ -315,6 +319,31 @@ void svr06MtgsSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
             }
             p += sz;
         }
+    }
+    // [norestore2] CL-0375: file switch analysis\\live\\norestore2.on (polled every 2048 packets): drop EVERY host->local upload to
+    // dbp 15296 (any size: the 16x16 tiles and the 256x256/256x64/256x112 saves the engine restores over the crowd target + its Z buffer)
+    static std::atomic<bool> s_nr2{false}; static std::atomic<uint32_t> s_nr2Drop{0}; static uint32_t s_nr2Poll = 0;
+    static const bool s_nr2Live = std::getenv("SVR06_NR2LIVE") != nullptr; // CL-0382: the file poll ran on the GS path every 2048 packets; opt-in now
+    if (s_nr2Live && gsvk::enabled() && ((++s_nr2Poll & 2047u) == 0u))
+    {
+        const bool on = std::filesystem::exists("analysis\\live\\norestore2.on");
+        if (on != s_nr2.load()) { s_nr2.store(on); std::fprintf(stderr, "[norestore2] %s (dropped so far %u)\n", on ? "ON" : "OFF", s_nr2Drop.load()); }
+    }
+    if (gsvk::enabled() && s_nr2.load(std::memory_order_relaxed))
+    {
+        static bool dropping2 = false;
+        uint64_t lo = 0, hi = 0; std::memcpy(&lo, data, 8); std::memcpy(&hi, data + 8, 8);
+        const uint32_t flg = (uint32_t)((lo >> 58) & 3);
+        if (flg == 2) { if (dropping2) { dropping2 = false; s_nr2Drop.fetch_add(1u); return; } }
+        else if (flg == 0 && (hi & 15) == 0xE && ((lo >> 60) & 15) == 1 && sizeBytes >= 16u + 16u)
+        {
+            uint64_t bb = 0, dir = 1; const uint32_t nl = (uint32_t)(lo & 0x7fff);
+            for (uint32_t i = 0; i < nl && 16u + (i + 1) * 16u <= sizeBytes; ++i) { uint64_t v, r; std::memcpy(&v, data + 16 + i * 16, 8); std::memcpy(&r, data + 24 + i * 16, 8); r &= 0xff; if (r == 0x50) bb = v; else if (r == 0x53) dir = v & 3; }
+            const uint32_t dbp = (uint32_t)((bb >> 32) & 0x3fff);
+            if (nl <= 5 && dir == 0 && dbp == 15296) { dropping2 = true; return; }
+            dropping2 = false;
+        }
+        else dropping2 = false;
     }
     if (gsvk::enabled() && (g_svr06Flags.load(std::memory_order_relaxed) & (1u << 20)))
     { // [norestore] ISS-130 experiment (console: flag 20 1): drop the per-frame 16x16 / 16x64 CT32 restore uploads to dbp 15296 (setup packet + its IMAGE packet)
@@ -490,7 +519,7 @@ void svr06MtgsSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes)
                 return;
             }
         }
-        { const uint64_t v0 = wpNow(); gsvk::gifTransfer(gsvk::submitPath(), data, sizeBytes); g_wpSubNs.fetch_add(wpNow() - v0, std::memory_order_relaxed); g_wpSubN.fetch_add(1, std::memory_order_relaxed); wpReport(); } return;
+        { static thread_local uint32_t sk = 0; if ((++sk & 63u) == 0u) { const uint64_t v0 = wpNow(); gsvk::gifTransfer(gsvk::submitPath(), data, sizeBytes); g_wpSubNs.fetch_add((wpNow() - v0) * 64u, std::memory_order_relaxed); wpReport(); } else gsvk::gifTransfer(gsvk::submitPath(), data, sizeBytes); g_wpSubN.fetch_add(1, std::memory_order_relaxed); } return; // CL-0261: time 1 in 64 packets (3 clock reads per packet were ~2% of the worker)
     } // Vulkan GS: paraLLEl-GS consumes the raw GIF stream
     svr06mtgs::State &s = svr06mtgs::st();
     if ((g_svr06Flags.load(std::memory_order_relaxed) & 2048) || std::this_thread::get_id() == s.worker)
@@ -1252,7 +1281,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         static FILE *s_dumpFile = nullptr; static bool s_dumpDone = false; static uint64_t s_lastTick = ~0ull;
         if (m_privRegs && !s_dumpDone) {
             const uint64_t tk = m_privRegs->vsyncTick.load();
-            static const uint64_t s_T = std::getenv("SVR06_GSDUMPTICK") ? std::strtoull(std::getenv("SVR06_GSDUMPTICK"), nullptr, 10) : 7000ull;
+            static const uint64_t s_T = std::getenv("SVR06_GSDUMPTICK") ? std::strtoull(std::getenv("SVR06_GSDUMPTICK"), nullptr, 10) : ~0ull; // CL-0284: no dump unless asked (was tick 7000 every run)
             static const uint64_t s_L = std::getenv("SVR06_GSDUMPLEN") ? std::strtoull(std::getenv("SVR06_GSDUMPLEN"), nullptr, 10) : 2ull;
             { extern std::atomic<int> g_svr06DumpActive; g_svr06DumpActive.store((tk >= s_T && tk <= s_T + s_L) ? 1 : 0); }
             if (tk >= s_T && tk <= s_T + s_L) {
@@ -1376,7 +1405,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             if ((nloop * nreg) & 1)
                 offset += 8;
         }
-        else if (flg == GIF_FMT_IMAGE)
+        else if (flg == GIF_FMT_IMAGE || flg == GIF_FMT_DISABLED) // CL-0221 upstream e563698: FLG=3 = IMAGE
         {
             uint32_t imageBytes = nloop * 16;
             if (offset + imageBytes > sizeBytes)
@@ -1721,6 +1750,15 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         static uint64_t hist[256] = {}, calls = 0; ++hist[regAddr]; // ISS-132 diag: which registers bypass the GIF stream
         if ((++calls % 3000) == 1) { std::cout << "[gsvk] direct regs n=" << calls << ":"; for (int r = 0; r < 256; ++r) if (hist[r]) std::cout << " " << std::hex << r << std::dec << "x" << hist[r]; std::cout << std::endl; }
         gsvk::writeReg(regAddr, value);
+        // CL-0284: paraLLEl-GS draws this primitive. The software rasterizer's VRAM is not displayed or read back while Vulkan is
+        // active (GIF-path draws never reach it), so rasterizing the vertex kick on the CPU too was pure waste on the game thread
+        // (~2 ms per full-screen GS clear, once per frame). Register state is still kept; only the CPU draw is skipped.
+        if (regAddr == 0x04u || regAddr == 0x05u || regAddr == 0x0Cu || regAddr == 0x0Du)
+        {
+            static const bool s_cpuToo = std::getenv("SVR06_CPU_DIRECT_DRAW") != nullptr;
+            if (!s_cpuToo)
+                return;
+        }
     }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     writeRegisterUnlocked(regAddr, value);

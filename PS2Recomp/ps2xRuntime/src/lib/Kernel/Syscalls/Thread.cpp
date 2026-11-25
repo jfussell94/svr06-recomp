@@ -1,3 +1,9 @@
+#include <map>
+#include <chrono>
+#include <cstdio>
+#include <chrono>
+#include <atomic>
+#include <cstdio>
 #include <cstdio>
 #include "Common.h"
 #include "Thread.h"
@@ -158,6 +164,15 @@ namespace ps2_syscalls
         {
             const int requestedTid = resolveRequestedThreadId(rdram, ctx, runtime);
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+            static const bool s_wkOn = std::getenv("SVR06_WAKERS") != nullptr; // CL-0372: opt-in
+            if (s_wkOn) { // CL-0362d: who wakes whom (caller ra), top callers printed every 3 s
+                static std::map<uint64_t, uint32_t> s_w; static auto s_t0 = std::chrono::steady_clock::now();
+                ++s_w[((uint64_t)(uint32_t)requestedTid << 40) | ((uint64_t)(interruptSafe ? 1 : 0) << 32) | getRegU32(ctx, 31)];
+                const auto nowT = std::chrono::steady_clock::now();
+                if (nowT - s_t0 > std::chrono::seconds(3)) { s_t0 = nowT; std::fprintf(stderr, "[wakers]");
+                    for (auto &kv : s_w) if (kv.second >= 3) std::fprintf(stderr, " tid%u%s ra=%X:%u", (unsigned)(kv.first >> 40), ((kv.first >> 32) & 1) ? "i" : "", (unsigned)(kv.first & 0xFFFFFFFFu), kv.second);
+                    std::fprintf(stderr, "\n"); s_w.clear(); }
+            }
             const int result = ee.wakeupThread(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
             setReturnS32(ctx, threadIdOnSuccess(result, requestedTid));
             ee.transferIfRequested(interruptSafe);
@@ -428,8 +443,10 @@ namespace ps2_syscalls
         ReferThreadStatus(rdram, ctx, runtime);
     }
 
+struct Svr06BlkScope { const char *what; uint32_t ra; uint32_t arg; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now(); ~Svr06BlkScope() { const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(); static std::atomic<int> n{0}; if (ms >= 40 && ms < 4000 && n.fetch_add(1) < 400) std::fprintf(stderr, "[blk] %s arg=%u ra=%X blocked %lld ms\n", what, arg, ra, (long long)ms); } };
     void SleepThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        Svr06BlkScope blk{"SleepThread", getRegU32(ctx, 31), 0u}; // CL-0362
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
         ee.sleepCurrent();
         setReturnS32(ctx, KE_OK);

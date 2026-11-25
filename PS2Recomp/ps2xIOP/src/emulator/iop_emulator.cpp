@@ -622,7 +622,39 @@ namespace ps2x::iop::detail
                         continue;
                     }
                     const uint64_t before = totalCycles;
-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                    static std::map<uint32_t, std::pair<uint64_t,uint64_t>> sProf; static auto sProfLast = std::chrono::steady_clock::now(); static uint64_t sProfTot = 0; /* CL-0360 diag */
+                    const auto pt0 = std::chrono::steady_clock::now(); const uint64_t pi0 = totalInstructions; const uint32_t pEntry = next->entry;
+                    const uint32_t sliceBudget = static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles));
+                    const uint32_t ranInsns = runCpu(next->cpu, sliceBudget);
+                    { // CL-0378: IOP poll-loop skip. A thread that keeps using its whole slice and ends every slice with the same PC and
+                      // the same 32 registers is polling (Season forced-match load: sound-driver thread entry 0x4E780 ran 73M instructions
+                      // per 2 s = 73% of the EE host thread, which starved the EE). After 8 identical slices, account the rest of this
+                      // runCycles() call as IOP time spent spinning instead of interpreting it; timers/DMA/callbacks still fire on time
+                      // because the scheduler services them per iteration. SVR06_NOIOPSPINSKIP=1 disables.
+                      static const bool s_off = std::getenv("SVR06_IOPSPINSKIP") == nullptr; // CL-0382: opt-in (per-slice cost on the EE thread; the hang it chased was CL-0381)
+                      // A loop whose length does not divide the slice ends slices at different points of the loop, so each slice end is
+                      // compared with the last 16 slice ends of the same thread (exact PC + all registers).
+                      struct SpinSnap { uint32_t pc[16] = {}; std::array<uint32_t, 32> gpr[16]{}; uint32_t n = 0; uint32_t same = 0; };
+                      static std::map<int, SpinSnap> s_snap;
+                      if (!s_off && !next->cpu.stopped && !next->cpu.yielded && ranInsns >= sliceBudget && sliceBudget == kDefaultSlice)
+                      {
+                          SpinSnap &sn = s_snap[next->id];
+                          bool hit = false;
+                          for (uint32_t k = 0; k < 16u && k < sn.n; ++k) if (sn.pc[k] == next->cpu.pc && sn.gpr[k] == next->cpu.gpr) { hit = true; break; }
+                          if (hit) ++sn.same; else sn.same = 0;
+                          const uint32_t w = sn.n++ & 15u; sn.pc[w] = next->cpu.pc; sn.gpr[w] = next->cpu.gpr;
+                          if (sn.same >= 16u)
+                          {
+                              const uint64_t skip = std::min<uint64_t>(target - totalCycles, (uint64_t)kDefaultSlice * 15u);
+                              totalCycles += skip;
+                              static uint64_t s_sk = 0, s_skc = 0; ++s_sk; s_skc += skip;
+                              if ((s_sk & (s_sk - 1u)) == 0u) std::fprintf(stderr, "[iopspin] CL-0378 #%llu thread %d entry=%05X pc=%05X spinning, skipped %llu IOP cycles total\n", (unsigned long long)s_sk, next->id, next->entry, next->cpu.pc, (unsigned long long)s_skc);
+                          }
+                      }
+                      else if (!s_off) { auto it = s_snap.find(next->id); if (it != s_snap.end()) it->second.same = 0; }
+                    }
+                    { const auto pt1 = std::chrono::steady_clock::now(); const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(pt1 - pt0).count(); auto &e = sProf[pEntry]; e.first += ns; e.second += totalInstructions - pi0; sProfTot += ns;
+                      if (pt1 - sProfLast > std::chrono::seconds(2)) { if (sProfTot > 40000000ull) { std::fprintf(stderr, "[iopprof] 2s total=%.1fms:", sProfTot / 1e6); std::vector<std::pair<uint64_t,uint32_t>> v; for (auto &kv : sProf) v.push_back({kv.second.first, kv.first}); std::sort(v.rbegin(), v.rend()); for (size_t k = 0; k < v.size() && k < 5; ++k) std::fprintf(stderr, " entry=%05X ms=%.1f ins=%llu", v[k].second, v[k].first / 1e6, (unsigned long long)sProf[v[k].second].second); std::fprintf(stderr, "\n"); } sProf.clear(); sProfTot = 0; sProfLast = pt1; } }
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
                     if (totalCycles == before)
                         ++totalCycles;

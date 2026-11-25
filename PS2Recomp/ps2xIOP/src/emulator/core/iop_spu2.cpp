@@ -1,12 +1,15 @@
 #include <chrono>
 #include <cstdlib>
 #include "ps2x/iop/spu2.h"
+#include "spu2_hctp.h" // CL-0304
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -51,6 +54,7 @@ namespace ps2x::iop
             double pos = 0.0;            // index into current block (0..28)
             bool endFlagPending = false;
             uint8_t lastFlags = 0;
+            uint32_t walk = 0, loopJumps = 0; uint64_t konFrame = 0; // CL-0280 runaway / long-voice diagnostics
         };
 
         struct Core
@@ -63,6 +67,11 @@ namespace ps2x::iop
             bool admaOn = false;
             const uint8_t *admaRam = nullptr;
             uint32_t admaRamSize = 0, admaAddr = 0, admaBytes = 0, admaPos = 0;
+            // CL-0223: each AutoDMA block (the game's double buffer, one block per DMA, refilled at emulated speed) is copied
+            // into this FIFO once and played once at real time. Before, the mixer looped the last block until the next DMA,
+            // so a slow frame rate stretched streamed speech (referee). Underrun = silence, never a repeat.
+            std::deque<int16_t> fifo;   // interleaved L,R
+            bool fifoPlaying = false;
         };
 
         struct State
@@ -75,13 +84,16 @@ namespace ps2x::iop
             bool endxLive = false;        // ISS-136: real ENDX bits only after the first sample-bank upload
             bool endxLiveLogged = false;
             unsigned endxReads = 0;
+            uint64_t frames = 0;          // CL-0280 rendered output frames
+            unsigned konBad = 0, runaway = 0;
+            unsigned koffs = 0, toneGuard = 0; // CL-0302
         } g;
 
         inline bool isSweep(uint16_t v) { return (v & 0x8000u) != 0u; }
         inline float volFloat(uint16_t v)
         {
             if (isSweep(v))
-                return 1.0f;
+                return (v & 0x2000u) ? 0.0f : 1.0f; // CL-0302: sweeps are not modelled; a decreasing sweep (fade-out) now ends silent instead of full volume
             const int16_t s = static_cast<int16_t>(static_cast<uint16_t>(v << 1));
             return static_cast<float>(s) / 32768.0f;
         }
@@ -142,6 +154,25 @@ namespace ps2x::iop
             decodeBlock(vo);
             vo.pos = 0.0;
             c.endx &= ~(1u << idx);
+            vo.walk = 0; vo.loopJumps = 0; vo.konFrame = g.frames;
+            {   // CL-0280: sanity-scan the sample the driver keyed on (end flag reachable? any data at all? first-block loop flags)
+                const uint32_t a0 = (vo.ssa * 2u) & (kRamBytes - 1u) & ~15u;
+                uint32_t nblk = 0; bool endf = false, nz = false, loopf = false; uint8_t firstFl = g.ram[a0 + 1];
+                for (; nblk < 0x4000u; ++nblk)
+                {
+                    const uint32_t bq = (a0 + nblk * 16u) & (kRamBytes - 1u);
+                    for (int k = 2; k < 16; ++k) if (g.ram[bq + k]) { nz = true; break; }
+                    const uint8_t fl = g.ram[bq + 1];
+                    if (fl & 0x01) { endf = true; loopf = (fl & 0x02) != 0; ++nblk; break; }
+                }
+                if ((!nz || !endf) && vo.ssa != 0x2800u && g.konBad < 600u)
+                {
+                    ++g.konBad;
+                    std::fprintf(stderr, "[spu2] KONBAD core=%d v=%d ssa=0x%x bytes=0x%x nonzero=%d endflag=%d blocks=%u firstflags=0x%02x pitch=0x%x vol=%04x/%04x\n",
+                                 coreIdx, idx, vo.ssa, vo.ssa * 2u, nz ? 1 : 0, endf ? 1 : 0, nblk, firstFl, vo.pitch, vo.volL, vo.volR);
+                }
+                (void)loopf;
+            }
             if (g.koncount < 30000 && (vo.ssa != 0x2800 || vo.volL || vo.volR))
             {
                 ++g.koncount;
@@ -213,7 +244,35 @@ namespace ps2x::iop
                 c.endx |= (1u << idx);
                 if (flags & 0x02)
                 {
+                    {   // CL-0302 tone guard: a loop of at most 4 ADPCM blocks (<= 112 samples) still sounding 4 s after key-on is a stuck
+                        // tone loop (the 'ringing' that stacks with every hit). Real sample data never rings like that: release it.
+                        static const bool s_noGuard = std::getenv("SVR06_SPU2_NOTONEGUARD") != nullptr;
+                        const uint32_t endA = vo.blockAddr & (kRamBytes - 1u);
+                        const uint32_t loopA = vo.nextLoop & (kRamBytes - 1u);
+                        if (!s_noGuard && vo.phase != Phase::Release && endA >= loopA && endA - loopA < 64u && g.frames - vo.konFrame > 4u * 48000u)
+                        {
+                            int amp = 0;
+                            for (int k = 3; k < 31; ++k) amp = std::max(amp, std::abs(static_cast<int>(vo.buf[k])));
+                            if (amp > 64)
+                            {
+                                if (g.toneGuard++ < 60u)
+                                    std::fprintf(stderr, "[spu2] TONEGUARD core=%d v=%d ssa=0x%x loop=0x%x..0x%x amp=%d age=%.1fs -> released\n", &c == &g.core[0] ? 0 : 1, idx, vo.ssa, loopA, endA, amp, static_cast<double>(g.frames - vo.konFrame) / 48000.0);
+                                if ((vo.adsr2 & 0x1Fu) >= 0x18u) { vo.on = false; vo.phase = Phase::Off; vo.env = 0; return; } // release would take seconds
+                                vo.phase = Phase::Release;
+                            }
+                        }
+                    }
                     vo.blockAddr = vo.nextLoop;
+                    vo.walk = 0;
+                    // CL-0280: a repeat flag with no loop-start flag ever seen and no LSA written loops the whole sample onto its own start
+                    // forever (a continuous buzz/ringing when the driver keyed on a wrong/stale address). Real data always marks the loop start.
+                    if (!vo.loopSet && vo.lsa == 0u && ++vo.loopJumps > 48u)
+                    {
+                        if (g.runaway++ < 40u)
+                            std::fprintf(stderr, "[spu2] RUNAWAYLOOP core=%d v=%d ssa=0x%x (no loop-start flag) -> voice stopped\n", &c == &g.core[0] ? 0 : 1, idx, vo.ssa);
+                        vo.on = false; vo.phase = Phase::Off; vo.env = 0;
+                        return;
+                    }
                 }
                 else
                 {
@@ -226,6 +285,13 @@ namespace ps2x::iop
             else
             {
                 vo.blockAddr += 16u;
+                if (++vo.walk > 0x8000u)
+                {   // CL-0280: 512 KB walked without an end flag: the voice is running through unrelated SPU RAM
+                    if (g.runaway++ < 40u)
+                        std::fprintf(stderr, "[spu2] RUNAWAY core=%d v=%d ssa=0x%x walked %u blocks without end flag -> voice stopped\n", &c == &g.core[0] ? 0 : 1, idx, vo.ssa, vo.walk);
+                    vo.on = false; vo.phase = Phase::Off; vo.env = 0;
+                    return;
+                }
             }
             decodeBlock(vo);
         }
@@ -238,6 +304,19 @@ namespace ps2x::iop
         }
     }
 
+    namespace
+    {   // CL-0304: optional HCTP SPU2 backend (SVR06_SPU2=hctp). The public API below forwards to it; the driver-init
+        // ENDX rule (ISS-136: ENDX reads 0 until the first sample bank upload) is kept in front of it.
+        bool hctpSpu()
+        {
+            static const bool on = [] { const char *v = std::getenv("SVR06_SPU2"); const bool h = v && std::strcmp(v, "hctp") == 0; if (h) std::fprintf(stderr, "[spu2] backend: HCTP model (SVR06_SPU2=hctp)\n"); return h; }();
+            return on;
+        }
+        detail::Spu2 &hb() { static detail::Spu2 s; return s; }
+        uint64_t g_hcCycle = 0;
+        std::vector<int16_t> g_hcOut;
+    }
+
     Spu2 &Spu2::instance()
     {
         static Spu2 s;
@@ -247,6 +326,7 @@ namespace ps2x::iop
     void Spu2::reset()
     {
         std::lock_guard<std::mutex> lk(g.m);
+        if (hctpSpu()) { hb().reset(); g.endxLive = false; g_hcCycle = 0; }
         std::fill(g.ram.begin(), g.ram.end(), uint8_t{0});
         g.core[0] = Core{};
         g.core[1] = Core{};
@@ -256,6 +336,14 @@ namespace ps2x::iop
     {
         std::lock_guard<std::mutex> lk(g.m);
         const uint32_t off = (phys - kBase) & 0x7FFu;
+        if (hctpSpu())
+        {
+            static const bool s_live = std::getenv("SVR06_SPU2_ENDX_LIVE") != nullptr;
+            const uint32_t rr = off & 0x3FFu;
+            if (off < 0x760u && (rr == kRegEndx || rr == kRegEndx + 2u) && !g.endxLive && !s_live)
+                return 0;
+            return hb().read16(off);
+        }
         {
             static uint32_t s_rc[0x400];
             const uint32_t n = ++s_rc[(off >> 1) & 0x3FFu];
@@ -346,6 +434,7 @@ namespace ps2x::iop
     {
         std::lock_guard<std::mutex> lk(g.m);
         const uint32_t off = (phys - kBase) & 0x7FFu;
+        if (hctpSpu()) { hb().write16(off, value); return; }
         if (off >= 0x760u && off < 0x7B0u)
         {
             const int cv = off < 0x788u ? 0 : 1;
@@ -413,7 +502,7 @@ namespace ps2x::iop
             const int base = (r == kRegKoff) ? 0 : 16;
             for (int i = 0; i < 16; ++i)
                 if ((value >> i) & 1 && base + i < kVoices && c.v[base + i].on)
-                    c.v[base + i].phase = Phase::Release;
+                { c.v[base + i].phase = Phase::Release; ++g.koffs; }
             break;
         }
         case kRegEndx:
@@ -450,11 +539,18 @@ namespace ps2x::iop
     void Spu2::dmaToSpu(int core, const uint8_t *src, size_t bytes)
     {
         std::lock_guard<std::mutex> lk(g.m);
+        if (hctpSpu())
+        {
+            if (!g.endxLive && bytes >= 256u) { g.endxLive = true; std::fprintf(stderr, "[spu2] ENDX goes live (hctp backend)\n"); }
+            hb().dmaWrite(core & 1, src, bytes);
+            hb().markDmaReady(core & 1);
+            return;
+        }
         g.core[core & 1].regs[kRegStatx / 2] |= 0x80u;
         Core &c = g.core[core & 1];
         uint32_t a = (c.tsa * 2u) & (kRamBytes - 1u);
         static unsigned s_n = 0;
-        if (s_n++ < 60)
+        if (s_n++ < 600)
             std::fprintf(stderr, "[spu2] DMA core=%d -> spuaddr=0x%x bytes=0x%zx\n", core, a, bytes);
         if (!g.endxLive && bytes >= 256u)
         {
@@ -473,6 +569,7 @@ namespace ps2x::iop
     void Spu2::dmaFromSpu(int core, uint8_t *dst, size_t bytes)
     {
         std::lock_guard<std::mutex> lk(g.m);
+        if (hctpSpu()) { hb().dmaRead(core & 1, dst, bytes); hb().markDmaReady(core & 1); return; }
         Core &c = g.core[core & 1];
         c.regs[kRegStatx / 2] |= 0x80u;
         uint32_t a = (c.tsa * 2u) & (kRamBytes - 1u);
@@ -484,10 +581,46 @@ namespace ps2x::iop
         c.tsa = (a / 2u) & 0xFFFFFu;
     }
 
+    static std::atomic<float> s_voiceGain{1.0f}, s_streamGain{1.0f};
+    void Spu2::setGains(float voices, float stream) { s_voiceGain.store(voices); s_streamGain.store(stream); }
+    static const bool s_admaLegacy = std::getenv("SVR06_ADMA_LEGACY") != nullptr;
+
     void Spu2::startAdma(int core, const uint8_t *iopRam, uint32_t iopRamSize, uint32_t addr, uint32_t bytes)
     {
         std::lock_guard<std::mutex> lk(g.m);
+        if (hctpSpu())
+        {   // planar 1 KiB chunks (256 left, then 256 right samples) -> interleaved 48 kHz frames
+            if (iopRam && iopRamSize && bytes >= 1024u)
+            {
+                std::vector<int16_t> pcm;
+                pcm.reserve(bytes / 2u);
+                for (uint32_t ch = 0; ch + 1024u <= bytes; ch += 1024u)
+                    for (uint32_t i = 0; i < 256u; ++i)
+                    {
+                        int16_t sl, sr;
+                        std::memcpy(&sl, iopRam + (addr + ch + i * 2u) % iopRamSize, 2);
+                        std::memcpy(&sr, iopRam + (addr + ch + 512u + i * 2u) % iopRamSize, 2);
+                        pcm.push_back(sl); pcm.push_back(sr);
+                    }
+                hb().queueInput(core & 1, pcm.data(), pcm.size() / 2u);
+            }
+            hb().markDmaReady(core & 1);
+            return;
+        }
         Core &c = g.core[core & 1];
+        if (!s_admaLegacy && iopRam && bytes >= 1024u)
+        {   // planar 1 KiB chunks: 256 left samples then 256 right samples
+            for (uint32_t ch = 0; ch + 1024u <= bytes; ch += 1024u)
+                for (uint32_t i = 0; i < 256u; ++i)
+                {
+                    int16_t sl, sr;
+                    std::memcpy(&sl, iopRam + (addr + ch + i * 2u) % iopRamSize, 2);
+                    std::memcpy(&sr, iopRam + (addr + ch + 512u + i * 2u) % iopRamSize, 2);
+                    c.fifo.push_back(sl); c.fifo.push_back(sr);
+                }
+            const size_t cap = 48000u / 10u * 2u; // 100 ms
+            if (c.fifo.size() > cap) c.fifo.erase(c.fifo.begin(), c.fifo.begin() + static_cast<std::ptrdiff_t>(c.fifo.size() - cap / 2u));
+        }
         c.regs[kRegStatx / 2] |= 0x80u;
         c.admaOn = true;
         c.admaRam = iopRam;
@@ -514,8 +647,19 @@ namespace ps2x::iop
     void Spu2::render(int16_t *out, size_t frames)
     {
         std::lock_guard<std::mutex> lk(g.m);
+        if (hctpSpu())
+        {
+            g_hcOut.clear();
+            g_hcCycle += static_cast<uint64_t>(frames) * detail::Spu2::kIopCyclesPerSample;
+            hb().advanceTo(g_hcCycle, g_hcOut);
+            const float vg = s_voiceGain.load(std::memory_order_relaxed);
+            for (size_t i = 0; i < frames * 2u; ++i)
+                out[i] = static_cast<int16_t>(std::clamp(i < g_hcOut.size() ? static_cast<float>(g_hcOut[i]) * vg : 0.0f, -32768.f, 32767.f));
+            return;
+        }
         for (size_t f = 0; f < frames; ++f)
         {
+            ++g.frames;
             float coreL[2] = {0, 0}, coreR[2] = {0, 0};
             for (int ci = 0; ci < 2; ++ci)
             {
@@ -541,7 +685,20 @@ namespace ps2x::iop
                         advanceBlock(vo, c, vi);
                     }
                 }
-                if (c.admaOn && c.admaBytes >= 1024u && c.admaRam)
+                l *= s_voiceGain.load(std::memory_order_relaxed);
+                r *= s_voiceGain.load(std::memory_order_relaxed);
+                if (!s_admaLegacy)
+                {
+                    if (!c.fifoPlaying && c.fifo.size() >= 1024u * 2u) c.fifoPlaying = true; // prebuffer ~21 ms
+                    if (c.fifoPlaying && c.fifo.size() >= 2u)
+                    {
+                        const float sg = s_streamGain.load(std::memory_order_relaxed);
+                        l += c.fifo[0] * sg; r += c.fifo[1] * sg;
+                        c.fifo.pop_front(); c.fifo.pop_front();
+                    }
+                    else c.fifoPlaying = false;
+                }
+                else if (c.admaOn && c.admaBytes >= 1024u && c.admaRam)
                 {
                     // planar blocks: 256 left samples, then 256 right samples
                     const uint32_t chunk = (c.admaPos / 256u) * 1024u;
@@ -577,6 +734,26 @@ namespace ps2x::iop
                                 ringPk = std::max(ringPk, std::abs(static_cast<int>(sv)));
                             }
                         for (int vi = 0; vi < kVoices; ++vi) act += c.v[vi].on ? 1 : 0;
+                        for (int vi = 0; vi < kVoices; ++vi)
+                        {   // CL-0280: voices alive for more than 6 s (ringing candidates)
+                            const Voice &lv = c.v[vi];
+                            if (lv.on && g.frames - lv.konFrame > 6u * 48000u)
+                                std::fprintf(stderr, "[spu2] LONGVOICE core=%d v=%d ssa=0x%x age=%.1fs phase=%d env=%d loopSet=%d lsa=0x%x pitch=0x%x vol=%04x/%04x adsr=%04x/%04x\n",
+                                             ci, vi, lv.ssa, static_cast<double>(g.frames - lv.konFrame) / 48000.0, static_cast<int>(lv.phase), lv.env, lv.loopSet ? 1 : 0, lv.lsa, lv.pitch, lv.volL, lv.volR, lv.adsr1, lv.adsr2);
+                            {   // CL-0302: once per keyed voice: loop start, current block, loudness and the first loop bytes (is a ring a short tone loop?)
+                                static uint64_t s_dumped[2][kVoices] = {};
+                                if (s_dumped[ci][vi] != lv.konFrame + 1u)
+                                {
+                                    s_dumped[ci][vi] = lv.konFrame + 1u;
+                                    int amp = 0;
+                                    for (int k = 3; k < 31; ++k) amp = std::max(amp, std::abs(static_cast<int>(lv.buf[k])));
+                                    std::fprintf(stderr, "[spu2] LOOPINFO core=%d v=%d ssa=0x%x loopStart=0x%x cur=0x%x amp=%d bytes:", ci, vi, lv.ssa, lv.nextLoop, lv.blockAddr, amp);
+                                    for (uint32_t k = 0; k < 32u; ++k) std::fprintf(stderr, "%02x", g.ram[(lv.nextLoop + k) & (kRamBytes - 1u)]);
+                                    std::fprintf(stderr, "\n");
+                                }
+                            }
+                        }
+                        if (ci == 0) std::fprintf(stderr, "[spu2] koffs=%u toneguard=%u\n", g.koffs, g.toneGuard); // CL-0302
                         std::fprintf(stderr, "[spu2] state core=%d attr=%04x mvol=%04x/%04x evol=%04x/%04x avol=%04x/%04x bvol=%04x/%04x voices=%d adma=%d bytes=%u ringpeak=%d addr=0x%x peak=%.0f\n",
                                      ci, c.regs[kRegAttr / 2], c.vol[0], c.vol[1], c.vol[2], c.vol[3], c.vol[4], c.vol[5], c.vol[6], c.vol[7],
                                      act, c.admaOn ? 1 : 0, c.admaBytes, ringPk, c.admaAddr, s_pk[ci]);

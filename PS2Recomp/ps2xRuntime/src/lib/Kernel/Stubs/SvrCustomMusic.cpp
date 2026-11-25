@@ -27,6 +27,7 @@ extern "C"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -216,12 +217,18 @@ namespace
     // Track numbers with no stock song, all below 256 (in case the game saves the choice in a byte):
     // 57..79 (BGM1 #17..39), 147..159 (BGM3 #27..39), 160..255 (above the stock banks), 7..39 (BGM0 #7..39) = 165.
     // The number never reaches the sound code: the track resolver hook swaps it for a stock track and queues the file.
+    // CL-0227: arena entrances ask for a song's arena mix as n + 120 (ENVB) or n + 240 (ENVH). The CL-0143 expansion
+    // (160..255, 7..39) collided with those: custom 243 + 120 = 363 = Christy Hemme's arena mix, stock Undertaker
+    // 81 + 120 = 201 = a custom number. Allowed now: numbers whose n, n+120, n+240 hit no stock track, no stock arena mix
+    // and no other custom song: 57..79 and 147..159 (36, fit in a byte), then from 400 up in blocks of 360 whose first
+    // 120 are songs (needs the game to keep the number in more than a byte; the log says so if it does not).
     std::vector<int> freeTrackNumbers()
     {
         std::vector<int> v;
         for (int n = 57; n <= 79; ++n) v.push_back(n);
-        for (int n = 147; n <= 255; ++n) v.push_back(n);
-        for (int n = 7; n <= 39; ++n) v.push_back(n);
+        for (int n = 147; n <= 159; ++n) v.push_back(n);
+        for (int b = 0; b < 3; ++b)
+            for (int i = 0; i < 120; ++i) v.push_back(400 + 360 * b + i);
         return v;
     }
 
@@ -315,6 +322,10 @@ std::vector<std::pair<int, std::string>> svr06_custom_entrance_slots(size_t maxL
             if (bar == std::string::npos) continue;
             const int n = std::atoi(line.substr(0, bar).c_str());
             const std::string rel = line.substr(bar + 1);
+            {   // CL-0227: numbers from the old (colliding) ranges are given a new, safe number below
+                static const std::vector<int> ok = freeTrackNumbers();
+                if (std::find(ok.begin(), ok.end(), n) == ok.end()) { std::fprintf(stderr, "[custommusic] %s: old track number %d collides with arena mixes, renumbered\n", rel.c_str(), n); continue; }
+            }
             for (const auto &p : files)
                 if (relOf(p) == rel) { keep.emplace_back(n, rel); break; }
         }
@@ -383,15 +394,156 @@ std::vector<std::pair<int, std::string>> svr06_custom_entrance_slots(size_t maxL
     return out;
 }
 
-// Track resolver hook (overrides, 0x1CA4A0): is track number n one of the custom songs?
+// ---- CL-0319 custom entrance database (replaces the ISS-143 extra-slot list) ----
+// Game slots, records and music lists stay stock. Per wrestler (game slot id) the database {id -> song file, Titantron file} lives
+// in "Custom Entrances\\entrances.txt" next to "Custom Music" (lines "id|song|video"; written by the launcher; paths are
+// relative to "Custom Music\\Entrances" and "Custom Titantrons", or absolute). When the game looks up that wrestler's record
+// (hook in svr06_overrides.cpp) the RAM copy of its music byte / movie byte is swapped for a session marker; the track resolver
+// and the movie request hook map the marker back to the file. Toggles: entrance.customMusic, entrance.customTitantron.
+namespace
+{
+    struct EntEntry { std::string song, video; };
+    std::mutex g_enM;
+    std::map<int, EntEntry> g_en;
+    fs::file_time_type g_enT{}, g_enT2{};
+    std::map<int, std::pair<std::string, std::string>> g_enRel;
+    std::atomic<int> g_lastId{-1};
+    std::chrono::steady_clock::time_point g_enChecked{};
+    std::map<int, std::vector<uint16_t>> g_mv; fs::file_time_type g_mvT{};
+    int g_musMark[256]; // marker n -> wrestler id (-1 = free)
+    int g_movMark[100];
+    bool g_markInit = false;
+    std::map<int, std::pair<int,int>> g_origBytes; // id -> (music byte, movie byte) as the game's table has them
+    const int kMusicMarkers[] = {57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,147,148,149,150,151,152,153,154,155,156,157,158,159};
+
+    fs::path entDir() { std::error_code ec; fs::path r = root(); return r.parent_path() / "Custom Entrances"; }
+    fs::path titanDir() { return root().parent_path() / "Custom Titantrons"; }
+
+    std::string resolve(const std::string &v, const fs::path &base)
+    {
+        if (v.empty()) return {};
+        fs::path p = v; std::error_code ec;
+        if (p.is_relative()) p = base / p;
+        return fs::exists(p, ec) ? p.string() : std::string();
+    }
+
+    void mvReload()
+    {
+        std::error_code ec; const fs::path f = entDir() / "movesets.txt";
+        const auto t = fs::last_write_time(f, ec);
+        if (ec) { g_mv.clear(); return; }
+        if (t == g_mvT) return;
+        g_mvT = t; g_mv.clear();
+        std::ifstream in(f); std::string line;
+        while (std::getline(in, line))
+        {
+            if (line.empty() || line[0] == '#') continue;
+            const size_t bar = line.find('|'); if (bar == std::string::npos) continue;
+            std::vector<uint16_t> v; std::stringstream ss(line.substr(bar + 1)); std::string x;
+            while (ss >> x) v.push_back(static_cast<uint16_t>(std::strtoul(x.c_str(), nullptr, 16)));
+            if (v.size() == 152) g_mv[std::atoi(line.c_str())] = v;
+        }
+        std::fprintf(stderr, "[entrances] move-sets: %zu wrestlers with a custom move-set\n", g_mv.size());
+    }
+
+    void enReload()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (g_markInit && now - g_enChecked < std::chrono::seconds(1)) return;
+        g_enChecked = now;
+        if (!g_markInit) { g_markInit = true; for (int &x : g_musMark) x = -1; for (int &x : g_movMark) x = -1;
+            std::error_code ec; fs::create_directories(entDir(), ec); fs::create_directories(root() / "Entrances", ec); fs::create_directories(titanDir(), ec); }
+        mvReload();
+        std::error_code ec;
+        const fs::path f = entDir() / "entrances.txt", f2 = entDir() / "game_assign.txt";
+        const auto t = fs::last_write_time(f, ec); const bool ok1 = !ec;
+        ec.clear(); const auto t2 = fs::last_write_time(f2, ec); const bool ok2 = !ec;
+        if (!ok1 && !ok2) { g_en.clear(); return; }
+        if ((ok1 ? t : fs::file_time_type{}) == g_enT && (ok2 ? t2 : fs::file_time_type{}) == g_enT2) return;
+        g_enT = ok1 ? t : fs::file_time_type{}; g_enT2 = ok2 ? t2 : fs::file_time_type{}; g_en.clear(); g_enRel.clear();
+        for (const fs::path &ff : {f, f2})
+        {
+        std::ifstream in(ff); std::string line;
+        while (std::getline(in, line))
+        {
+            if (line.empty() || line[0] == '#') continue;
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            std::vector<std::string> pt; std::stringstream ss(line); std::string x;
+            while (std::getline(ss, x, '|')) pt.push_back(x);
+            if (pt.size() < 2) continue;
+            const int id = std::atoi(pt[0].c_str());
+            EntEntry e; e.song = resolve(pt[1], root() / "Entrances"); if (pt.size() > 2) e.video = resolve(pt[2], titanDir());
+            g_enRel[id] = {pt[1], pt.size() > 2 ? pt[2] : std::string()};
+            if (!e.song.empty() || !e.video.empty()) g_en[id] = e; else g_en.erase(id);
+        }
+        }
+        std::fprintf(stderr, "[entrances] database: %zu wrestlers with custom music/Titantron\n", g_en.size());
+    }
+}
+
+// Called by the record lookup hook for wrestler `id`; rec points at the RAM copy of its record (+0x13C movie byte, +0x140 music byte).
+void svr06_entrance_apply(int id, uint8_t *rec)
+{
+    if (!rec) return;
+    g_lastId.store(id);
+    std::lock_guard<std::mutex> lk(g_enM);
+    enReload();
+    auto o = g_origBytes.find(id);
+    if (o == g_origBytes.end()) o = g_origBytes.emplace(id, std::make_pair((int)rec[0x140], (int)rec[0x13C])).first;
+    const bool wantMus = ps2settings::getInt("entrance.customMusic", 1) != 0, wantMov = ps2settings::getInt("entrance.customTitantron", 1) != 0;
+    auto it = g_en.find(id);
+    int mus = o->second.first, mov = o->second.second;
+    if (it != g_en.end())
+    {
+        if (wantMus && !it->second.song.empty())
+        {
+            int m = -1;
+            for (int k : kMusicMarkers) if (g_musMark[k] == id) { m = k; break; }
+            if (m < 0) for (int k : kMusicMarkers) if (g_musMark[k] < 0) { g_musMark[k] = id; m = k; break; }
+            if (m >= 0) mus = m; else std::fprintf(stderr, "[entrances] no free music marker for wrestler %d\n", id);
+        }
+        if (wantMov && !it->second.video.empty())
+        {
+            int m = -1;
+            for (int k = 83; k <= 99; ++k) if (g_movMark[k] == id) { m = k; break; }
+            if (m < 0) for (int k = 83; k <= 99; ++k) if (g_movMark[k] < 0) { g_movMark[k] = id; m = k; break; }
+            if (m >= 0) { mov = m; std::fprintf(stderr, "[entrances] wrestler %d: movie byte %d -> marker %d (%s)\n", id, o->second.second, m, it->second.video.c_str()); } else std::fprintf(stderr, "[entrances] no free Titantron marker for wrestler %d\n", id);
+        }
+    }
+    rec[0x140] = static_cast<uint8_t>(mus); rec[0x13C] = static_cast<uint8_t>(mov);
+    if (ps2settings::getInt("entrance.customMoves", 1))
+    {   // CL-0322: custom move-set = the 152 move ids at the start of the record (stock bytes are restored by the game's own reload of the table only at boot)
+        auto m = g_mv.find(id);
+        if (m != g_mv.end()) { std::memcpy(rec, m->second.data(), 152 * 2); }
+    }
+}
+
+// Movie request hook: Titantron marker (ptid 10..14, idx) -> custom video file
+bool svr06_entrance_movie(int ptid, int idx, std::string &out)
+{
+    if (ptid < 10 || ptid > 14 || !ps2settings::getInt("entrance.customTitantron", 1)) return false;
+    const int b = (ptid - 10) * 20 + idx;
+    std::fprintf(stderr, "[entrances] movie request ptid=%d idx=%d -> byte %d (%s)\n", ptid, idx, b, (b >= 83 && b <= 99) ? "marker range" : "stock");
+    if (b < 83 || b > 99) return false;
+    std::lock_guard<std::mutex> lk(g_enM);
+    const int id = g_movMark[b]; if (id < 0) return false;
+    auto it = g_en.find(id); if (it == g_en.end() || it->second.video.empty()) return false;
+    out = it->second.video; std::fprintf(stderr, "[entrances] Titantron marker %d (wrestler %d) -> %s\n", b, id, out.c_str()); return true;
+}
+
+// Track resolver hook (overrides, 0x1CA4A0): is track number n a custom song marker (n, or its arena mix n+120 / n+240)?
 bool svr06_custom_track_path(int n, std::string &out)
 {
-    if (!ps2settings::getInt("music.extraSlots", 0)) return false;
-    static std::atomic<bool> s_scanned{false};
-    if (!s_scanned.exchange(true)) svr06_custom_entrance_slots(20); // a match can start before the list was ever opened
-    std::lock_guard<std::mutex> lk(g_esM);
-    for (const auto &e : g_es)
-        if (e.n == n) { out = e.path; return true; }
+    if (!ps2settings::getInt("entrance.customMusic", 1)) return false;
+    std::lock_guard<std::mutex> lk(g_enM);
+    if (!g_markInit) return false;
+    for (int d : {0, 120, 240})
+    {
+        const int k = n - d;
+        if (k < 0 || k > 255 || g_musMark[k] < 0) continue;
+        auto it = g_en.find(g_musMark[k]);
+        if (it != g_en.end() && !it->second.song.empty()) { out = it->second.song; std::fprintf(stderr, "[entrances] track %d -> wrestler %d song %s\n", n, g_musMark[k], out.c_str()); return true; }
+    }
     return false;
 }
 
@@ -420,17 +572,7 @@ bool svr06_custom_take_pending(std::string &out)
 }
 
 // Called by svr06_music_start for every stock request: a custom track number -> its host file.
-bool svr06_custom_slot_track(const char *rel, int entry, std::string &out)
-{
-    if (!ps2settings::getInt("music.extraSlots", 0) || entry < 0) return false;
-    const std::string key = bankKey(rel); // "BGM1".."BGM3" (arena mixes map to their plain bank)
-    if (key.size() != 4 || key[3] < '0' || key[3] > '9') return false;
-    const int n = (key[3] - '0') * 40 + entry;
-    std::lock_guard<std::mutex> lk(g_esM);
-    for (const auto &e : g_es)
-        if (e.n == n) { out = e.path; std::fprintf(stderr, "[custommusic] entrance slot n=%d -> %s\n", n, out.c_str()); return true; }
-    return false;
-}
+bool svr06_custom_slot_track(const char *, int, std::string &) { return false; } // CL-0319: superseded by the entrance database
 
 std::vector<std::string> svr06_custom_entrance_songs()
 {
@@ -438,6 +580,19 @@ std::vector<std::string> svr06_custom_entrance_songs()
     std::error_code ec;
     for (const auto &de : fs::directory_iterator(root() / "Entrances", ec))
         if (de.is_regular_file(ec) && isAudio(de.path())) v.push_back(de.path().string());
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+// CL-0328: every audio file under Custom Music\\Menus (any depth) = the menu playlist. Rescanned on each menu-music start.
+std::vector<std::string> svr06_custom_menu_songs()
+{
+    std::vector<std::string> v;
+    std::error_code ec;
+    const fs::path dir = root() / "Menus";
+    if (!fs::exists(dir, ec)) return v;
+    for (fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), e; !ec && it != e; it.increment(ec))
+        if (it->is_regular_file(ec) && isAudio(it->path()) && it->file_size(ec) > 50000) v.push_back(it->path().string());
     std::sort(v.begin(), v.end());
     return v;
 }
@@ -453,9 +608,61 @@ void svr06_custom_now_playing(const std::string &path)
     std::fprintf(stderr, "[custommusic] now playing: %s\n", t.c_str());
 }
 
+// CL-0352: plugin-controlled label (roster page name on the select screen), drawn top centre while it has not expired.
+static std::mutex g_lblM; static std::string g_lblText; static std::chrono::steady_clock::time_point g_lblUntil{};
+void svr06_roster_label(const char *text, uint32_t ms)
+{
+    std::lock_guard<std::mutex> lk(g_lblM);
+    if (!text || !*text || !ms) { g_lblText.clear(); return; }
+    g_lblText = text; g_lblUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+}
+static void roster_label_draw(int screenW, int screenH)
+{
+    std::string t;
+    { std::lock_guard<std::mutex> lk(g_lblM); if (g_lblText.empty() || std::chrono::steady_clock::now() > g_lblUntil) return; t = g_lblText; }
+    const int fsz = std::max(18, screenH / 30), tw = MeasureText(t.c_str(), fsz), x = (screenW - tw) / 2, y = screenH / 40;
+    DrawRectangleRounded(Rectangle{static_cast<float>(x - fsz / 2), static_cast<float>(y - fsz / 3), static_cast<float>(tw + fsz), static_cast<float>(fsz * 5 / 3)}, 0.3f, 6, Color{10, 20, 50, 210});
+    DrawText(t.c_str(), x, y, fsz, Color{255, 255, 255, 255});
+}
+
 // Drawn by the presenter every frame (ps2_runtime.cpp); shows the custom track's name for 6 s.
+// ---- CL-0356: host overlay for the hot plugin (our own select screen) ----
+#include "svr06_hot_api.h"
+std::atomic<int> g_svr06PadCapture{0};
+static std::mutex g_hotOvlM;
+static void (*g_hotOvl)(int, int) = nullptr;
+void svr06_hot_set_overlay(void (*draw)(int, int)) { std::lock_guard<std::mutex> lk(g_hotOvlM); g_hotOvl = draw; }
+namespace svr06ui
+{
+    static Color col(uint32_t c) { return Color{(unsigned char)(c >> 24), (unsigned char)(c >> 16), (unsigned char)(c >> 8), (unsigned char)c}; }
+    static int pad() { for (int i = 0; i < 4; ++i) if (IsGamepadAvailable(i)) return i; return -1; }
+    static std::vector<Texture2D> g_tex;
+    static void rect(int x, int y, int w, int h, uint32_t c) { DrawRectangle(x, y, w, h, col(c)); }
+    static void rectRound(int x, int y, int w, int h, float r, uint32_t c) { DrawRectangleRounded(Rectangle{(float)x, (float)y, (float)w, (float)h}, r, 6, col(c)); }
+    static void rectLines(int x, int y, int w, int h, int t, uint32_t c) { DrawRectangleLinesEx(Rectangle{(float)x, (float)y, (float)w, (float)h}, (float)t, col(c)); }
+    static void text(const char *s, int x, int y, int size, uint32_t c) { DrawText(s, x, y, size, col(c)); }
+    static int measure(const char *s, int size) { return MeasureText(s, size); }
+    static bool keyPressed(int k) { return IsKeyPressed(k); }
+    static bool keyDown(int k) { return IsKeyDown(k); }
+    static int charPressed() { return GetCharPressed(); }
+    static bool padPressed(int b) { const int p = pad(); return p >= 0 && IsGamepadButtonPressed(p, b); }
+    static bool padDown(int b) { const int p = pad(); return p >= 0 && IsGamepadButtonDown(p, b); }
+    static float padAxis(int a) { const int p = pad(); return p >= 0 ? GetGamepadAxisMovement(p, a) : 0.0f; }
+    static int texLoad(const char *path) { Texture2D t = LoadTexture(path); if (t.id == 0) return -1; SetTextureFilter(t, TEXTURE_FILTER_BILINEAR); g_tex.push_back(t); return (int)g_tex.size() - 1; }
+    static void texDraw(int id, int x, int y, int w, int h, uint32_t c) { if (id < 0 || id >= (int)g_tex.size() || g_tex[id].id == 0) return; const Texture2D &t = g_tex[id]; DrawTexturePro(t, Rectangle{0, 0, (float)t.width, (float)t.height}, Rectangle{(float)x, (float)y, (float)w, (float)h}, Vector2{0, 0}, 0.0f, col(c)); }
+    static void texSize(int id, int *w, int *h) { if (id < 0 || id >= (int)g_tex.size()) { *w = *h = 0; return; } *w = g_tex[id].width; *h = g_tex[id].height; }
+    static void texFree(int id) { if (id < 0 || id >= (int)g_tex.size() || g_tex[id].id == 0) return; UnloadTexture(g_tex[id]); g_tex[id].id = 0; }
+    static double time() { return GetTime(); }
+    static void scissor(int x, int y, int w, int h) { if (w <= 0) EndScissorMode(); else BeginScissorMode(x, y, w, h); }
+    static const Svr06Ui k = {rect, rectRound, rectLines, text, measure, keyPressed, keyDown, charPressed, padPressed, padDown, padAxis, texLoad, texDraw, texSize, texFree, time, scissor};
+}
+const Svr06Ui *svr06_ui_table() { return &svr06ui::k; }
+static void hot_overlay_draw(int w, int h) { std::lock_guard<std::mutex> lk(g_hotOvlM); if (g_hotOvl) g_hotOvl(w, h); }
+
 void svr06_music_popup_draw(int screenW, int screenH)
 {
+    hot_overlay_draw(screenW, screenH); // CL-0356 (drawn first; popups stay on top)
+    roster_label_draw(screenW, screenH);
     std::string t;
     float a = 0.0f;
     {
@@ -475,4 +682,72 @@ void svr06_music_popup_draw(int screenW, int screenH)
     const unsigned char al = static_cast<unsigned char>(a * 200.0f), at = static_cast<unsigned char>(a * 255.0f);
     DrawRectangleRounded(Rectangle{static_cast<float>(x - fsz / 2), static_cast<float>(y - fsz / 2), static_cast<float>(tw + fsz), static_cast<float>(fsz * 2)}, 0.3f, 6, Color{10, 20, 50, al});
     DrawText(line.c_str(), x, y, fsz, Color{255, 255, 255, at});
+}
+
+
+// ---- CL-0325: in-game entrance editor (F1 menu). Edits go to game_assign.txt, which overlays the launcher's entrances.txt.
+int svr06_entrance_last_id() { return g_lastId.load(); }
+
+namespace
+{
+    std::vector<std::string> g_lsSongs, g_lsVideos; std::map<int, std::string> g_lsNames; bool g_lsInit = false;
+    void lsScan(const fs::path &base, std::vector<std::string> &out, std::initializer_list<const char *> exts)
+    {
+        std::error_code ec;
+        if (!fs::exists(base, ec)) return;
+        for (auto it = fs::recursive_directory_iterator(base, fs::directory_options::skip_permission_denied, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+        {
+            if (!it->is_regular_file(ec)) continue;
+            std::string rel = fs::relative(it->path(), base, ec).generic_string();
+            if (rel.rfind("_Bink2", 0) == 0) continue;
+            std::string e = it->path().extension().string(); for (char &c : e) c = (char)std::tolower((unsigned char)c);
+            for (const char *x : exts) if (e == x) { out.push_back(rel); break; }
+        }
+        std::sort(out.begin(), out.end());
+    }
+}
+
+void svr06_entrance_lists(std::vector<std::string> &songs, std::vector<std::string> &videos, std::map<int, std::string> &names)
+{
+    std::lock_guard<std::mutex> lk(g_enM);
+    if (!g_lsInit)
+    {
+        g_lsInit = true;
+        lsScan(root() / "Entrances", g_lsSongs, {".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus"});
+        lsScan(titanDir(), g_lsVideos, {".bik", ".mp4", ".mkv", ".webm", ".avi", ".mov"});
+        std::ifstream in(entDir() / "slots.txt"); std::string line;
+        while (std::getline(in, line))
+        {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            const size_t b = line.find('|'); if (line.empty() || line[0] == '#' || b == std::string::npos) continue;
+            g_lsNames[std::atoi(line.c_str())] = line.substr(b + 1);
+        }
+        std::fprintf(stderr, "[entrances] editor lists: %zu songs, %zu Titantrons, %zu slot names\n", g_lsSongs.size(), g_lsVideos.size(), g_lsNames.size());
+    }
+    songs = g_lsSongs; videos = g_lsVideos; names = g_lsNames;
+}
+
+bool svr06_entrance_get(int slot, std::string &song, std::string &video)
+{
+    std::lock_guard<std::mutex> lk(g_enM);
+    enReload();
+    auto it = g_enRel.find(slot);
+    if (it == g_enRel.end()) { song.clear(); video.clear(); return false; }
+    song = it->second.first; video = it->second.second; return true;
+}
+
+void svr06_entrance_set(int slot, const std::string &song, const std::string &video)
+{
+    std::lock_guard<std::mutex> lk(g_enM);
+    std::error_code ec; fs::create_directories(entDir(), ec);
+    const fs::path f = entDir() / "game_assign.txt";
+    std::vector<std::string> keep;
+    { std::ifstream in(f); std::string line;
+      while (std::getline(in, line)) { while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+          if (line.empty() || line[0] == '#') continue; if (std::atoi(line.c_str()) == slot) continue; keep.push_back(line); } }
+    keep.push_back(std::to_string(slot) + "|" + song + "|" + video);   // empty fields = stock for this wrestler (overrides the launcher)
+    { std::ofstream out(f, std::ios::trunc); out << "# slot|song|video  written by the in-game Entrance Editor; overrides entrances.txt\n"; for (auto &l : keep) out << l << "\n"; }
+    g_enChecked = {}; g_enT2 = {};   // force reload on next lookup
+    std::fprintf(stderr, "[entrances] editor: slot %d song='%s' video='%s'\n", slot, song.c_str(), video.c_str());
+    g_enT = {}; 
 }

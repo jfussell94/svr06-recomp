@@ -7,6 +7,10 @@
 extern std::atomic<int64_t> g_svr06LastDrawNs;
 class GS;
 void svr06MtgsSubmit(GS &gs, const uint8_t *data, uint32_t sizeBytes);
+bool svr06VifIdle(); // CL-0223 (ps2_memory.cpp)
+bool svr06VifFrameDone(); // CL-0238
+void svr06WaitStatLatch(uint64_t us); // CL-0295
+bool svr06VifAsyncOn();
 bool svr06MtgsIdle();
 void svr06MtgsWaitIdle();
 #include <cstdio>
@@ -23,6 +27,7 @@ extern "C" __declspec(dllimport) char *__stdcall GetCommandLineA(void);
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "svr06_prof.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -47,6 +52,7 @@ extern "C" __declspec(dllimport) char *__stdcall GetCommandLineA(void);
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <filesystem>
 #include "rlgl.h" // rlGetShaderIdDefault (CL-0111 movie luma key); after raylib.h so Matrix is not redefined
 extern "C" void svr06DescribeAddr(uint32_t addr); // defined in svr06 overrides (analysis aid)
 
@@ -78,6 +84,33 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
 static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
 #endif
+// CL-0259: window resolution and display mode, applied live from svr06_settings.json (launcher Video page / F1 Graphics).
+// graphics.resolution: 0 default 640x448, 1 480p (854x480), 2 720p, 3 1080p, 4 1440p, 5 4K UHD.
+// graphics.fullscreen 0/1 (F11), graphics.fsMode: 0 borderless fullscreen (desktop resolution), 1 exclusive fullscreen (the monitor
+// switches to the chosen resolution). A window larger than the monitor is shrunk to 90% of it, keeping its shape.
+static void svr06_apply_display()
+{
+    static int s_res = -1, s_mode = -1;
+    static const int kW[] = {0, 854, 1280, 1920, 2560, 3840}, kH[] = {0, 480, 720, 1080, 1440, 2160};
+    int res = ps2settings::getInt("graphics.resolution", 0); if (res < 0 || res > 5) res = 0;
+    const int mode = ps2settings::getInt("graphics.fullscreen", 0) ? (ps2settings::getInt("graphics.fsMode", 0) ? 2 : 1) : 0;
+    if (res == s_res && mode == s_mode) return;
+    const bool first = s_res < 0; s_res = res; s_mode = mode;
+    if (first && res == 0 && mode == 0) return; // defaults: leave the window exactly as created
+    const int mon = GetCurrentMonitor(); const int mw = GetMonitorWidth(mon), mh = GetMonitorHeight(mon);
+    if (IsWindowFullscreen()) ToggleFullscreen();
+    if (IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE)) ToggleBorderlessWindowed();
+    int w = res ? kW[res] : HOST_WINDOW_WIDTH, h = res ? kH[res] : HOST_WINDOW_HEIGHT;
+    if (mode == 2) { if (!res && mw > 0) { w = mw; h = mh; } SetWindowSize(w, h); ToggleFullscreen(); }
+    else if (mode == 1) ToggleBorderlessWindowed();
+    else
+    {
+        if (mw > 0 && mh > 0 && (w > mw * 9 / 10 || h > mh * 9 / 10)) { const float k = std::min(mw * 0.9f / w, mh * 0.9f / h); w = static_cast<int>(w * k); h = static_cast<int>(h * k); }
+        SetWindowSize(w, h);
+        if (mw > 0 && mh > 0) { const Vector2 mp = GetMonitorPosition(mon); SetWindowPosition(static_cast<int>(mp.x) + (mw - w) / 2, static_cast<int>(mp.y) + (mh - h) / 2); }
+    }
+    std::fprintf(stderr, "[display] resolution=%d (%dx%d) mode=%s monitor=%dx%d\n", res, w, h, mode == 2 ? "exclusive fullscreen" : (mode == 1 ? "borderless fullscreen" : "windowed"), mw, mh);
+}
 struct ElfHeader
 {
     uint32_t magic;
@@ -402,8 +435,9 @@ namespace
     }
 }
 
+std::atomic<int> g_svr06PresentHz{60}; // CL-0250: window present rate (50/60), used by the FPS counter colour
 bool svr06_movie_present(float,float,float,float);
-bool svr06_movie_active(); bool svr06_movie_holding();
+bool svr06_movie_active(); bool svr06_movie_holding(); bool svr06_movie_title_playing();
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -429,7 +463,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             // retry next present, so intros/movies hold a steady 60 FPS instead of 40-48 (the 40 ms wait below).
             static int s_movieSkips = 0; // after 6 skipped latches in a row fall through to the normal wait so the UI layer can never freeze
             if (s_hasUploadedFrame && s_movieSkips < 6 && (svr06_movie_active() || svr06_movie_holding()) &&
-                (nowNs() - g_svr06LastDrawNs.load() < 4000000LL || !svr06MtgsIdle()))
+                (nowNs() - g_svr06LastDrawNs.load() < 4000000LL || !svr06MtgsIdle() || !svr06VifIdle()))
             {
                 ++s_movieSkips;
                 outWidth = (s_lastWidth != 0u) ? s_lastWidth : TEX_W;
@@ -439,8 +473,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             s_movieSkips = 0;
             const int64_t waitCap = (svr06_movie_active() || svr06_movie_holding()) ? 6000000LL : 40000000LL; // movies: never miss a 60 Hz present
             const int64_t start = nowNs();
-            while (nowNs() - start < waitCap && (nowNs() - g_svr06LastDrawNs.load() < 4000000LL || !svr06MtgsIdle()))
+            if (svr06VifAsyncOn()) // CL-0238: async worker: wait only until the previous frame's work is done (max 40 ms)
+                { while (nowNs() - start < waitCap && !svr06VifFrameDone()) std::this_thread::sleep_for(std::chrono::microseconds(200)); }
+            else
+            while (nowNs() - start < waitCap && (nowNs() - g_svr06LastDrawNs.load() < 4000000LL || !svr06MtgsIdle() || !svr06VifIdle()))
                 std::this_thread::sleep_for(std::chrono::microseconds(500));
+            svr06WaitStatLatch(static_cast<uint64_t>((nowNs() - start) / 1000)); // CL-0295
         }
         rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
@@ -547,10 +585,19 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
             static std::vector<uint8_t> s_shotBuf; const uint32_t sw = std::max<uint32_t>(1u, std::min<uint32_t>(width, TEX_W)), sh = std::max<uint32_t>(1u, std::min<uint32_t>(height, TEX_H));
             s_shotBuf.assign(static_cast<size_t>(sw) * sh * 4u, 0u);
             for (uint32_t yy = 0; yy < sh; ++yy) { std::memcpy(s_shotBuf.data() + static_cast<size_t>(yy) * sw * 4u, s_uploadBuffer.data() + static_cast<size_t>(yy) * TEX_W * 4u, sw * 4u); for (uint32_t xx = 0; xx < sw; ++xx) s_shotBuf[(static_cast<size_t>(yy) * sw + xx) * 4u + 3u] = 255u; }
-            Image img{}; img.data = s_shotBuf.data(); img.width = static_cast<int>(sw); img.height = static_cast<int>(sh);
-            img.mipmaps = 1; img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
             const std::string fn = std::string(shotDir) + "/shot_" + std::to_string(s_shotN++) + ".png";
-            ExportImage(img, fn.c_str());
+            // CL-0295: encode the periodic diagnostic PNG on a background thread. stb's zlib compression ran on the presenter and
+            // took ~40 ms every 240 frames: the regular "every 4 s" hitch in menus, entrances and matches. One encode in flight at a time.
+            static std::atomic<bool> s_shotBusy{false};
+            if (!s_shotBusy.exchange(true))
+            {
+                std::thread([buf = s_shotBuf, sw, sh, fn]() mutable {
+                    Image img{}; img.data = buf.data(); img.width = static_cast<int>(sw); img.height = static_cast<int>(sh);
+                    img.mipmaps = 1; img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    ExportImage(img, fn.c_str());
+                    s_shotBusy.store(false);
+                }).detach();
+            }
         }
     }
     outWidth = width;
@@ -830,7 +877,7 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN); // CL-0297: ALWAYS_RUN: raylib otherwise blocks in glfwWaitEvents while minimized, freezing the game
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -858,7 +905,7 @@ bool PS2Runtime::initialize(const char *title)
                     ps2x::iop::Spu2::instance().render(static_cast<int16_t *>(buffer), frames);
                     {   // settings: audio.master (0..100 %), audio.mute
                         static float s_vol = 1.0f; static unsigned s_n = 0;
-                        if ((s_n++ & 15u) == 0) s_vol = ps2settings::getInt("audio.mute", 0) ? 0.0f : ps2settings::getFloat("audio.master", 100.0f) / 100.0f;
+                        if ((s_n++ & 15u) == 0) { s_vol = ps2settings::getInt("audio.mute", 0) ? 0.0f : ps2settings::getFloat("audio.master", 100.0f) / 100.0f; ps2x::iop::Spu2::setGains(std::clamp(ps2settings::getFloat("audio.sfx", 100.0f), 0.0f, 100.0f) / 100.0f, std::clamp(ps2settings::getFloat("audio.stream", 100.0f), 0.0f, 100.0f) / 100.0f); } // CL-0223
                         if (s_vol < 0.999f) { int16_t *b = static_cast<int16_t *>(buffer); for (unsigned i = 0; i < frames * 2u; ++i) b[i] = static_cast<int16_t>(b[i] * s_vol); }
                     }
                     if (s_wav && s_wavBytes < 48000ull * 4 * 600)
@@ -873,7 +920,10 @@ bool PS2Runtime::initialize(const char *title)
             }
         }
 #endif
-        SetTargetFPS(60);
+        { // CL-0248: presentation rate = Settings > Refresh Rate (SVR06_HZ 50/60); default = region rate. Game logic, audio and movies stay on the
+          // region clock (EeScheduler vblank), so a higher output rate only gives headroom and never speeds anything up.
+          int hz = 50; if (const char *r = std::getenv("SVR06_REGION_HZ")) { if (std::atoi(r) == 60) hz = 60; } /* CL-0272: region default */ if (const char *e = std::getenv("SVR06_HZ")) { const int v = std::atoi(e); if (v == 50 || v == 60) hz = v; }
+          g_svr06PresentHz.store(hz); SetTargetFPS(hz); std::fprintf(stderr, "[hz] present rate %d Hz\n", hz); }
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -1507,6 +1557,26 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    { // [calltrace] CL-0380: while analysis\live\calltrace.on exists, count guest call pairs (source pc -> target) on the EE executor;
+      // when the file is removed (or after 3M calls) write analysis\live\calltrace.txt sorted by count. Used to see what the
+      // NOW LOADING frame loop polls every frame during a load hang.
+      static uint32_t s_ctPoll = 0; static bool s_ctOn = false; static std::unordered_map<uint64_t, uint32_t> s_ct; static uint64_t s_ctN = 0;
+      auto ctDump = []() {
+          std::vector<std::pair<uint32_t, uint64_t>> v; v.reserve(s_ct.size());
+          for (const auto &kv : s_ct) v.push_back({kv.second, kv.first});
+          std::sort(v.rbegin(), v.rend());
+          if (FILE *f = std::fopen("analysis\\live\\calltrace.txt", "w")) {
+              std::fprintf(f, "calls=%llu pairs=%zu\n", (unsigned long long)s_ctN, v.size());
+              for (size_t i = 0; i < v.size() && i < 3000; ++i) std::fprintf(f, "%8u  %06X -> %06X\n", v[i].first, (unsigned)(v[i].second >> 32), (unsigned)(v[i].second & 0xFFFFFFFFu));
+              std::fclose(f); }
+          s_ct.clear(); s_ctN = 0; };
+      if ((++s_ctPoll & 0x3FFFFFu) == 0u) { // CL-0382: poll the file every ~4M calls (was 64K: hundreds of file checks/s on the game thread)
+          const bool on = std::filesystem::exists("analysis\\live\\calltrace.on");
+          if (s_ctOn && !on) ctDump();
+          if (on && !s_ctOn) { s_ct.clear(); s_ctN = 0; }
+          s_ctOn = on; }
+      if (s_ctOn && isCall) { ++s_ct[(static_cast<uint64_t>(sourcePc) << 32) | targetPc]; if (++s_ctN >= 3000000u) { ctDump(); s_ctOn = false; std::remove("analysis\\live\\calltrace.on"); } }
+    }
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
@@ -1655,6 +1725,22 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
         return;
     }
 
+    { // CL-0370: dump each VU0 microprogram image (4 KiB code) once it is hot, for the native generator (tools/vu1bench, VU0 mode)
+        static uint32_t s_cnt[512]; static uint64_t s_seen[64]; static int s_files = 0;
+        const uint32_t c = ++s_cnt[(startPC >> 3) & 511u];
+        if ((c == 2000u || c == 200000u) && s_files < 64)
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (uint32_t i = 0; i < PS2_VU0_CODE_SIZE; ++i) { h ^= vu0Code[i]; h *= 1099511628211ull; }
+            bool dup = false; for (int i = 0; i < s_files; ++i) dup = dup || s_seen[i] == (h ^ startPC);
+            if (!dup)
+            {
+                s_seen[s_files++] = h ^ startPC;
+                char nm[96]; std::snprintf(nm, sizeof nm, "analysis/live/vu0nat_%04x_%08x.bin", startPC, static_cast<uint32_t>(h));
+                if (FILE *df = std::fopen(nm, "wb")) { std::fwrite(vu0Code, 1, PS2_VU0_CODE_SIZE, df); std::fwrite(vu0Data, 1, PS2_VU0_DATA_SIZE, df); std::fclose(df); std::fprintf(stderr, "[vu0nat] wrote %s (calls=%u)\n", nm, c); }
+            }
+        }
+    }
     { extern std::atomic<uint8_t *> g_svr06Vu0Data; g_svr06Vu0Data.store(vu0Data); extern std::atomic<uint8_t *> g_svr06Vu0Code; g_svr06Vu0Code.store(vu0Code); }
     static __m128 s_vu0In[32]; static uint32_t s_vu0InVi[16];
     for (int r = 0; r < 32; ++r) s_vu0In[r] = ctx->vu0_vf[r];
@@ -1664,6 +1750,7 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     {
         extern std::atomic<int> g_svr06Flags;
         static uint64_t s_abN = 0, s_abBad = 0; static bool s_vu0Bad[512];
+        static const uint32_t s_vu0StMask = std::getenv("SVR06_VU0STRICT") ? 0xFFFFFFFFu : ~0xFC4u; // sticky flags + U
         const bool fastOn = (g_svr06Flags.load(std::memory_order_relaxed) & (1 << 30)) != 0;
         const bool badProg = fastOn && s_vu0Bad[(startPC >> 3) & 511u];
         const bool ab = fastOn && !badProg && (s_abN < 20000u || (s_abN & 1023u) == 0u);
@@ -1684,7 +1771,7 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
             m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE, vu0Data, PS2_VU0_DATA_SIZE, m_gs, &m_memory, startPC, 0u, ctx->vu0_itop, 4096);
             const VU1State &s2 = m_vu0.state();
             const bool same = !std::memcmp(s1.vf, s2.vf, sizeof s1.vf) && !std::memcmp(s1.vi, s2.vi, sizeof s1.vi) && !std::memcmp(s1.acc, s2.acc, sizeof s1.acc) &&
-                              s1.q == s2.q && s1.p == s2.p && s1.i == s2.i && s1.r == s2.r && s1.pc == s2.pc && s1.mac == s2.mac && s1.clip == s2.clip && s1.status == s2.status &&
+                              s1.q == s2.q && s1.p == s2.p && s1.i == s2.i && s1.r == s2.r && s1.pc == s2.pc && s1.mac == s2.mac && s1.clip == s2.clip && ((s1.status ^ s2.status) & s_vu0StMask) == 0u && /* CL-0371: underflow flags (U/US) ignored unless SVR06_VU0STRICT */
                               !std::memcmp(d1, vu0Data, PS2_VU0_DATA_SIZE);
             if (!same)
             {
@@ -2328,8 +2415,22 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
 }
 
+// CL-0272 (ISS-161 diag): guest pc / ra / sp of the last IPU register load, printed by SvrIpu's [ipu] rd64 log.
+std::atomic<uint32_t> g_svr06IpuRdPc{0}, g_svr06IpuRdRa{0}, g_svr06IpuRdSp{0};
+static inline void svr06NoteIpuRd(R5900Context *ctx, uint32_t vaddr)
+{
+    if ((vaddr & 0xFFFFFFC0u) == 0x10002000u && ctx)
+    {
+        g_svr06IpuRdPc.store(ctx->pc, std::memory_order_relaxed);
+        g_svr06IpuRdRa.store(static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])), std::memory_order_relaxed);
+        g_svr06IpuRdSp.store(static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29])), std::memory_order_relaxed);
+    }
+}
+
+void svr06SlowFrame(float ms); // CL-0286 (vu/ps2_vu1_sampler.cpp)
 uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    svr06NoteIpuRd(ctx, vaddr);
     try
     {
         return m_memory.read32(vaddr);
@@ -2343,6 +2444,7 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    svr06NoteIpuRd(ctx, vaddr);
     try
     {
         return m_memory.read64(vaddr);
@@ -2691,6 +2793,7 @@ void svr06BuildHostFnMap()
         if (g_ps2RecompiledFunctionTable[s]) g_hostFnMap.emplace_back((uintptr_t)g_ps2RecompiledFunctionTable[s], g_ps2RecompiledFunctionTableBase + s * 4u);
     std::sort(g_hostFnMap.begin(), g_hostFnMap.end());
 }
+uint32_t svr06CurOsTid(); uint64_t svr06ExeBase(); int svr06SampleThreadStack(uint32_t osTid, uint64_t *rips, int maxFrames); // CL-0310b (ps2_pagewatch.cpp)
 uint32_t svr06HostToGuest(uintptr_t host)
 {
     if (g_hostFnMap.empty()) return 0;
@@ -2764,40 +2867,9 @@ void PS2Runtime::run()
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
-    while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+    // CL-0297: the whole present step is a lambda so the Windows modal move/size loop (title-bar hold) can keep drawing frames.
+    auto frameBody = [&]()
     {
-        PS2_IF_AGRESSIVE_LOGS({
-            tick++;
-            if ((tick % 120) == 0)
-            {
-                uint64_t curDma = m_memory.dmaStartCount();
-                uint64_t curGif = m_memory.gifCopyCount();
-                uint64_t curGs = m_memory.gsWriteCount();
-                uint64_t curVif = m_memory.vifWriteCount();
-                const GSRegisters &gs = m_memory.gs();
-                const uint32_t dbgPc = m_debugPc.load(std::memory_order_relaxed);
-                const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
-                const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
-                const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
-                const auto eeSnapshot = m_eeScheduler->snapshot();
-
-                RUNTIME_LOG("[run:tick] tick=" << tick
-                                               << " pc=0x" << std::hex << dbgPc
-                                               << " ra=0x" << dbgRa
-                                               << " sp=0x" << dbgSp
-                                               << " gp=0x" << dbgGp
-                                               << " dispfb1=0x" << gs.dispfb1
-                                               << " display1=0x" << gs.display1
-                                               << std::dec
-                                               << " activeThreads=" << eeSnapshot.threads.size()
-                                               << " dma=" << curDma
-                                               << " gif=" << curGif
-                                               << " gsw=" << curGs
-                                               << " vif=" << curVif
-                                               << std::endl);
-
-            }
-        });
         uint32_t presentWidth = TEX_W;
         uint32_t presentHeight = DISP_H;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
@@ -2829,6 +2901,7 @@ void PS2Runtime::run()
         float dstWidth = screenWidth;
         float dstHeight = screenWidth / aspect;
         if (dstHeight > screenHeight) { dstHeight = screenHeight; dstWidth = screenHeight * aspect; }
+        if (ps2settings::getInt("graphics.integer", 0)) { const float k = static_cast<float>(static_cast<int>(dstHeight / 448.0f)); if (k >= 1.0f) { dstHeight = 448.0f * k; dstWidth = dstHeight * aspect; } } // CL-0259 integer scaling (whole multiples of the 448-line picture)
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
@@ -2847,6 +2920,57 @@ void PS2Runtime::run()
             static int s_kd = 0;
             if ((++s_kd % 120) == 0)
             {
+                { // CL-0310 live EE sampler: touch analysis/live/prof.req [optional seconds] -> analysis/live/prof.txt
+                    static std::atomic<bool> s_profRun{false};
+                    std::error_code pec;
+                    if (!s_profRun.load() && std::filesystem::exists("analysis/live/prof.req", pec))
+                    {
+                        int secs = 5; if (FILE *rf = std::fopen("analysis/live/prof.req", "r")) { int v = 0; if (std::fscanf(rf, "%d", &v) == 1 && v > 0 && v <= 60) secs = v; std::fclose(rf); }
+                        std::filesystem::remove("analysis/live/prof.req", pec);
+                        s_profRun.store(true);
+                        const unsigned long long vs0 = (unsigned long long)eeScheduler().currentVSyncTick();
+                        std::thread([this, secs, vs0]() {
+                            std::unordered_map<uint64_t, uint32_t> hist; std::unordered_map<int, uint32_t> zones, tids; uint32_t total = 0;
+                            std::unordered_map<uint64_t, uint32_t> topRip; std::unordered_map<std::string, uint32_t> chains; uint32_t stackN = 0; const uint64_t exeBase = svr06ExeBase(); svr06BuildHostFnMap();
+                            const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(secs);
+                            while (std::chrono::steady_clock::now() < end)
+                            {
+                                const uint32_t pc = svr06prof::g_pc.load(std::memory_order_relaxed), tid = svr06prof::g_tid.load(std::memory_order_relaxed);
+                                const int z = svr06prof::g_zone.load(std::memory_order_relaxed);
+                                ++hist[((uint64_t)tid << 40) | ((uint64_t)(uint32_t)(z & 0xFF) << 32) | pc]; ++zones[z]; ++tids[(int)tid]; ++total;
+                                { // CL-0310b: host stack of the EE thread -> deepest guest functions (direct calls included)
+                                    uint64_t rips[24]; const int nf = svr06SampleThreadStack(svr06prof::g_eeOsTid.load(), rips, 24);
+                                    if (nf > 0) { ++stackN; ++topRip[(rips[0] - exeBase) & ~0xFull];
+                                        char key[160]; int kn = 0; int got = 0;
+                                        for (int fi = 0; fi < nf && got < 6; ++fi) { const uint32_t g = svr06HostToGuest((uintptr_t)rips[fi]); if (g == 0u) continue; if (got && kn > 0) { unsigned last = 0; std::sscanf(key + kn - 6, "%x", &last); if (last == g) continue; } kn += std::snprintf(key + kn, sizeof key - kn, "%s%06X", got ? "<" : "", g); ++got; }
+                                        if (got) ++chains[std::string(key, kn)]; }
+                                }
+                                std::this_thread::sleep_for(std::chrono::microseconds(1000));
+                            }
+                            std::vector<std::pair<uint64_t, uint32_t>> v(hist.begin(), hist.end());
+                            std::sort(v.begin(), v.end(), [](const auto &x, const auto &y) { return x.second > y.second; });
+                            if (FILE *f = std::fopen("analysis/live/prof.txt", "w"))
+                            {
+                                std::fprintf(f, "samples=%u secs=%d vsync=%llu (start %llu)\nzones (0 guest, 1 ipu, 2 gs-submit, 10+ scope vu1run/gifpkt/gifnative/image/sprite/tri/wpix/samp):", total, secs, (unsigned long long)eeScheduler().currentVSyncTick(), vs0);
+                                for (const auto &z : zones) std::fprintf(f, " z%d=%.1f%%", z.first, 100.0 * z.second / (total ? total : 1));
+                                std::fprintf(f, "\nthreads:"); for (const auto &t : tids) std::fprintf(f, " T%d=%.1f%%", t.first, 100.0 * t.second / (total ? total : 1));
+                                std::fprintf(f, "\n");
+                                { // CL-0310b stacks
+                                    std::vector<std::pair<std::string, uint32_t>> cv(chains.begin(), chains.end()); std::sort(cv.begin(), cv.end(), [](const auto &x, const auto &y) { return x.second > y.second; });
+                                    std::fprintf(f, "stack samples=%u (guest chain innermost<outer)\n", stackN);
+                                    for (size_t i = 0; i < cv.size() && i < 40; ++i) std::fprintf(f, "  %5.1f%% %s\n", 100.0 * cv[i].second / (stackN ? stackN : 1), cv[i].first.c_str());
+                                    std::vector<std::pair<uint64_t, uint32_t>> rv(topRip.begin(), topRip.end()); std::sort(rv.begin(), rv.end(), [](const auto &x, const auto &y) { return x.second > y.second; });
+                                    std::fprintf(f, "top host rip (exe offset, resolve with the linker map):\n");
+                                    for (size_t i = 0; i < rv.size() && i < 30; ++i) std::fprintf(f, "  %5.1f%% +%llX guest~%06X\n", 100.0 * rv[i].second / (stackN ? stackN : 1), (unsigned long long)rv[i].first, svr06HostToGuest((uintptr_t)(rv[i].first + exeBase)));
+                                }
+                                for (size_t i = 0; i < v.size() && i < 60; ++i)
+                                    std::fprintf(f, "%5.1f%% T%u z%u pc=%06X\n", 100.0 * v[i].second / (total ? total : 1), (unsigned)(v[i].first >> 40), (unsigned)((v[i].first >> 32) & 0xFF), (unsigned)(v[i].first & 0xFFFFFFFFu));
+                                std::fclose(f);
+                            }
+                            s_profRun.store(false);
+                        }).detach();
+                    }
+                }
                 const char *rq = "analysis/live/threads.req";
                 std::error_code kec;
                 if (std::filesystem::exists(rq, kec))
@@ -2890,7 +3014,8 @@ void PS2Runtime::run()
                 s_keyState = (s_key.id != 0 && s_key.id != rlGetShaderIdDefault()) ? 1 : -1;
                 std::fprintf(stderr, "[moviekey] luma-key shader %s\n", s_keyState == 1 ? "ok" : "FAILED (additive fallback)");
             }
-            if (s_keyState == 1)
+            if (svr06_movie_title_playing()) { /* CL-0253: title movie plays on its own; the game's text-only layer is not drawn over it */ }
+            else if (s_keyState == 1)
             {
                 BeginShaderMode(s_key);
                 DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
@@ -2908,8 +3033,7 @@ void PS2Runtime::run()
             // settings: fullscreen (F11 / menu) and texture filter, applied live
             static int s_filt = -1;
             if (IsKeyPressed(KEY_F11)) ps2settings::set("graphics.fullscreen", ps2settings::getInt("graphics.fullscreen", 0) ? 0 : 1);
-            const bool wantFs = ps2settings::getInt("graphics.fullscreen", 0) != 0;
-            if (wantFs != IsWindowFullscreen()) ToggleFullscreen();
+            svr06_apply_display(); // CL-0259 (replaces the old exclusive-only ToggleFullscreen at the 640x448 window size)
             const int wantFilt = ps2settings::getInt("graphics.filter", 0);
             if (wantFilt != s_filt) { SetTextureFilter(frameTex, wantFilt ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT); s_filt = wantFilt; }
         }
@@ -2920,22 +3044,33 @@ void PS2Runtime::run()
             if (IsKeyPressed(KEY_F3)) ps2settings::set("graphics.showFps", ps2settings::getInt("graphics.showFps", 1) ? 0 : 1);
             ++s_frames;
             const double now = GetTime();
+            { // CL-0283 frame-pacing recorder: interval between presented frames (60 Hz target = 16.7 ms)
+                static double s_lastT = 0.0, s_rep = now; static std::vector<float> s_iv; static int s_slowLogged = 0;
+                if (s_lastT > 0.0) { const float ms = static_cast<float>((now - s_lastT) * 1000.0); s_iv.push_back(ms); if (ms > 25.0f) svr06SlowFrame(ms); if (ms > 25.0f && s_slowLogged++ < 300) std::fprintf(stderr, "[ftime] SLOW %.1f ms vsync=%llu\n", ms, static_cast<unsigned long long>(eeScheduler().currentVSyncTick())); }
+                s_lastT = now;
+                if (now - s_rep >= 3.0 && s_iv.size() > 8)
+                {
+                    std::vector<float> v = s_iv; std::sort(v.begin(), v.end()); int n20 = 0, n33 = 0; for (float x : v) { if (x > 20.0f) ++n20; if (x > 33.4f) ++n33; }
+                    std::fprintf(stderr, "[ftime] 3s: n=%zu p50=%.1f p95=%.1f p99=%.1f max=%.1f over20=%d over33=%d\n", v.size(), v[v.size() / 2], v[v.size() * 95 / 100], v[v.size() * 99 / 100], v.back(), n20, n33);
+                    s_iv.clear(); s_rep = now;
+                }
+            }
             if (now - s_t0 >= 0.5) { s_fps = static_cast<int>(s_frames / (now - s_t0) + 0.5); s_frames = 0; s_t0 = now; }
             { // ISS-146 control channel: heartbeat (watchdog / launcher) + perf numbers for `svrlive perf`
                 extern std::atomic<int> g_svr06PerfFps; extern std::atomic<uint64_t> g_svr06PerfPresented;
                 g_svr06PerfFps.store(s_fps); g_svr06PerfPresented.fetch_add(1);
                 static double s_hb = 0.0;
-                if (now - s_hb >= 1.0) { s_hb = now; if (FILE *hf = std::fopen("analysis/live/heartbeat.txt", "w")) { std::fprintf(hf, "fps=%d presented=%llu vsync=%llu time=%lld\n", s_fps, (unsigned long long)g_svr06PerfPresented.load(), (unsigned long long)eeScheduler().currentVSyncTick(), (long long)std::time(nullptr)); std::fclose(hf); } }
+                if (now - s_hb >= 1.0) { s_hb = now; if (FILE *hf = std::fopen("analysis/live/heartbeat.txt", "w")) { extern std::atomic<uint64_t> g_svr06WaitMaxUs, g_svr06WaitSumUs, g_svr06WaitN; std::fprintf(hf, "fps=%d presented=%llu vsync=%llu time=%lld waitmaxus=%llu waitsumus=%llu waitn=%llu\n", s_fps, (unsigned long long)g_svr06PerfPresented.load(), (unsigned long long)eeScheduler().currentVSyncTick(), (long long)std::time(nullptr), (unsigned long long)g_svr06WaitMaxUs.exchange(0), (unsigned long long)g_svr06WaitSumUs.exchange(0), (unsigned long long)g_svr06WaitN.exchange(0)); std::fclose(hf); } }
             }
             if (ps2settings::getInt("graphics.showFps", 1))
             {
                 // run clock + frame counters: lets screenshots and logs be matched to the moment a bug happens (see the [shot]/[clock] log lines)
                 static const double s_runT0 = GetTime(); static uint64_t s_presented = 0; ++s_presented;
                 const int runSec = static_cast<int>(GetTime() - s_runT0);
-                char buf[96]; std::snprintf(buf, sizeof buf, "%d FPS  %02d:%02d  f%llu  v%llu", s_fps, runSec / 60, runSec % 60,
-                                            static_cast<unsigned long long>(s_presented), static_cast<unsigned long long>(eeScheduler().currentVSyncTick()));
+                extern int svr06_internal_res_mode(); char buf[96]; std::snprintf(buf, sizeof buf, "%d FPS  %02d:%02d  f%llu  v%llu  R%d", s_fps, runSec / 60, runSec % 60,
+                                            static_cast<unsigned long long>(s_presented), static_cast<unsigned long long>(eeScheduler().currentVSyncTick()), svr06_internal_res_mode());
                 DrawText(buf, 11, 11, 20, BLACK);
-                DrawText(buf, 10, 10, 20, s_fps >= 55 ? GREEN : (s_fps >= 40 ? YELLOW : RED));
+                DrawText(buf, 10, 10, 20, (s_fps >= g_svr06PresentHz.load() - 2 ? GREEN : (s_fps >= g_svr06PresentHz.load() * 3 / 4 ? YELLOW : RED)));
             }
         }
         { extern void svr06_music_popup_draw(int, int); svr06_music_popup_draw(GetScreenWidth(), GetScreenHeight()); } // [custommusic] CL-0118 now-playing popup
@@ -2943,6 +3078,8 @@ void PS2Runtime::run()
             // [SVR06 menu] Ship-of-Harkinian style menu (ps2_ship_menu.cpp)
             extern void svr06_menu_frame();
             svr06_menu_frame();
+            extern void svr06_arcade_frame(uint8_t *ram);   // CL-0289/0290 PSP Arcade: Hold'em + main-menu entry (reads guest RAM only)
+            svr06_arcade_frame(m_memory.getRDRAM());
         }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
@@ -2951,6 +3088,47 @@ void PS2Runtime::run()
         { extern std::atomic<bool> g_svr06ShotPending; extern char g_svr06ShotPath[260];
           if (g_svr06ShotPending.exchange(false)) { { Image im = LoadImageFromScreen(); ExportImage(im, g_svr06ShotPath); UnloadImage(im); } /* not TakeScreenshot(): it drops the folder part of the path */ std::fprintf(stderr, "[ctl] screenshot %s\n", g_svr06ShotPath); } } // ISS-146: svrlive shot
         EndDrawing();
+    };
+    {
+        extern void svr06InstallModalPump(void *hwnd, void (*pump)());
+        static std::function<void()> s_frameFn; s_frameFn = frameBody;
+        svr06InstallModalPump(GetWindowHandle(), [] { if (s_frameFn) s_frameFn(); });
+    }
+    while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+    {
+        PS2_IF_AGRESSIVE_LOGS({
+            tick++;
+            if ((tick % 120) == 0)
+            {
+                uint64_t curDma = m_memory.dmaStartCount();
+                uint64_t curGif = m_memory.gifCopyCount();
+                uint64_t curGs = m_memory.gsWriteCount();
+                uint64_t curVif = m_memory.vifWriteCount();
+                const GSRegisters &gs = m_memory.gs();
+                const uint32_t dbgPc = m_debugPc.load(std::memory_order_relaxed);
+                const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
+                const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
+                const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
+                const auto eeSnapshot = m_eeScheduler->snapshot();
+
+                RUNTIME_LOG("[run:tick] tick=" << tick
+                                               << " pc=0x" << std::hex << dbgPc
+                                               << " ra=0x" << dbgRa
+                                               << " sp=0x" << dbgSp
+                                               << " gp=0x" << dbgGp
+                                               << " dispfb1=0x" << gs.dispfb1
+                                               << " display1=0x" << gs.display1
+                                               << std::dec
+                                               << " activeThreads=" << eeSnapshot.threads.size()
+                                               << " dma=" << curDma
+                                               << " gif=" << curGif
+                                               << " gsw=" << curGs
+                                               << " vif=" << curVif
+                                               << std::endl);
+
+            }
+        });
+        frameBody();
 
         if (WindowShouldClose())
         {

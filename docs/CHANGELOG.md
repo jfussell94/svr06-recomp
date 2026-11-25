@@ -1,8 +1,11 @@
 # SVR06 PC port: change log
 
+> **Note (2026-11-18):** this file's table stops at CL-0121 (v0.5.3). Newer entries (CL-0167 onward) are in `CHANGELOG-2026-10-28.md` (latest CL-0294, next free CL-0295), `CHANGELOG-2026-11-10-limbs.md` and `CHANGELOG-2026-11-12.md`. A themed summary of 11-11..11-18 is the project doc `claude/week-summary-2026-11-11-to-11-18.md`. Version tags after v0.5.3 have not been assigned yet.
+
+
 ## Version history
 
-Pre-1.0 alpha. Version numbers are assigned to ranges of change-log entries (semantic-ish: minor = a milestone, patch = a batch of fixes). Current: **v0.5.3-alpha** (CL-0121). 1.0.0 = matches PCSX2 on a full play-through. Each `## CL-nnnn` heading in the change logs carries its `[vX.Y.Z]` tag.
+Pre-1.0 alpha. Version numbers are assigned to ranges of change-log entries (semantic-ish: minor = a milestone, patch = a batch of fixes). Current: **v0.9.0-beta** (CL-0395, 2026-11-25). 1.0.0 = matches PCSX2 on a full play-through. Each `## CL-nnnn` heading in the change logs carries its `[vX.Y.Z]` tag.
 
 | version | CL range | dates | summary |
 |---|---|---|---|
@@ -15,6 +18,7 @@ Pre-1.0 alpha. Version numbers are assigned to ranges of change-log entries (sem
 | v0.5.1 | CL-0111..CL-0115 | 2026-11-03 | Title Press START pill, locked 60 FPS on intros/title, fenced readback queue, no pink frames. |
 | v0.5.2 | CL-0116..CL-0120 | 2026-11-03 | Title-hold release, fade fixes, custom music replacements + now-playing popup, music-slot findings. |
 | v0.5.3 | CL-0121 | 2026-11-04 | Extra entrance songs in the game's own Create-an-Entrance list (A-Z, "none" last, game-year tags). |
+| v0.9.0-beta | CL-0122..CL-0395 | 2026-11-04..11-25 | Roll-up (no intermediate tags were assigned). USA (SLUS-21286) is the main build and is playable end to end: SmackDown Season and RAW Season play through with cutscenes; roster/entrance/moveset import and the cut-wrestler restore; custom entrance and soundtrack databases; vsync/pacing fixes (CL-0369); Season stuck-cutscene and black-arena fixes; Win32 menu bar + debugger window; in-session save states (CL-0392..0395: EE kernel, GS VRAM, IPU, host audio). Remaining for 1.0: bug fixes, performance smoothing, sync/lag polish (see the 1.0 checklist). |
 
 (Entries CL-0078..0099 are recorded in the project docs `claude/changelog-CL-00xx-*.md` and the older mirror.)
 

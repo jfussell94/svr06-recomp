@@ -23,18 +23,26 @@ extern "C" __declspec(dllimport) const char *__stdcall GetCommandLineA(void);
 #include "ps2_ship_font.inc"
 
 std::atomic<bool> g_svr06MenuOpen{false};
+extern std::atomic<int> g_svr06ArcadeRequest;   // CL-0289 ps2_arcade_holdem.cpp
+extern std::atomic<bool> g_svr06ArcadeOpen;
 namespace svr06input
 {
 struct PadBind { const char *name; uint16_t mask; int defBtn; };
 extern const PadBind kPadBinds[16];
 int defaultKey(int i, int alt);
+int bindingFor(int player, int i);
+int keyFor(int player, int i, int alt);
 }
 extern std::atomic<uint64_t> g_svr06PadView[2];
 extern std::atomic<int> g_svr06Flags;
+int svr06_entrance_last_id();
+void svr06_entrance_lists(std::vector<std::string> &songs, std::vector<std::string> &videos, std::map<int, std::string> &names);
+bool svr06_entrance_get(int slot, std::string &song, std::string &video);
+void svr06_entrance_set(int slot, const std::string &song, const std::string &video);
 
 namespace
 {
-enum Type { T_HEADER, T_CHECK, T_SLIDER, T_COMBO, T_BUTTON, T_TEXT, T_FLAG, T_BIND, T_VIEW };
+enum Type { T_HEADER, T_CHECK, T_SLIDER, T_COMBO, T_BUTTON, T_TEXT, T_FLAG, T_BIND, T_VIEW, T_REMAP };
 struct Item
 {
     int tab, side, col;
@@ -62,10 +70,13 @@ const int kSideN[4] = {7, 3, 4, 2};
 const char *kThemeNames[] = {"Blue", "Indigo", "Purple", "Red", "Orange", "Green", "Gray"};
 const Color kThemeCol[] = {{0, 61, 204, 255}, {63, 51, 190, 255}, {120, 40, 170, 255}, {190, 25, 25, 255}, {210, 105, 10, 255}, {20, 130, 60, 255}, {90, 90, 100, 255}};
 const char *kFilt[] = {"Nearest (sharp)", "Bilinear (smooth)"};
+const char *kRes[] = {"Default (640x448)", "480p (854x480)", "720p HD (1280x720)", "1080p Full HD (1920x1080)", "1440p QHD (2560x1440)", "2160p 4K UHD (3840x2160)"}; // CL-0259
+const char *kFsType[] = {"Borderless (desktop resolution)", "Exclusive (changes monitor resolution)"};
 const char *kAsp[] = {"4:3 (original)", "16:9", "21:9", "Stretch"};
 const char *kScale[] = {"1x Native (fastest)", "1x + Anti-aliasing (SSAA 4x)", "2x (1280x896)", "2x + Anti-aliasing (SSAA 8x)"};
 const char *kLayout[] = {"Docked", "Full"};
 const char *kColorBlind[] = {"Off", "Protanopia (red-weak)", "Deuteranopia (green-weak)", "Tritanopia (blue-weak)"};
+const char *kHz[] = {"Region default (PAL 50 / NTSC 60)", "50 Hz", "60 Hz"};
 const char *kMode[] = {"Normal (VU1 speed-ups)", "Safe (reference path, slower)"};
 const char *kIcons[] = {"Original (PS2)", "Xbox One", "Xbox 360", "PS3", "PS4", "PS5", "Switch Pro", "Switch Pro 2", "Custom pack"};
 const char *kFinOpts[] = {"Off", "1", "2", "Unlimited"};
@@ -103,6 +114,13 @@ const char *keyName(int k)
 const char *kPs2Label[16] = {"Up", "Down", "Left", "Right", "Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2", "L3", "R3", "Select", "Start"};
 int g_bindCapture = -1;   // item index waiting for a gamepad button
 double g_bindCaptureT = 0;
+int g_remapMode[2] = {0, 0};  // per player: 0 gamepad buttons, 1 keyboard keys, 2 alternate keys
+int g_capPl = -1, g_capBtn = -1, g_capMode = 0;   // remap capture target (player, PS2 button index, mode)
+const char *remapKey(char *out, size_t n, int pl, int btn, int mode)
+{
+    std::snprintf(out, n, mode == 0 ? "input.p%d.btn.%s" : (mode == 1 ? "input.p%d.key.%s" : "input.p%d.key2.%s"), pl + 1, svr06input::kPadBinds[btn].name);
+    return out;
+}
 std::deque<std::string> g_keyStore; // stable storage for generated setting keys
 const char *K(const char *fmt, int a, const char *b = "")
 {
@@ -114,7 +132,7 @@ const char *K2(const char *fmt, const char *a)
 }
 
 // actions
-enum { A_NONE, A_FULLSCREEN, A_RESET_ALL, A_OPEN_FOLDER, A_PRESET_ORIG, A_PRESET_SMOOTH, A_PRESET_ENH, A_RESET_IMG };
+enum { A_NONE, A_FULLSCREEN, A_RESET_ALL, A_OPEN_FOLDER, A_PRESET_ORIG, A_PRESET_SMOOTH, A_PRESET_ENH, A_RESET_IMG, A_ARCADE_HOLDEM };
 
 std::vector<Item> g_items;
 void I(int tab, int side, int col, Type t, const char *label, const char *key = nullptr, double def = 0, double lo = 0, double hi = 100,
@@ -122,6 +140,55 @@ void I(int tab, int side, int col, Type t, const char *label, const char *key = 
        bool reload = false, int action = 0)
 {
     g_items.push_back(Item{tab, side, col, t, label, key, def, lo, hi, unit, opts, nopts, tip, dis, reload, action});
+}
+
+
+// ---- CL-0325: in-game entrance editor
+namespace
+{
+std::vector<std::string> g_edSongs, g_edVideos, g_edSlotLbl, g_edSongLbl, g_edVideoLbl;
+std::vector<const char *> g_edSlotP, g_edSongP, g_edVideoP;
+bool g_edInit = false;
+int g_edSlot = -1, g_edSong = -1, g_edVid = -1, g_edFollowId = -2;
+std::string shortLbl(const std::string &v)
+{
+    std::string n = v; const size_t d = n.rfind('.'); if (d != std::string::npos) n.erase(d);
+    if (n.size() > 46) n = n.substr(0, 20) + ".." + n.substr(n.size() - 24);
+    return n;
+}
+void edInit()
+{
+    if (g_edInit) return; g_edInit = true;
+    std::map<int, std::string> names; svr06_entrance_lists(g_edSongs, g_edVideos, names);
+    for (int i = 0; i < 128; ++i) { auto it = names.find(i); g_edSlotLbl.push_back(it != names.end() ? (std::to_string(i) + "  " + it->second) : ("Slot " + std::to_string(i))); }
+    g_edSongLbl.push_back("(stock / none)"); for (auto &s2 : g_edSongs) g_edSongLbl.push_back(shortLbl(s2));
+    g_edVideoLbl.push_back("(stock / none)"); for (auto &s2 : g_edVideos) g_edVideoLbl.push_back(shortLbl(s2));
+    for (auto &x : g_edSlotLbl) g_edSlotP.push_back(x.c_str());
+    for (auto &x : g_edSongLbl) g_edSongP.push_back(x.c_str());
+    for (auto &x : g_edVideoLbl) g_edVideoP.push_back(x.c_str());
+}
+int idxOf(const std::vector<std::string> &v, const std::string &x) { for (size_t i = 0; i < v.size(); ++i) if (v[i] == x) return (int)i + 1; return 0; }
+void entEditTick()
+{
+    edInit();
+    const int last = svr06_entrance_last_id();
+    if (ps2settings::getInt("entedit.follow", 1) && last >= 0 && last < 128 && last != g_edFollowId) { g_edFollowId = last; ps2settings::set("entedit.slot", last); }
+    int slot = ps2settings::getInt("entedit.slot", 0); if (slot < 0 || slot > 127) slot = 0;
+    int song = ps2settings::getInt("entedit.song", 0), vid = ps2settings::getInt("entedit.video", 0);
+    if (slot != g_edSlot)
+    {   // wrestler changed: show what is assigned now
+        std::string a, b; svr06_entrance_get(slot, a, b);
+        song = idxOf(g_edSongs, a); vid = idxOf(g_edVideos, b);
+        ps2settings::set("entedit.song", song); ps2settings::set("entedit.video", vid);
+        g_edSlot = slot; g_edSong = song; g_edVid = vid; return;
+    }
+    if (song != g_edSong || vid != g_edVid)
+    {
+        g_edSong = song; g_edVid = vid;
+        svr06_entrance_set(slot, (song > 0 && song <= (int)g_edSongs.size()) ? g_edSongs[song - 1] : std::string(),
+                           (vid > 0 && vid <= (int)g_edVideos.size()) ? g_edVideos[vid - 1] : std::string());
+    }
+}
 }
 
 void buildItems()
@@ -161,14 +228,18 @@ void buildItems()
     I(0, 1, 0, T_SLIDER, "Master Volume", "audio.master", 100, 0, 100, "%", nullptr, 0, "Adjust the overall volume.");
     I(0, 1, 0, T_CHECK, "Mute", "audio.mute", 0, 0, 1, nullptr, nullptr, 0, "Mutes all game audio.");
     I(0, 1, 1, T_HEADER, "Mixer");
-    I(0, 1, 1, T_SLIDER, "Music Volume", "audio.music", 100, 0, 100, "%", nullptr, 0, nullptr, DEV);
-    I(0, 1, 1, T_SLIDER, "Effects Volume", "audio.sfx", 100, 0, 100, "%", nullptr, 0, nullptr, DEV);
-    I(0, 1, 1, T_SLIDER, "Commentary Volume", "audio.commentary", 100, 0, 100, "%", nullptr, 0, nullptr, DEV);
-    I(0, 1, 1, T_SLIDER, "Crowd Volume", "audio.crowd", 100, 0, 100, "%", nullptr, 0, nullptr, DEV);
+    I(0, 1, 1, T_SLIDER, "Music Volume", "audio.music", 100, 0, 100, "%", nullptr, 0, "Menu music, entrance themes and arena music.");
+    I(0, 1, 1, T_SLIDER, "Commentary Volume", "audio.commentary", 100, 0, 100, "%", nullptr, 0, "Play-by-play and colour commentary.");
+    I(0, 1, 1, T_SLIDER, "Announcer Volume", "audio.announcer", 100, 0, 100, "%", nullptr, 0, "Ring announcer introductions.");
+    I(0, 1, 1, T_SLIDER, "Crowd Volume", "audio.crowd", 100, 0, 100, "%", nullptr, 0, "Crowd reactions and arena ambience.");
+    I(0, 1, 1, T_SLIDER, "Referee / Streamed Voice Volume", "audio.stream", 100, 0, 100, "%", nullptr, 0, "Referee calls and other streamed speech.");
+    I(0, 1, 1, T_SLIDER, "Effects Volume", "audio.sfx", 100, 0, 100, "%", nullptr, 0, "Hits, menu sounds and other sound effects.");
     I(0, 1, 1, T_COMBO, "SPU2 Interpolation", "audio.interp", 0, 0, 0, nullptr, kInterp, 2, nullptr, DEV, true);
     // ---- Settings / Graphics
     I(0, 2, 0, T_HEADER, "Graphics Options");
     I(0, 2, 0, T_BUTTON, "Toggle Fullscreen", nullptr, 0, 0, 0, nullptr, nullptr, 0, "Toggles fullscreen (F11).", nullptr, false, A_FULLSCREEN);
+    I(0, 2, 0, T_COMBO, "Window Resolution", "graphics.resolution", 0, 0, 0, nullptr, kRes, 6, "Size of the game window (480p, 720p, 1080p, 1440p, 4K). In exclusive fullscreen the monitor switches to this resolution. Sharper 3D needs Internal Resolution too.");
+    I(0, 2, 0, T_COMBO, "Fullscreen Type", "graphics.fsMode", 0, 0, 0, nullptr, kFsType, 2, "Borderless covers the screen at the desktop resolution (fast alt-tab). Exclusive switches the monitor to the Window Resolution.");
     I(0, 2, 0, T_COMBO, "Internal Resolution", "graphics.internalRes", 0, 0, 0, nullptr, kScale, 4, "Renders the 3D picture with more samples on the GPU. Native is the original look and the fastest. Restart the game after changing it.", nullptr, true);
     I(0, 2, 0, T_SLIDER, "Anti-aliasing (MSAA)", "graphics.msaa", 1, 1, 8, "x", nullptr, 0, nullptr, DEV);
     I(0, 2, 0, T_SLIDER, "Current FPS", "graphics.fpsCap", 60, 20, 240, " fps", nullptr, 0, "Frame rate limit. The game runs at its original 50/60 Hz logic rate.", "Frame pacing work is not finished (in development).");
@@ -178,7 +249,7 @@ void buildItems()
     I(0, 2, 0, T_COMBO, "Texture Filter", "graphics.filter", 0, 0, 0, nullptr, kFilt, 2, "Nearest keeps the PS2 look; Bilinear smooths the final image.");
     I(0, 2, 1, T_HEADER, "Advanced Graphics Options");
     I(0, 2, 1, T_COMBO, "Aspect Ratio", "graphics.aspect", 0, 0, 0, nullptr, kAsp, 4, "The picture is rendered at 4:3; wider modes stretch it (widescreen HUD fixes are in development).");
-    I(0, 2, 1, T_CHECK, "Integer Scaling", "graphics.integer", 0, 0, 1, nullptr, nullptr, 0, nullptr, DEV);
+    I(0, 2, 1, T_CHECK, "Integer Scaling", "graphics.integer", 0, 0, 1, nullptr, nullptr, 0, "Scales the picture by whole multiples only (sharpest pixels, may leave borders)."); // CL-0259: implemented
     I(0, 2, 1, T_CHECK, "Deinterlace / Anti-blur", "graphics.antiBlur", 1, 0, 1, nullptr, nullptr, 0, nullptr, DEV);
     I(0, 2, 1, T_HEADER, "Image Adjustments");
     I(0, 2, 1, T_SLIDER, "Brightness", "image.brightness", 0, -100, 100, "%", nullptr, 0, "Adds or removes light from the whole picture.");
@@ -189,7 +260,7 @@ void buildItems()
     I(0, 2, 1, T_SLIDER, "Black Level", "image.black", 0, 0, 50, "%", nullptr, 0, "Lifts the darkest values to pure black.");
     I(0, 2, 1, T_SLIDER, "Color Temperature", "image.temp", 0, -100, 100, "%", nullptr, 0, "Negative is cooler (blue), positive is warmer (orange).");
     I(0, 2, 1, T_SLIDER, "Hue Shift", "image.hue", 0, -180, 180, " deg", nullptr, 0, "Rotates every color around the color wheel.");
-    I(0, 2, 1, T_SLIDER, "Sharpness", "image.sharp", 0, 0, 100, "%", nullptr, 0, "Sharpens edges (unsharp mask).");
+    I(0, 2, 1, T_SLIDER, "Sharpness", "image.sharp", 0, 0, 100, "%", nullptr, 0, "Contrast-adaptive sharpening (CAS): crisper edges without halos.");
     I(0, 2, 1, T_BUTTON, "Reset Image Adjustments", nullptr, 0, 0, 0, nullptr, nullptr, 0, "Returns every image adjustment to neutral.", nullptr, false, A_RESET_IMG);
     // ---- Settings / Controls (per player, PCSX2-style mapping; port 1 = Player 1, port 2 = Player 2)
     for (int pl = 0; pl < 2; ++pl)
@@ -201,23 +272,15 @@ void buildItems()
         I(0, 3, pl, T_CHECK, "Keyboard", K("input.p%d.keyboard", pl + 1), pl == 0 ? 1 : 0, 0, 1, nullptr, nullptr, 0,
           "Keyboard also drives this player: arrows/WASD, X/Space = Cross, C = Circle, Z = Square, V = Triangle, Q/E = L1/R1, Shift = L2/R2, Enter = Start, Tab = Select.");
         I(0, 3, pl, T_CHECK, "Left Stick Moves D-Pad", K("input.p%d.stickdpad", pl + 1), 1, 0, 1, nullptr, nullptr, 0, "The left stick also presses the D-pad directions (the game moves wrestlers with both).");
-        for (int i = 0; i < 16; ++i)
-            I(0, 3, pl, T_BIND, kPs2Label[i], K("input.p%d.btn.%s", pl + 1, svr06input::kPadBinds[i].name), svr06input::kPadBinds[i].defBtn, 0, 0, nullptr, nullptr, 0,
-              "Click, then press the gamepad button to use. Right-click resets to the default. Esc cancels.");
-        I(0, 3, pl, T_HEADER, pl == 0 ? "Player 1 keyboard keys" : "Player 2 keyboard keys");
-        for (int i = 0; i < 16; ++i)
-        {
-            I(0, 3, pl, T_BIND, K2("%s (key)", kPs2Label[i]), K("input.p%d.key.%s", pl + 1, svr06input::kPadBinds[i].name), svr06input::defaultKey(i, 0), 0, 0, nullptr, nullptr, 1,
-              "Click, then press the keyboard key to use. Right-click resets to the default, Backspace clears it. Esc cancels. Only used when Keyboard is ticked for this player.");
-            I(0, 3, pl, T_BIND, K2("%s (alt key)", kPs2Label[i]), K("input.p%d.key2.%s", pl + 1, svr06input::kPadBinds[i].name), svr06input::defaultKey(i, 1), 0, 0, nullptr, nullptr, 1,
-              "A second key for the same button. Right-click resets to the default, Backspace clears it.");
-        }
+        I(0, 3, pl, T_REMAP, "Button Mapping", nullptr, 0, 0, 0, nullptr, nullptr, pl,
+          "Pick Gamepad, Keys or Alt Keys, click a button, then press what you want to use. Right-click a button resets it, Backspace clears a key, Esc cancels.");
     }
     I(0, 3, 0, T_SLIDER, "Stick Deadzone", "controls.deadzone", 15, 0, 50, "%", nullptr, 0, "Stick movement inside this range counts as centred (both players).");
     I(0, 3, 1, T_CHECK, "Rumble", "controls.rumble", 1, 0, 1, nullptr, nullptr, 0, nullptr, DEV);
     // ---- Settings / Game (what the launcher's Play / Visuals pages offer; stored in svr06_settings.json, read at startup)
     I(0, 4, 0, T_HEADER, "Performance");
     I(0, 4, 0, T_COMBO, "Emulation Mode", "game.mode", 0, 0, 0, nullptr, kMode, 2, "Normal uses the VU1 speed-ups. Safe turns them off: slower, but it is the reference path if something looks wrong.", nullptr, true);
+    I(0, 4, 0, T_COMBO, "Refresh Rate", "game.hz", 0, 0, 0, nullptr, kHz, 3, "Output frame rate shown by the window. Game speed, animation and audio always stay on the region clock (PAL 50 / NTSC 60), so 60 Hz on the PAL game never speeds anything up; it gives headroom. Applies on next start.", nullptr, true);
     I(0, 4, 0, T_CHECK, "Diagnostic Probes", "game.probes", 1, 0, 1, nullptr, nullptr, 0, "Writes diagnostic probe lines to the log for bug reports. Turning them off is a little faster.", nullptr, true);
     I(0, 4, 0, T_HEADER, "Appearance");
     I(0, 4, 0, T_COMBO, "Controller Button Icons", "game.iconSet", 0, 0, 0, nullptr, kIcons, 9, "Replaces the Cross / Square / Triangle / Circle, shoulder and D-pad prompts in menus. PAL version only.", nullptr, true);
@@ -237,12 +300,22 @@ void buildItems()
     I(1, 0, 1, T_HEADER, "Matches");
     I(1, 0, 1, T_COMBO, "Camera Style", "game.camera", 0, 0, 0, nullptr, kCam, 3, nullptr, DEV);
     I(1, 0, 1, T_SLIDER, "Count-out Length", "game.countout", 10, 5, 30, " s", nullptr, 0, nullptr, DEV);
+    I(1, 0, 0, T_HEADER, "PSP Arcade");   // CL-0289
+    I(1, 0, 0, T_CHECK, "Arcade Mode in the Main Menu", "menu.arcadeEntry", 1, 0, 1, nullptr, nullptr, 0, "Adds Arcade Mode after Exhibition, like the PSP game (greyed out until the PSP game is linked). Takes effect the next time the front-end menus load.");   // CL-0291
+    I(1, 0, 0, T_BUTTON, "Play WWE Texas Hold'em", nullptr, 0, 0, 0, nullptr, nullptr, 0, "Poker against John Cena, Batista and Triple H with the table, cards and chips from the PSP game. Needs the PSP game linked in the launcher. The game underneath ignores your controller while the table is open.", nullptr, false, A_ARCADE_HOLDEM);
     I(1, 1, 0, T_HEADER, "Interface");
     I(1, 1, 0, T_CHECK, "Widescreen HUD", "game.wideHud", 0, 0, 1, nullptr, nullptr, 0, nullptr, DEV);
     I(1, 2, 0, T_HEADER, "Custom Music");
     I(1, 2, 0, T_CHECK, "Use replacement tracks", "music.replace", 0, 0, 1, nullptr, nullptr, 0, "Plays your own file instead of a stock song (e.g. its full-length version). Put it in the \"Custom Music\\Replacements\" folder named like BGM2_012.ogg; the name of the song playing right now is in Replacements\\_last_played.txt. Off = original songs (1:1).");
-    I(1, 2, 0, T_CHECK, "Allows extra music slots", "music.extraSlots", 0, 0, 1, nullptr, nullptr, 0, "Adds the songs in \"Custom Music\\Entrances\" (and its game sub-folders, e.g. Entrances\\SVR05) to the Create-an-Entrance music list, sorted A-Z with \"none\" last. The list refreshes every time it is opened. Off = original 1:1 list.", "Up to 165 extra songs (ISS-143). Each song keeps its slot in Entrances\\_slots.txt so saved entrances keep their song.");
-    I(1, 2, 0, T_CHECK, "Tag game of origin in the music list", "music.tagStock", 1, 0, 1, nullptr, nullptr, 0, "With extra music slots on, every song name shows the game it comes from: \"Edge '06\" for this game's songs, \"Edge '05\" for one from an SVR05 folder. Names are shortened to fit the row.");
+    I(1, 2, 0, T_CHECK, "Custom entrance songs", "entrance.customMusic", 1, 0, 1, nullptr, nullptr, 0, "Plays the song assigned to each wrestler in the launcher (Mods > Custom entrances) when they enter. Wrestlers and slots stay stock; with nothing assigned the game plays its own songs (1:1).", nullptr);
+    I(1, 2, 0, T_CHECK, "Custom Titantrons", "entrance.customTitantron", 1, 0, 1, nullptr, nullptr, 0, "Plays the video from the \"Custom Titantrons\" folder assigned to each wrestler in the launcher. Off plays the original Titantrons.", nullptr);
+    I(1, 2, 0, T_CHECK, "Custom move-sets", "entrance.customMoves", 1, 0, 1, nullptr, nullptr, 0, "Uses the move-set chosen per wrestler in the launcher (Mods > Custom entrances), e.g. taken from SvR 2005. Moves the old game shares with this one are copied, the rest come from a stock wrestler. Off keeps the original moves. Needs a restart after changing.", nullptr);
+    edInit();
+    I(1, 2, 0, T_HEADER, "Entrance Editor");
+    I(1, 2, 0, T_CHECK, "Follow the wrestler the game loads", "entedit.follow", 1, 0, 1, nullptr, nullptr, 0, "While editing an entrance in Create-an-Entrance (or when a wrestler loads), the picker below jumps to that wrestler. Turn off to pick any wrestler yourself.");
+    I(1, 2, 0, T_COMBO, "Wrestler (slot)", "entedit.slot", 0, 0, 0, nullptr, g_edSlotP.data(), (int)g_edSlotP.size(), "The wrestler to edit. Changes apply the next time the game loads that wrestler (leave and re-enter the screen or start the match).");
+    I(1, 2, 0, T_COMBO, "Entrance song", "entedit.song", 0, 0, 0, nullptr, g_edSongP.data(), (int)g_edSongP.size(), "Song from your Custom Music/Entrances folder. Saved immediately; overrides the launcher for this wrestler.");
+    I(1, 2, 0, T_COMBO, "Titantron video", "entedit.video", 0, 0, 0, nullptr, g_edVideoP.data(), (int)g_edVideoP.size(), "Video from your Custom Titantrons folder. Saved immediately; overrides the launcher for this wrestler.");
     I(1, 2, 0, T_CHECK, "Now-playing popup", "music.popup", 1, 0, 1, nullptr, nullptr, 0, "Shows \"Artist - Title (Game)\" for 6 s when a custom or replacement song starts (from the song's .json sidecar or its own tags).");
     // ---- Cheats: generated from ps2_cheat_tables.h (same ids as the launcher); the game applies them itself
     {
@@ -408,6 +481,7 @@ void applyPalette()
     g_pal.on = lerpC(m, WHITE, 0.45f);        // focus ring
 }
 
+void closeMenuNow();
 void doAction(int a)
 {
     if (a >= 100 && a < 300)
@@ -419,6 +493,7 @@ void doAction(int a)
     }
     switch (a)
     {
+    case A_ARCADE_HOLDEM: { closeMenuNow(); g_svr06ArcadeRequest.store(1); } break;   // CL-0289
     case A_FULLSCREEN: ps2settings::set("graphics.fullscreen", ps2settings::getInt("graphics.fullscreen", 0) ? 0 : 1); break;
     case A_RESET_ALL: { ps2settings::Store &st = ps2settings::store(); std::lock_guard<std::mutex> lk(st.m); st.v.clear(); st.save(); } break;
     case A_OPEN_FOLDER:
@@ -497,6 +572,7 @@ float estHeight(const Item &it)
     case T_HEADER: return L(36);
     case T_CHECK: case T_FLAG: case T_BIND: return L(32);
     case T_VIEW: return L(150);
+    case T_REMAP: return L(300);
     case T_SLIDER: case T_COMBO: return L(62);
     case T_BUTTON: return L(40);
     default: return L(26);
@@ -700,6 +776,52 @@ float drawItem(int idx, const Item &it, float x, float y, float w, bool first)
         stick(ox + bw * 0.5f - 44 * sc, oy + 96 * sc, 16, 24, 12); stick(ox + bw * 0.5f + 44 * sc, oy + 96 * sc, 32, 40, 13);
         return H;
     }
+    case T_REMAP:
+    {
+        const int pl = it.nopts & 1;
+        const float sc = L(1);
+        int &mode = g_remapMode[pl];
+        // mode tabs
+        static const char *kModeN[3] = {"Gamepad", "Keys", "Alt keys"};
+        const float tw = w / 3.0f, th = 28 * sc;
+        for (int m = 0; m < 3; ++m)
+        {
+            const Rectangle r{x + tw * m + 2 * sc, y + 2 * sc, tw - 4 * sc, th};
+            const bool hh = over(r);
+            rrect(r, 4, withA(m == mode ? g_pal.main : (hh ? wdgHot : wdg), alpha));
+            textC(kModeN[m], r, 15, withA(WHITE, alpha));
+            if (hh && C.click && m != mode) { mode = m; g_bindCapture = -1; g_capPl = -1; }
+        }
+        // 4x4 grid in PS2 button order: dpad / face / shoulders / sticks+select+start
+        const float gy = y + th + 12 * sc, gap = 6 * sc, cw = (w - 3 * gap) / 4.0f, ch = 50 * sc;
+        bool anyTip = false;
+        for (int b = 0; b < 16; ++b)
+        {
+            const Rectangle r{x + (b % 4) * (cw + gap), gy + (b / 4) * (ch + gap), cw, ch};
+            const bool hh = over(r) && !dis;
+            const bool cap = g_capPl == pl && g_capBtn == b && g_capMode == mode && g_bindCapture >= 0;
+            char kb[72]; remapKey(kb, sizeof kb, pl, b, mode);
+            int v = mode == 0 ? svr06input::bindingFor(pl, b) : svr06input::keyFor(pl, b, mode == 2 ? 1 : 0);
+            if (mode == 0 && (v < 0 || v > 17)) v = 0;
+            rrect(r, 5, withA(cap ? g_pal.main : (hh ? wdgHot : wdg), alpha));
+            textC(kPs2Label[b], Rectangle{r.x, r.y + 3 * sc, r.width, r.height * 0.42f}, 13, withA(Color{190, 200, 225, 255}, alpha));
+            const char *vn = cap ? (mode == 0 ? "Press button..." : "Press key...") : (mode == 0 ? kPadBtnName[v] : keyName(v));
+            float fs = 14;
+            while (fs > 9 && measure(vn, fs).x > cw - 8 * sc) fs -= 1;
+            textC(vn, Rectangle{r.x, r.y + r.height * 0.42f, r.width, r.height * 0.58f - 2 * sc}, fs, withA(WHITE, alpha));
+            if (hh) anyTip = true;
+            if (!dis && hh && C.click && !cap) { g_bindCapture = idx; g_bindCaptureT = GetTime(); g_capPl = pl; g_capBtn = b; g_capMode = mode; g_focus = idx; }
+            if (hh && C.rclick) { ps2settings::reset(kb); g_bindCapture = -1; g_capPl = -1; }
+        }
+        // reset-all for the shown mode
+        const Rectangle rr{x + 2 * sc, gy + 4 * (ch + gap) + 4 * sc, w * 0.45f, 28 * sc};
+        const bool rh = over(rr);
+        rrect(rr, 4, withA(rh ? wdgHot : wdgDim, alpha));
+        textC("Reset this page", rr, 14, withA(WHITE, alpha));
+        if (rh && C.click) { for (int b = 0; b < 16; ++b) { char kb[72]; ps2settings::reset(remapKey(kb, sizeof kb, pl, b, mode)); } g_bindCapture = -1; g_capPl = -1; }
+        setTip(anyTip);
+        return H;
+    }
     case T_BIND:
     {
         const Rectangle row{x - L(4), y, w + L(8), H};
@@ -817,7 +939,7 @@ const char *kFs =
     "uniform vec4 adjA; uniform vec4 adjB; uniform vec4 adjC;\n"
     "void main(){\n"
     "  vec3 c = texture(texture0, fragTexCoord).rgb;\n"
-    "  if (adjC.x > 0.0) { vec2 t = adjC.yz; vec3 n = texture(texture0, fragTexCoord+vec2(t.x,0)).rgb + texture(texture0, fragTexCoord-vec2(t.x,0)).rgb + texture(texture0, fragTexCoord+vec2(0,t.y)).rgb + texture(texture0, fragTexCoord-vec2(0,t.y)).rgb; c += (c - n*0.25) * adjC.x * 2.0; }\n"
+    "  if (adjC.x > 0.0) { vec2 t = adjC.yz; vec3 b = texture(texture0, fragTexCoord-vec2(0.0,t.y)).rgb; vec3 d = texture(texture0, fragTexCoord-vec2(t.x,0.0)).rgb; vec3 f = texture(texture0, fragTexCoord+vec2(t.x,0.0)).rgb; vec3 h = texture(texture0, fragTexCoord+vec2(0.0,t.y)).rgb; vec3 mn = min(min(min(b,d),min(f,h)),c); vec3 mx = max(max(max(b,d),max(f,h)),c); vec3 amp = sqrt(clamp(min(mn, 1.0-mx) / max(mx, vec3(0.0001)), 0.0, 1.0)); vec3 w = -amp * mix(0.125, 0.2, clamp(adjC.x, 0.0, 1.0)); c = clamp((c + (b+d+f+h)*w) / (1.0 + 4.0*w), 0.0, 1.0); }\n"
     "  c = (c - adjB.z) / max(1.0 - adjB.z, 0.01);\n"
     "  c = pow(max(c, 0.0), vec3(1.0 / adjA.w));\n"
     "  c += adjA.x;\n"
@@ -889,13 +1011,36 @@ void svr06_menu_frame()
     bool open = wasOpen;
     bool padBack = false;
     for (int gi = 0; gi < 4; ++gi) if (IsGamepadAvailable(gi) && IsGamepadButtonPressed(gi, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)) padBack = true;
-    if (IsKeyPressed(KEY_F1) && !g_searchFocus) open = !open;
+    if (IsKeyPressed(KEY_F1) && !g_searchFocus && !g_svr06ArcadeOpen.load()) open = !open;   // CL-0289: F1 does nothing while the Hold'em table is open
     if (open && (IsKeyPressed(KEY_ESCAPE) || (padBack && g_bindCapture < 0)))
     {
         if (g_bindCapture >= 0) g_bindCapture = -1;
         else if (g_openCombo >= 0) g_openCombo = -1;
         else if (g_searchFocus) { g_searchFocus = false; if (!g_search.empty() && IsKeyPressed(KEY_ESCAPE)) g_search.clear(); }
         else open = false;
+    }
+    if (g_bindCapture >= 0 && (!open || g_capPl < 0)) { g_bindCapture = -1; g_capPl = -1; }
+    if (g_bindCapture >= 0 && g_capPl >= 0)
+    {   // remap capture: polled once per frame, independent of drawing
+        char kb[72]; remapKey(kb, sizeof kb, g_capPl, g_capBtn, g_capMode);
+        const double age = GetTime() - g_bindCaptureT;
+        if (age > 8.0) { g_bindCapture = -1; g_capPl = -1; }
+        else if (age > 0.12)
+        {
+            if (g_capMode == 0)
+            {
+                int got = 0;
+                for (int gi = 0; gi < 4 && !got; ++gi)
+                    if (IsGamepadAvailable(gi)) for (int b = 1; b < 18; ++b) if (IsGamepadButtonPressed(gi, b)) { got = b; break; }
+                if (got) { ps2settings::set(kb, got); g_bindCapture = -1; g_capPl = -1; }
+            }
+            else
+            {
+                if (IsKeyPressed(KEY_BACKSPACE)) { ps2settings::set(kb, 0); g_bindCapture = -1; g_capPl = -1; }
+                else for (int k = 1; k < 350; ++k)
+                    if (k != KEY_ESCAPE && k != KEY_F1 && IsKeyPressed(k)) { ps2settings::set(kb, k); g_bindCapture = -1; g_capPl = -1; break; }
+            }
+        }
     }
     if (open && !wasOpen) { g_wasHidden = IsCursorHidden(); if (g_wasHidden) ShowCursor(); g_openCombo = -1; g_dragSlider = -1; g_focus = -1; g_kbNav = false; }
     if (!open && wasOpen) { if (g_wasHidden) HideCursor(); g_searchFocus = false; g_confirm = 0; g_dragSlider = -1; g_openCombo = -1; }
@@ -904,6 +1049,7 @@ void svr06_menu_frame()
     if (!open && g_vis < 0.01f) { g_vis = 0; return; }
 
     buildItems();
+    entEditTick();
     if (g_hov.size() != g_items.size()) { g_hov.assign(g_items.size(), 0.0f); g_knob.assign(g_items.size(), -1.0f); }
     if (!g_fontOk)
     {
@@ -1190,7 +1336,12 @@ void svr06_menu_frame()
     {
         const Item &it = g_items[g_openCombo];
         const float oh = L(30);
-        const float ph = oh * it.nopts;
+        const int vis = std::min(it.nopts, 12);
+        static int popTop = 0;
+        if (it.nopts > vis) { g_popSel = std::max(0, std::min(it.nopts - 1, g_popSel - (int)GetMouseWheelMove())); } else popTop = 0;
+        if (g_popSel < popTop) popTop = g_popSel; if (g_popSel >= popTop + vis) popTop = g_popSel - vis + 1;
+        popTop = std::max(0, std::min(it.nopts - vis, popTop));
+        const float ph = oh * vis;
         float py = g_comboCtrl.y + g_comboCtrl.height + L(2);
         if (py + ph > H - L(8)) py = g_comboCtrl.y - ph - L(2);
         const Rectangle pr{g_comboCtrl.x, py, g_comboCtrl.width, ph};
@@ -1198,9 +1349,9 @@ void svr06_menu_frame()
         rrect(pr, 4, lerpC(kBg, g_pal.main, 0.35f));
         const int cur = ps2settings::getInt(it.key, (int)it.def);
         bool closeIt = false;
-        for (int k = 0; k < it.nopts; ++k)
+        for (int k = popTop; k < popTop + vis; ++k)
         {
-            const Rectangle r{pr.x, pr.y + k * oh, pr.width, oh};
+            const Rectangle r{pr.x, pr.y + (k - popTop) * oh, pr.width, oh};
             const bool h = C.live && hit(r, C.mp);
             if (h) { Vector2 md = GetMouseDelta(); if (md.x != 0 || md.y != 0) g_popSel = k; }
             if (k == g_popSel) rrect(Rectangle{r.x + L(2), r.y + L(2), r.width - L(4), r.height - L(4)}, 3, g_pal.main);
@@ -1242,4 +1393,21 @@ void svr06_menu_frame()
                                     : "Up/Down  Left/Right  Enter  PgUp/PgDn tabs  [ ] pages  F1 close";
         textR(keys, right, footY + footH - L(20), 12, withA(WHITE, 0.38f));
     }
+}
+
+// CL-0289: the menu font for other overlays (PSP Arcade Hold'em). Loads it on first use.
+const Font *svr06_ship_font()
+{
+    if (!g_fontOk)
+    {
+        static bool tried = false;
+        if (!tried)
+        {
+            tried = true;
+            g_font = LoadFontFromMemory(".ttf", kShipFont, (int)sizeof(kShipFont), 64, nullptr, 0);
+            g_fontOk = g_font.texture.id != 0;
+            if (g_fontOk) SetTextureFilter(g_font.texture, TEXTURE_FILTER_BILINEAR);
+        }
+    }
+    return g_fontOk ? &g_font : nullptr;
 }

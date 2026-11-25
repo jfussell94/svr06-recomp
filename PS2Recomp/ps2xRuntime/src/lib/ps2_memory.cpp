@@ -37,6 +37,7 @@ uint8_t *g_svr06Scratchpad = nullptr; // analysis aid: host pointer of the EE sc
 extern std::atomic<unsigned> g_svr06Ord;
 #include <cstring>
 #include <limits>
+#include "runtime/gs/gs_vulkan_bridge.h"
 #include <stdexcept>
 #include <algorithm>
 #include <string>
@@ -75,6 +76,7 @@ uint32_t svr06LaunchSeed()
 // copy of the transferred bytes (VIF1 incl. VU1 runs, GIF path 3, GIF arbiter -> GS). The game thread waits (fence) only
 // when it touches worker-owned state: GS privileged registers, GIF/VIF registers and FIFOs, VU1 memory, GS stubs/readbacks,
 // a synchronous transfer. Off unless debug flag 15 (32768) is set; can be toggled live.
+namespace gsvk { void flushWorkerBatch(); } // CL-0261
 namespace svr06vw
 {
     struct W
@@ -87,6 +89,7 @@ namespace svr06vw
         std::thread::id worker{};
         std::atomic<bool> pending{false};
         std::atomic<uint64_t> fences{0}, jobs{0};
+        std::atomic<uint64_t> enq{0}, done{0}; // CL-0237: frame throttle tickets
     };
     static std::atomic<int> g_stage{0};
     static W &w() { static W *p = new W(); return *p; }
@@ -104,12 +107,13 @@ namespace svr06vw
                 s.q.pop_front();
                 s.busy = true;
             }
-            g_stage.store(1); try { job(); g_stage.store(2); }
+            g_stage.store(1); try { job(); gsvk::flushWorkerBatch(); g_stage.store(2); } // CL-0261: flush before the job counts as done
             catch (const std::exception &e) { std::fprintf(stderr, "[vifasync] job threw: %s\n", e.what()); }
             catch (...) { std::fprintf(stderr, "[vifasync] job threw\n"); }
             {
                 std::lock_guard<std::mutex> lk(s.m);
                 s.busy = false;
+                s.done.fetch_add(1, std::memory_order_release);
                 if (s.q.empty()) s.pending.store(false, std::memory_order_release);
             }
             s.cvIdle.notify_all();
@@ -118,18 +122,61 @@ namespace svr06vw
 }
 bool svr06VifAsyncOn() { extern std::atomic<int> g_svr06Flags; return (g_svr06Flags.load(std::memory_order_relaxed) & 32768) != 0; }
 bool svr06VifOnWorker() { return std::this_thread::get_id() == svr06vw::w().worker; }
+namespace gsvk { void drainQueue(); bool queueIdle(); }
+bool svr06VifIdle() { return !svr06vw::w().pending.load(std::memory_order_acquire) && gsvk::queueIdle(); } // CL-0233: also the GS submit queue // CL-0223: presenter must not latch while the worker still has queued GS work
+// CL-0295: wait-time counters (game thread blocked in the frame throttle / fences, presenter waiting to latch). Printed with [vifasync].
+struct WaitStat { std::atomic<uint64_t> thrN{0}, thrUs{0}, thrMaxUs{0}, fenN{0}, fenUs{0}, fenMaxUs{0}, latN{0}, latUs{0}, latMaxUs{0}; };
+static WaitStat g_waitStat;
+static inline void waitAdd(std::atomic<uint64_t> &n, std::atomic<uint64_t> &sum, std::atomic<uint64_t> &mx, uint64_t us)
+{ n.fetch_add(1, std::memory_order_relaxed); sum.fetch_add(us, std::memory_order_relaxed); uint64_t m = mx.load(std::memory_order_relaxed); while (us > m && !mx.compare_exchange_weak(m, us, std::memory_order_relaxed)) {} }
+void svr06WaitStatLatch(uint64_t us) { waitAdd(g_waitStat.latN, g_waitStat.latUs, g_waitStat.latMaxUs, us); }
 void svr06VifFence()
 {
     svr06vw::W &s = svr06vw::w();
-    if (!s.pending.load(std::memory_order_acquire) || std::this_thread::get_id() == s.worker)
+    if (std::this_thread::get_id() == s.worker)
         return;
-    s.fences.fetch_add(1, std::memory_order_relaxed);
-    std::unique_lock<std::mutex> lk(s.m);
-    for (int n = 0; !s.cvIdle.wait_for(lk, std::chrono::seconds(2), [&] { return s.q.empty() && !s.busy; }); ++n)
-        std::fprintf(stderr, "[vifasync] FENCE WAIT %ds: busy=%d queued=%zu stage=%d (game thread blocked)\n", (n + 1) * 2, (int)s.busy, s.q.size(), svr06vw::g_stage.load()); // CL-0128 diag
+    if (s.pending.load(std::memory_order_acquire))
+    {
+        s.fences.fetch_add(1, std::memory_order_relaxed);
+        const auto t0f = std::chrono::steady_clock::now();
+        struct FenceTimer { std::chrono::steady_clock::time_point t; ~FenceTimer() { waitAdd(g_waitStat.fenN, g_waitStat.fenUs, g_waitStat.fenMaxUs, (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count()); } } fenceTimer{t0f};
+        std::unique_lock<std::mutex> lk(s.m);
+        for (int n = 0; !s.cvIdle.wait_for(lk, std::chrono::seconds(2), [&] { return s.q.empty() && !s.busy; }); ++n)
+            std::fprintf(stderr, "[vifasync] FENCE WAIT %ds: busy=%d queued=%zu stage=%d (game thread blocked)\n", (n + 1) * 2, (int)s.busy, s.q.size(), svr06vw::g_stage.load()); // CL-0128 diag
+    }
+    // CL-0236: no GS-queue drain here; every gsvk entry point that reads or adds GS state drains the queue itself
 }
 static std::atomic<uint64_t> g_fenceSite[16];
-void svr06VifFenceS(int site) { if (svr06vw::w().pending.load(std::memory_order_acquire)) g_fenceSite[site & 15].fetch_add(1, std::memory_order_relaxed); svr06VifFence(); }
+static std::atomic<uint64_t> g_fenceSiteUs[16]; // CL-0295: time the game thread spent waiting per fence site
+namespace gsvk { void fdPriv(uint32_t address, uint64_t value); } // CL-0383 flipdiag2 (gs_vulkan_bridge.cpp)
+void svr06VifFenceS(int site) { if (svr06vw::w().pending.load(std::memory_order_acquire)) { g_fenceSite[site & 15].fetch_add(1, std::memory_order_relaxed); const auto t0 = std::chrono::steady_clock::now(); svr06VifFence(); g_fenceSiteUs[site & 15].fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed); } else svr06VifFence(); }
+// CL-0237: frame throttle. Without the per-poll fences the game thread runs ahead of the VIF1/GIF worker (vsync 80/s, 18 fps shown).
+// Called from sceGsSyncPath: once per vsync the game may only continue when the worker has finished everything that was queued
+// one vsync earlier, so the game computes frame N+1 while the worker renders frame N (one frame of pipelining, no runaway).
+static std::atomic<uint64_t> g_svr06FrameTicket{0};
+// CL-0238: presenter latch condition with the async worker: the worker has finished everything the game queued before its last
+// frame boundary (sceGsSyncPath at a new vsync). With one frame of pipelining the worker is never fully idle, so the old
+// "worker idle + 4 ms without draws" test made every present wait its 40 ms cap (~18 fps).
+bool svr06VifFrameDone() { return svr06vw::w().done.load(std::memory_order_acquire) >= g_svr06FrameTicket.load(std::memory_order_acquire); }
+void svr06VifFrameThrottle(uint64_t vsyncTick)
+{
+    svr06vw::W &s = svr06vw::w();
+    if (std::this_thread::get_id() == s.worker) return;
+    static uint64_t lastV = ~0ull, prevT = 0, curT = 0, ppT = 0;
+    if (vsyncTick != lastV) { lastV = vsyncTick; ppT = prevT; prevT = curT; curT = s.enq.load(std::memory_order_relaxed); g_svr06FrameTicket.store(prevT, std::memory_order_release); } // CL-0240: latch on the frame before the newest boundary (curT is reached only after the game has moved on)
+    // CL-0265: two frames of pipelining by default. With one, the game thread and the VIF1/VU1 worker took turns at every frame
+    // boundary (busy Rumble: worker 89%, game 61%, 43-47 fps). The presenter latch (ticket = prevT) is unchanged; only the game
+    // may now run one more frame ahead of the worker. SVR06_PIPEDEPTH=1 restores the old throttle.
+    // CL-0267: back to one frame by default. Two frames (SVR06_PIPEDEPTH=2) left the game at ~45 vsync/s but the presenter
+    // latch (ticket prevT) was then almost never reached in time: 19 frames shown per second in the busy Rumble.
+    static const bool depth1 = [] { const char *v = std::getenv("SVR06_PIPEDEPTH"); return !(v && *v == '2'); }();
+    const uint64_t need = depth1 ? prevT : ppT;
+    if (s.done.load(std::memory_order_acquire) >= need) return;
+    const auto t0t = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lk(s.m);
+    s.cvIdle.wait_for(lk, std::chrono::milliseconds(200), [&] { return s.done.load(std::memory_order_acquire) >= need; });
+    waitAdd(g_waitStat.thrN, g_waitStat.thrUs, g_waitStat.thrMaxUs, (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0t).count());
+}
 void svr06VifEnqueue(std::function<void()> job)
 {
     svr06vw::W &s = svr06vw::w();
@@ -137,6 +184,7 @@ void svr06VifEnqueue(std::function<void()> job)
         std::lock_guard<std::mutex> lk(s.m);
         if (!s.started) { s.started = true; std::thread(svr06vw::workerMain).detach(); }
         s.q.push_back(std::move(job));
+        s.enq.fetch_add(1, std::memory_order_relaxed);
         s.pending.store(true, std::memory_order_release);
     }
     s.jobs.fetch_add(1, std::memory_order_relaxed);
@@ -147,7 +195,10 @@ void svr06VifEnqueue(std::function<void()> job)
     {
         s_last = now;
         std::fprintf(stderr, "[vifasync] 3s: jobs=%llu fences=%llu\n", (unsigned long long)s.jobs.exchange(0), (unsigned long long)s.fences.exchange(0));
-        std::fprintf(stderr, "[fencesite] gspriv=%llu vu1code=%llu vu1data=%llu fifo=%llu wio=%llu rb=%llu rio=%llu seq=%llu\n", (unsigned long long)g_fenceSite[1].exchange(0), (unsigned long long)g_fenceSite[2].exchange(0), (unsigned long long)g_fenceSite[3].exchange(0), (unsigned long long)g_fenceSite[4].exchange(0), (unsigned long long)g_fenceSite[5].exchange(0), (unsigned long long)g_fenceSite[6].exchange(0), (unsigned long long)g_fenceSite[7].exchange(0), (unsigned long long)g_fenceSite[8].exchange(0));
+        { const uint64_t tn = g_waitStat.thrN.exchange(0), tu = g_waitStat.thrUs.exchange(0), tm = g_waitStat.thrMaxUs.exchange(0), fn = g_waitStat.fenN.exchange(0), fu = g_waitStat.fenUs.exchange(0), fm = g_waitStat.fenMaxUs.exchange(0), ln = g_waitStat.latN.exchange(0), lu = g_waitStat.latUs.exchange(0), lm = g_waitStat.latMaxUs.exchange(0);
+          { std::fprintf(stderr, "[fenceus] 3s ms by site:"); for (int i = 0; i < 16; ++i) std::fprintf(stderr, " %d=%.0f", i, g_fenceSiteUs[i].exchange(0) / 1000.0); std::fprintf(stderr, "\n"); }
+          std::fprintf(stderr, "[waitstat] 3s: throttle n=%llu sum=%.1fms max=%.1fms | fence n=%llu sum=%.1fms max=%.1fms | latch n=%llu sum=%.1fms max=%.1fms\n", (unsigned long long)tn, tu / 1000.0, tm / 1000.0, (unsigned long long)fn, fu / 1000.0, fm / 1000.0, (unsigned long long)ln, lu / 1000.0, lm / 1000.0); }
+        std::fprintf(stderr, "[fencesite] gspriv=%llu vu1code=%llu vu1data=%llu fifo=%llu wio=%llu rb=%llu rio=%llu seq=%llu gifarb=%llu\n", (unsigned long long)g_fenceSite[1].exchange(0), (unsigned long long)g_fenceSite[2].exchange(0), (unsigned long long)g_fenceSite[3].exchange(0), (unsigned long long)g_fenceSite[4].exchange(0), (unsigned long long)g_fenceSite[5].exchange(0), (unsigned long long)g_fenceSite[6].exchange(0), (unsigned long long)g_fenceSite[7].exchange(0), (unsigned long long)g_fenceSite[8].exchange(0), (unsigned long long)g_fenceSite[9].exchange(0));
     }
 }
 
@@ -180,7 +231,9 @@ namespace
     inline bool isGsPrivReg(uint32_t addr)
     {
         const bool r = Ps2AddressInRange(addr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE);
-        if (r) svr06VifFenceS(1); // CL-0127: GS privileged registers belong to the async worker's GS stream
+        // CL-0236: CSR (0x12001000) is not fed by the GIF stream when paraLLEl-GS renders (FINISH/SIGNAL are only set by the software
+        // GS; VSYNC/field come from the EE scheduler), and the game polls it constantly: no worker fence for CSR with Vulkan GS.
+        if (r && !(((addr - PS2_GS_PRIV_REG_BASE) & ~0xFu) == 0x1000u && gsvk::enabled())) svr06VifFenceS(1); // CL-0127: GS privileged registers belong to the async worker's GS stream
         return r;
     }
 
@@ -1124,7 +1177,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         {
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
-            *reg = newVal;
+            *reg = newVal; gsvk::fdPriv(address, newVal);
         }
         return;
     }
@@ -1181,7 +1234,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
-            *reg = value;
+            *reg = value; gsvk::fdPriv(address, value);
         }
         return;
     }
@@ -1342,7 +1395,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
-            *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u)); gsvk::fdPriv(address, *reg);
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -1575,6 +1628,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 1 << 20;
                     std::vector<uint8_t> chainBuf;
+                    chainBuf.reserve(8192u); // CL-0220: avoid repeated realloc/copy while appending chain chunks
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -2079,8 +2133,8 @@ void PS2Memory::processPendingTransfers()
                 m_gifArbiter->drain();
         });
     }
-    else if (!svr06VifOnWorker())
-        svr06VifFenceS(8); // synchronous transfers run after everything already queued
+    else if (!svr06VifOnWorker() && (!m_pendingGifTransfers.empty() || !m_pendingVif1Transfers.empty()))
+        svr06VifFenceS(8); // synchronous transfers run after everything already queued (CL-0222: only when there is GIF/VIF1 work to run here; an empty call no longer waits for the worker)
 
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
@@ -2262,7 +2316,9 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter && !asyncQueued)
+    // CL-0222: with the async worker on, a call that ran no GIF/VIF1 work here (e.g. a VIF0 kick) leaves the arbiter to the
+    // worker instead of draining it (which would wait for the worker); flag off = unchanged (always drains)
+    if (m_gifArbiter && !asyncQueued && (!svr06VifAsyncOn() || svr06VifOnWorker() || hadGif || hadVif1))
         m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
@@ -2308,10 +2364,14 @@ void PS2Memory::processPendingTransfers()
     }
 }
 
+extern void svr06PostDmacWake(); // CL-0364
 void PS2Memory::queueCompletedDmacCause(uint32_t cause)
 {
-    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
-    m_completedDmacCauses.push_back(cause);
+    {
+        std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+        m_completedDmacCauses.push_back(cause);
+    }
+    svr06PostDmacWake();
 }
 
 std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()

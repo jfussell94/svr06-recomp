@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <thread>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #endif
 
@@ -178,6 +179,17 @@ int main(int argc, char *argv[])
         std::string filePathStr = pathObj.string();
         std::string elfName = pathObj.filename().string();
         std::string normalizedId = normalizeGameId(elfName);
+        { // CL-0272: region clock from the disc serial (SLES/SCES = PAL 50 Hz, everything else = NTSC 60 Hz); read by the EE scheduler
+          // (vblank period) and the presenter (default output rate). SVR06_REGION_HZ set by hand wins.
+          std::string up = normalizedId; for (auto &c : up) c = (char)std::toupper((unsigned char)c);
+          const bool pal = up.rfind("SLES", 0) == 0 || up.rfind("SCES", 0) == 0;
+#ifdef _WIN32
+          if (!std::getenv("SVR06_REGION_HZ")) _putenv_s("SVR06_REGION_HZ", pal ? "50" : "60");
+#else
+          setenv("SVR06_REGION_HZ", pal ? "50" : "60", 0);
+#endif
+          std::fprintf(stderr, "[hz] region %s -> %s Hz\n", normalizedId.c_str(), std::getenv("SVR06_REGION_HZ"));
+        }
 
         std::string windowTitle = "PS2-Recomp | ";
         const char *gameName = getGameName(normalizedId);

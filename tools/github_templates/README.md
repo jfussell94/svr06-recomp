@@ -34,6 +34,12 @@ Run `python tools/check_clean.py` before publishing anything.
 | `release/` | Release packaging (`package_release.py`, `regions.json`) |
 | `docs/` | Findings, roadmap, handoff notes. `CHANGELOG.md` / `CHANGELOG-detailed.md` |
 
+## Reverse-engineering tooling
+`tools/` also holds a whole-game analysis pipeline (disc inventory, container/format decoders, call graph, vtable and class discovery, function-pointer tables, name propagation) and hand-verified name tables (`names_manual.tsv`, `names_manual_ovl.tsv`, `class_labels_manual.tsv`). It works on a disc dump you supply and writes nothing back into this repository. As of 2026-11-12 about half of the 23,294 functions in the PAL executable and its 11 code overlays carry some semantic label; only about 570 are verified names, the rest are heuristic (role, class, helper-of, pointer-table) labels. See `docs/CHANGELOG-2026-11-12.md`.
+
+## Sources and credits
+Behaviour is checked against PCSX2 and hardware documentation; ideas were taken from other PS2 recompilation projects (hctp-recomp, Def Jam Vendetta recomp, Urban Reign recomp, WWE Crush Hour PC). The IPU/MPEG decoder is ported from PCSX2 (GPL-3.0+). Full list and licenses: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Reporting bugs
 Use the launcher's **Report issue** page (it opens a GitHub issue with your version and log excerpt attached and later asks you to confirm the fix), or open an issue here with the bug template.
 

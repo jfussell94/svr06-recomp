@@ -1,3 +1,4 @@
+#include <cctype>
 #include "Common.h"
 #include "CD.h"
 #include "MPEG.h"
@@ -5,6 +6,12 @@
 
 #include <cstdio>
 #define SVR06_CNT(nm) do { static unsigned c_ = 0; ++c_; if ((c_ & (c_ - 1)) == 0) std::fprintf(stderr, "[cdcnt] %s n=%u\n", nm, c_); } while (0)
+// CL-0300: stall watchdog shares the CD read progress counter + last-read info (updated and read on the EE executor thread, so no atomics needed)
+uint64_t g_svr06CdReadSeq = 0;
+uint32_t g_svr06CdLastLbn = 0;
+uint32_t g_svr06CdLastBytes = 0;
+uint64_t g_svr06CdLastOff = 0;
+char g_svr06CdLastFile[40] = {0};
 namespace ps2_stubs
 {
     namespace
@@ -206,9 +213,23 @@ namespace ps2_stubs
         return snapshot;
     }
 
+    std::atomic<uint32_t> g_svr06CdWatchLo{0}, g_svr06CdWatchHi{0}, g_svr06CdWatchHits{0}; // [cl0215] reads inside a pseudo-LBN window (movie streams)
+    void svr06_cd_watch(uint32_t lo, uint32_t hi) { g_svr06CdWatchHits.store(0); g_svr06CdWatchLo.store(lo); g_svr06CdWatchHi.store(hi); }
+    uint32_t svr06_cd_watch_hits() { return g_svr06CdWatchHits.load(); }
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        { const uint32_t wl_ = g_svr06CdWatchLo.load(), wh_ = g_svr06CdWatchHi.load(), l_ = getRegU32(ctx, 4); if (wh_ != 0u && l_ >= wl_ && l_ < wh_) { const uint32_t h_ = g_svr06CdWatchHits.fetch_add(1) + 1u; if (h_ <= 8u) std::cerr << std::hex << "[cdwatch] lbn=" << l_ << " sec=" << getRegU32(ctx, 5) << " buf=" << getRegU32(ctx, 6) << std::dec << std::endl; } }
         SVR06_CNT("sceCdRead"); g_svr06CdRa = getRegU32(ctx, 31);
+        { // [cl0314] live read trace -> analysis/live/cdtrace.txt (file key, sector offset inside the file, sectors, dest, ra). Capped; no console output.
+            static int n_ = 0;
+            if (n_ < 20000) {
+                const uint32_t l_ = getRegU32(ctx, 4);
+                const char *k_ = "?"; uint32_t rel_ = 0;
+                for (const auto &kv_ : g_cdFilesByKey) { const auto &e_ = kv_.second; if (l_ >= e_.baseLbn && l_ < e_.baseLbn + e_.sectors) { k_ = kv_.first.c_str(); rel_ = l_ - e_.baseLbn; break; } }
+                if (FILE *f_ = std::fopen("analysis/live/cdtrace.txt", n_ == 0 ? "w" : "a")) { std::fprintf(f_, "%s rel=%u sec=%u buf=%X ra=%X\n", k_, rel_, getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 31)); std::fclose(f_); }
+                ++n_;
+            }
+        }
         { const uint32_t l_=getRegU32(ctx,4); if (l_>=0x124ab1u && l_<0x14cb0au) { static const struct {uint32_t b,e;const char*n;} F[]={{0x124ab1,0x124ab1+0x4cd7,"EVT"},{0x129789,0x129789+0xf42f,"EVT2"},{0x138bb9,0x138bb9+0x4688,"EVT3"},{0x13d242,0x13d242+0x12b6,"EVT4"},{0x13e4f9,0x13e4f9+0xe611,"EVT5"}}; for (auto&f:F) if (l_>=f.b&&l_<f.e) { std::cerr<<std::hex<<"[evtrd] "<<f.n<<" sec="<<(l_-f.b)<<" n="<<getRegU32(ctx,5)<<" ra="<<getRegU32(ctx,31)<<std::dec<<std::endl; break; } } } // [evtrd] ISS-128
         { static int bc_=0; const uint32_t l_=getRegU32(ctx,4); if (l_>=0x1686AEu && l_<0x1686AEu+0x1A3AAu && bc_++<40) std::cerr<<std::hex<<"[bgmrd] lbn="<<l_<<" rel="<<(l_-0x1686AEu)<<" sec="<<getRegU32(ctx,5)<<std::dec<<std::endl; }
         { static int c=0; if(getRegU32(ctx,4)>=0x1f0000u && c++<80) std::cerr<<std::hex<<"[cdrd] lbn="<<getRegU32(ctx,4)<<" sec="<<getRegU32(ctx,5)<<" buf="<<getRegU32(ctx,6)<<" ra="<<getRegU32(ctx,31)<<std::dec<<std::endl; }
@@ -615,6 +636,19 @@ namespace ps2_stubs
 
         CdFileEntry entry;
         bool found = registerCdFile(path, entry);
+        if (!found)
+        {
+            // [cl0215] the game's own file list contains typos such as "ENDP.AFS128": strip stray digits after a ".AFS"/".AFS;1" extension
+            std::string alt = path;
+            const size_t ex = alt.find(".AFS");
+            if (ex != std::string::npos && ex + 4 < alt.size() && std::isdigit(static_cast<unsigned char>(alt[ex + 4])))
+            {
+                size_t e = ex + 4; while (e < alt.size() && std::isdigit(static_cast<unsigned char>(alt[e]))) ++e;
+                alt.erase(ex + 4, e - (ex + 4));
+                found = registerCdFile(alt, entry);
+                if (found) std::fprintf(stderr, "[cd] fixed typo path \"%s\" -> \"%s\"\n", path.c_str(), alt.c_str());
+            }
+        }
         CdFileEntry resolvedEntry = entry;
         std::string resolvedPath;
 

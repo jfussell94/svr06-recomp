@@ -23,6 +23,8 @@ uint32_t submitPath();
 void gifTransfer(uint32_t path, const uint8_t *data, uint32_t sizeBytes);
 // EE->GS host-to-local image upload that bypassed the GIF packet path.
 void writeReg(uint8_t reg, uint64_t value);
+// CL-0256c: while dbp != 0, game host->local uploads to that block address with DBW != keepDbw are cancelled (TRXDIR 3).
+void setUploadBlock(uint32_t dbp, uint32_t keepDbw);
 void uploadImage(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir,
                  const uint8_t *data, uint32_t sizeBytes);
 // GS->host readback (sceGsExecStoreImage): copies a PSMCT32 rectangle out of the Vulkan GS local memory into linear host rows.
@@ -33,6 +35,9 @@ bool readVramPages(uint32_t firstPage, uint32_t numPages, uint8_t *dst); // [gss
 // Returns false if no image is available this vsync.
 bool presentFrame(const GSRegisters &privRegs, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
 int outputScale(); // [scale] 1 or 2: host presentation frame is 640x512 times this
+void flushWorkerBatch(); // CL-0261: hand the VIF1 worker's batched GIF packets to the GS queue
+void drainQueue(); // CL-0233: wait until the GS submit queue is empty (no-op on the queue thread)
+bool queueIdle();  // CL-0233
 bool lastPresentWasQueueFill(); // [nopink] CL-0115: true when the last presentFrame() returned false only because the frame queue was refilling
 } // namespace gsvk
 

@@ -1,32 +1,32 @@
 # Game completion tracker (weighted)
 
-Updated 2026-11-10. Source: tools/game_completion.json -> run tools/game_completion.py.
+Updated 2026-11-15. Source: tools/game_completion.json -> run tools/game_completion.py.
 
 code = recompiled code for this feature matches the PS2 game (audited/verified vs reference); visual = renders correctly; audio = sounds/music correct; input = controls work; logic = game rules/state machines verified against the original; playable = can be used start-to-finish without bugs/crashes/hangs. Each component is 0-100, scored from evidence only (see 'evidence'). Overall for a feature = weighted sum; group = weighted by 'size'. A component set to null does not apply to that feature and is left out of its weighting.
 
 Weights: code 25%, visual 20%, audio 10%, input 10%, logic 20%, playable 15%
 
-## OVERALL: 42% ####......
+## OVERALL: 43% ####......
 
 | Group | Size weight | % | Bar |
 |---|---|---|---|
-| Boot / intro / title | 4 | 73% | #######... |
+| Boot / intro / title | 4 | 74% | #######... |
 | Main menu & submenus | 8 | 43% | ####...... |
 | Exhibition (match setup) | 10 | 53% | #####..... |
 | Match types (in-ring) | 22 | 29% | ##........ |
 | Match engine subsystems | 20 | 39% | ###....... |
-| Entrances | 8 | 68% | ######.... |
-| Season / GM mode | 8 | 32% | ###....... |
+| Entrances | 8 | 69% | ######.... |
+| Season / GM mode | 8 | 38% | ###....... |
 | Create modes | 8 | 26% | ##........ |
 | Audio | 6 | 48% | ####...... |
-| Platform layer | 6 | 49% | ####...... |
+| Platform layer | 6 | 59% | #####..... |
 
 ### Boot / intro / title
 
 | Feature | Total | code | visual | audio | input | logic | playable | Evidence |
 |---|---|---|---|---|---|---|---|---|
-| Boot, logos, intro movies | 79% | 90 | 85 | 20 | 70 | 90 | 85 | boots to title; movies decode; sound model new/unverified |
-| Title screen / Press START | 76% | 88 | 70 | 20 | 70 | 90 | 85 | NOW LOADING hang fixed (CL-0180, verified ~4 h of play); Press START layering bug still open |
+| Boot, logos, intro movies | 80% | 90 | 90 | 20 | 70 | 90 | 85 | boots to title; logos + opening video play (CL-0257); sound model unverified |
+| Title screen / Press START | 78% | 88 | 90 | 20 | 70 | 85 | 80 | movie + pill + text drawn together by the game like hardware (CL-0256, user-verified 11-15); demo hand-off fix CL-0256e awaiting test |
 | Memory card screen | 64% | 65 | 80 | 20 | 70 | 60 | 70 | per-version card folders; launcher card picker (11-10); saves still partial |
 
 ### Main menu & submenus
@@ -51,7 +51,7 @@ Weights: code 25%, visual 20%, audio 10%, input 10%, logic 20%, playable 15%
 
 | Feature | Total | code | visual | audio | input | logic | playable | Evidence |
 |---|---|---|---|---|---|---|---|---|
-| Singles | 48% | 55 | 55 | 5 | 60 | 50 | 45 | matches played by user; speed ~17 of 50 game frames/s (CL-0182); limb IK fixed 11-10 |
+| Singles | 50% | 55 | 55 | 5 | 60 | 55 | 55 | matches played by user; game logic 44-50 of 50 vsync/s after CL-0230-0241 (was ~17) |
 | Tag team | 43% | 50 | 50 | 5 | 55 | 45 | 35 | mixed man+woman tag titles verified in Exhibition 11-10; in-ring tag play lightly exercised |
 | Triple threat / Fatal 4-way / 6-man | 22% | 30 | 25 | 5 | 35 | 20 | 10 | not exercised |
 | Handicap / Battle royal / Royal Rumble | 21% | 28 | 25 | 5 | 35 | 18 | 8 | not exercised |
@@ -73,7 +73,7 @@ Weights: code 25%, visual 20%, audio 10%, input 10%, logic 20%, playable 15%
 
 | Feature | Total | code | visual | audio | input | logic | playable | Evidence |
 |---|---|---|---|---|---|---|---|---|
-| Entrance playback (movie+music+walk) | 60% | 65 | 70 | 45 | 60 | 60 | 50 | limb fix + rebuild awaiting user test 11-10 |
+| Entrance playback (movie+music+walk) | 63% | 65 | 70 | 45 | 60 | 65 | 60 | full PAL speed 50 vsync/s (CL-0230-0241, 11-14); ISS-162 freeze seen once |
 | Create entrance / Entrance set-up menu | 75% | 80 | 80 | 70 | 75 | 70 | 70 | menu works; custom music list (303 themes, A-Z, year tags) and refresh work; slot limit 165 vs 303 and save width >159 unverified |
 
 ### Season / GM mode
@@ -81,7 +81,7 @@ Weights: code 25%, visual 20%, audio 10%, input 10%, logic 20%, playable 15%
 | Feature | Total | code | visual | audio | input | logic | playable | Evidence |
 |---|---|---|---|---|---|---|---|---|
 | GM desk and menus | 42% | 45 | 55 | 15 | 60 | 35 | 35 | GM Desk reached |
-| Season progression / calendar / PPV | 21% | 25 | 30 | 5 | 40 | 15 | 10 | not exercised |
+| Season progression / calendar / PPV | 34% | 35 | 45 | 35 | 40 | 25 | 25 | user playing Season: post-match cutscenes, dialogue voice (SSND1/2, AHX) and in-world titantrons fixed (CL-0242-0246) |
 
 ### Create modes
 
@@ -101,8 +101,8 @@ Weights: code 25%, visual 20%, audio 10%, input 10%, logic 20%, playable 15%
 
 | Feature | Total | code | visual | audio | input | logic | playable | Evidence |
 |---|---|---|---|---|---|---|---|---|
-| Rendering (software GS) | 62% | 70 | 60 | - | - | 60 | 55 | garbled demo geometry ISS-101, halftone |
+| Rendering (software GS) | 63% | 70 | 65 | - | - | 60 | 55 | Vulkan (paraLLEl-GS) player renderer; title movie path fixed; garbled demo geometry ISS-101, halftone open |
 | Input (keyboard/XInput) | 45% | 60 | - | - | 30 | 40 | 35 | keyboard works; XInput pending |
-| Performance / windowing | 41% | 60 | - | - | - | 30 | 25 | CORRECTION: fps readout = host presents; game itself runs ~17 of ~50 vsync/s in-ring, single thread saturated (CL-0182). getenv fix + lazy flags built; threading plan open |
+| Performance / windowing | 68% | 75 | - | - | - | 65 | 60 | matches 44-50 and entrances 50 of 50 vsync/s, no thread saturated (CL-0230-0241); refresh rate option, resolution/display modes (CL-0248, CL-0259) |
 
 Scores are conservative: playable/logic stay low until a feature has been exercised in a run and its code verified against the original.

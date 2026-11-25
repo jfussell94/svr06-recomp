@@ -1,4 +1,5 @@
 #include <map>
+#include <array>
 // SvR06 live console: lets the developer poke the running game without rebuilding.
 // Each frame the presenter calls svr06_console_poll(); if analysis/live/cmd.txt exists its lines are executed,
 // results are appended to analysis/live/out.txt and cmd.txt is renamed to cmd_done.txt.
@@ -41,6 +42,7 @@
 #include "ps2_settings.h"
 
 void svr06PageWatchSet(uint8_t *rdram, uint32_t addr, uint32_t len);
+namespace svrdbg { bool consoleCommand(uint8_t *rdram, const std::string &c, std::istream &ls, std::ostream &out); }
 void svr06PineStart(uint8_t *rdram); // PINE (PCSX2 IPC) server, SvrPine.cpp
 // ISS-137: native voice playback (commentary / ring announcer / crowd), SvrMusic.cpp
 int svr06_afs_entry_by_name(const char *rel, const char *name);
@@ -96,6 +98,7 @@ struct LauncherEnv
         auto has = [](const char *k) { Store &st = store(); std::lock_guard<std::mutex> l(st.m); st.load(); return st.v.find(k) != st.v.end(); };
         if (has("game.mode")) { if (getInt("game.mode", 0) == 1) svr06PutEnv("SVR06_FLAGS", "536870912"); else svr06PutEnv("SVR06_FLAGS", nullptr); }
         if (has("game.probes")) { if (getInt("game.probes", 1)) svr06PutEnv("SVR06_NOPROBES", nullptr); else { svr06PutEnv("SVR06_NOPROBES", "1"); svr06PutEnv("SVR06_PROBES", nullptr); } }
+        if (has("game.hz")) { const int hv = getInt("game.hz", 0); svr06PutEnv("SVR06_HZ", hv == 1 ? "50" : (hv == 2 ? "60" : nullptr)); } // CL-0248
         if (has("game.skipMovies")) svr06PutEnv("SVR06_SKIPMOVIES", getInt("game.skipMovies", 0) ? "1" : nullptr);
         if (has("game.arcade")) { if (getInt("game.arcade", 0) && std::getenv("SVR06_PSPDIR")) svr06PutEnv("SVR06_ARCADE", "1"); else svr06PutEnv("SVR06_ARCADE", nullptr); }
         if (!svr06IsUsaExe())      // icon sets and the HD pack are matched against PAL addresses / hashes
@@ -118,6 +121,8 @@ static int svr06InitFlags()
 {   // launcher modes pass SVR06_FLAGS (decimal or 0x hex); SVR06_VUAB keeps its old meaning (bit 10)
     int v = std::getenv("SVR06_VUAB") ? 1024 : 0;
     if (!std::getenv("SVR06_VU0SLOW")) v |= (1 << 30); // CL-0206: VU0 microprograms use the fast interpreter (A/B-checked vs exact at runtime); SVR06_VU0SLOW=1 opts out
+    if (!std::getenv("SVR06_VUEXACTFLAGS")) v |= (1 << 16); // CL-0214: skip VU1 MAC/status bookkeeping for programs that never read flags (CL-0132, +~10%); GIF output verified identical. SVR06_VUEXACTFLAGS=1 opts out
+    if (!std::getenv("SVR06_VIFSYNC")) v |= (1 << 15); // CL-0223: async VIF1/GIF worker ON by default (CL-0222: +39% in a match); SVR06_VIFSYNC=1 or console "flag 15 0" turns it off
     if (const char *e = std::getenv("SVR06_FLAGS")) v |= static_cast<int>(std::strtoul(e, nullptr, 0));
     return v;
 }
@@ -355,6 +360,75 @@ void svr06ApplyCheats(uint8_t *rdram)
             }
         }
     }
+    { // CL-0313: restored cut superstars. When mods/disc/PAC/CH*.PAC (tools/cutslots) carry a model for a cut slot (NN01), the slot's
+      // profile record gets the playable flag (3) and its names (taken from M.PAC CHAR/FDAT), like the NPC unlock above.
+        static int s_avail = -1; static uint8_t s_have[100] = {0};
+        if (s_avail < 0)
+        {
+            s_avail = 0;
+            const char *e = std::getenv("SVR06_DISC_MODS"); const std::string root = (e && *e) ? e : "mods/disc";
+            for (const char *f : {"/PAC/CH.PAC", "/PAC/CH2.PAC", "/PAC/CH3.PAC"})
+                if (FILE *pf = std::fopen((root + f).c_str(), "rb"))
+                {
+                    uint8_t hd[0x4000]; const size_t got = std::fread(hd, 1, sizeof hd, pf); std::fclose(pf);
+                    if (got < 0x810 || std::memcmp(hd, "DPAC", 4) != 0) continue;
+                    uint32_t n = 0; std::memcpy(&n, hd + 0x804, 4); n &= 0x7FFFu;
+                    for (uint32_t i = 0; i < n && 0x808u + i * 4u + 4u <= got; ++i)
+                    {
+                        uint16_t id = 0; std::memcpy(&id, hd + 0x808 + i * 4, 2);
+                        const unsigned nn = ((id >> 12) & 15u) * 10u + ((id >> 8) & 15u), part = id & 0xFFu;
+                        if (nn < 100u && part == 0x01u) { s_have[nn] = 1; ++s_avail; }
+                    }
+                }
+            std::fprintf(stderr, "[cutslots] %d slot models in mods/disc\n", s_avail);
+        }
+        struct Cut { unsigned slot; const char *full, *shortName; };
+        static const Cut kCut[] = {{12, "Matt Hardy", "Matt"}, {15, "Bubba Ray Dudley", "Bubba Ray"}, {16, "D-Von Dudley", "D-Von"}, {19, "Masked Kane", "Kane"},
+                                   {20, "Stephanie McMahon", "Stephanie"}, {25, "Luther Reigns", "Luther"}, {38, "Victoria", "Victoria"}, {44, "Brock Lesnar", "Lesnar"},
+                                   {68, "Roddy Piper", "Piper"}, {75, "Animal", "Animal"}, {76, "Hawk", "Hawk"}, {79, "Ultimate Warrior", "Warrior"}};
+        // CL-0315: launcher-imported characters: mods/disc/cutslots.txt, one "slot|full name|short name" per line (overrides kCut)
+        static std::vector<std::string> s_names; static std::vector<Cut> s_man; static bool s_manRead = false;
+        if (!s_manRead)
+        {
+            s_manRead = true;
+            const char *e2 = std::getenv("SVR06_DISC_MODS"); const std::string r2 = (e2 && *e2) ? e2 : "mods/disc";
+            if (FILE *mf = std::fopen((r2 + "/cutslots.txt").c_str(), "rb"))
+            {
+                char buf[512]; std::vector<std::array<std::string, 3>> rows;
+                while (std::fgets(buf, sizeof buf, mf))
+                {
+                    std::string l(buf); while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+                    const size_t a = l.find('|'), b = a == std::string::npos ? a : l.find('|', a + 1);
+                    if (b == std::string::npos || l[0] == '#') continue;
+                    rows.push_back({l.substr(0, a), l.substr(a + 1, b - a - 1), l.substr(b + 1)});
+                }
+                std::fclose(mf);
+                s_names.reserve(rows.size() * 2);
+                for (auto &r : rows)
+                {
+                    const unsigned sl = static_cast<unsigned>(std::atoi(r[0].c_str())); if (sl >= 100u) continue;
+                    s_names.push_back(r[1]); s_names.push_back(r[2]);
+                    s_man.push_back(Cut{sl, s_names[s_names.size() - 2].c_str(), s_names.back().c_str()});
+                }
+                std::fprintf(stderr, "[cutslots] manifest: %zu imported characters\n", s_man.size());
+            }
+        }
+        static const std::vector<Cut> s_def(std::begin(kCut), std::end(kCut));
+        if (s_avail > 0)
+            for (const Cut &c : (s_man.empty() ? s_def : s_man))
+            {
+                if (!s_have[c.slot]) continue;
+                const uint32_t rec = m.save + 0x2Eu + c.slot * 0xA0u;
+                uint8_t *d0 = rdram + (rec & 0x1FFFFFFu), *d1 = rdram + ((rec + 0x5Cu) & 0x1FFFFFFu);
+                // CL-0332: launcher-imported characters (manifest) always overwrite the slot's names: slots 13/20/25/79 carry stock
+                // records (Jimmy Hart / Christy Hemme / Heidenreich / Snitsky) whose names would otherwise win. Built-in defaults keep fill-if-empty.
+                const bool force = !s_man.empty();
+                if (force || !d0[0]) std::memcpy(d0, c.full, std::min<size_t>(std::strlen(c.full), 0x5Bu)), d0[std::min<size_t>(std::strlen(c.full), 0x5Bu)] = 0;
+                if (force || !d1[0]) std::memcpy(d1, c.shortName, std::min<size_t>(std::strlen(c.shortName), 0x1Fu)), d1[std::min<size_t>(std::strlen(c.shortName), 0x1Fu)] = 0;
+                const uint32_t fa = rec + 0x7Eu; const uint32_t w = rd32(rdram, fa);
+                if ((w & 0xFFu) != 3u) wr32(rdram, fa, (w & 0xFFFFFF00u) | 3u);
+            }
+    }
     if (gm) wr32(rdram, m.save + (0x430AC0u - 0x3D9BF8u), 9999999u);
     // GM roster records: 0x30 bytes per superstar id at save+0x59F30 + id*0x30 (PAL 0x433B28; byte +0 = id). Found 2026-11-11 by diffing a GM week:
     // +0x15..+0x17 = fatigue, +0x28 = injured (1 -> filtered out of match booking). Batista (id 0x3C) cleared live -> fatigue reset, bookable again.
@@ -407,9 +481,13 @@ void svr06ApplyCheats(uint8_t *rdram)
 }
 
 std::string svr06AudioDump();
+std::string svr06_music_slots(long long mutemask);
+bool svr06SsConsole(const std::string &c, std::istream &ls, std::ostream &out); // CL-0392
+void svr06MenuTick(uint8_t *rdram);
 void svr06_console_poll(uint8_t *rdram)
 {
     using namespace svr06con;
+    svr06MenuTick(rdram);
     const uint64_t frame = ++g_svr06Frame;
     if (g_svr06CmdBtnFrames.load() > 0 && --g_svr06CmdBtnFrames == 0)
         g_svr06CmdBtn.store(0);
@@ -501,6 +579,45 @@ void svr06con::runCommands(uint8_t *rdram)
             for (char ch : rest) if (std::isxdigit((unsigned char)ch)) hx += ch;
             for (size_t i = 0; i + 1 < hx.size(); i += 2) body.push_back((uint8_t)std::strtoul(hx.substr(i, 2).c_str(), nullptr, 16));
             out << svrPineRoundTrip(std::atoi(ps.c_str()), body) << "\n";
+        }
+        else if (c == "rosterprobe")   // CL-0333 stage-2 probe: run at the character select screen
+        {
+            const uint32_t lim = 0x2000000u;
+            auto w32 = [&](uint32_t a) -> uint32_t { uint32_t v = 0; if (a + 4 <= lim) std::memcpy(&v, rdram + a, 4); return v; };
+            char b[200];
+            out << "[rosterprobe] roster array rec(id)=0x3DD640+id*0x5B0, dyn ptr @3D9BA4=" << std::hex << w32(0x3D9BA4) << std::dec << "\n";
+            for (uint32_t id : {0u, 1u, 92u, 93u, 94u, 95u})
+            {
+                const uint32_t a = 0x3DD640u + id * 0x5B0u;
+                std::snprintf(b, sizeof b, "  rec[%u] @%08X: %08X %08X %08X %08X", id, a, w32(a), w32(a + 4), w32(a + 8), w32(a + 12));
+                out << b << "\n";
+            }
+            // 1) free RAM: runs of zero words >= 64 KB (page aligned, 1 MB..32 MB). Heuristic: untouched heap / unused BSS.
+            out << "[rosterprobe] zero runs >= 0x10000:\n";
+            uint32_t runStart = 0, runLen = 0; int nr = 0;
+            for (uint32_t p = 0x100000u; p <= lim; p += 0x1000u)
+            {
+                bool z = p < lim;
+                if (z) { const uint64_t *q = reinterpret_cast<const uint64_t *>(rdram + p); for (int i = 0; i < 512; ++i) if (q[i]) { z = false; break; } }
+                if (z) { if (!runLen) runStart = p; runLen += 0x1000u; }
+                else { if (runLen >= 0x10000u && nr < 40) { std::snprintf(b, sizeof b, "  %08X - %08X  size 0x%X", runStart, runStart + runLen, runLen); out << b << "\n"; ++nr; } runLen = 0; }
+            }
+            // 2) live code scan: immediates 92/93/94 (0x5C..0x5E) in slti/sltiu/addiu/andi... in everything that looks like code (all of RAM)
+            out << "[rosterprobe] code immediates 0x5C/0x5D/0x5E (slti sltiu li):\n";
+            int shown = 0;
+            for (uint32_t a = 0x100000u; a + 4 <= lim && shown < 400; a += 4)
+            {
+                const uint32_t w = w32(a), op = w >> 26, imm = w & 0xFFFFu, rs = (w >> 21) & 31;
+                const bool slt = (op == 0x0A || op == 0x0B) && (imm == 0x5C || imm == 0x5D || imm == 0x5E);
+                const bool li = (op == 0x09 && rs == 0 && imm == 0x5D);
+                if (!slt && !li) continue;
+                // plausible code only: next word must itself decode as an opcode we expect near a compare (branch / slt / addu / beq...)
+                const uint32_t n = w32(a + 4), nop = n >> 26;
+                if (slt && !(nop == 4 || nop == 5 || nop == 0x14 || nop == 0x15 || n == 0 || nop == 0)) continue;
+                std::snprintf(b, sizeof b, "  %08X: %08X %s r%u,r%u,%u  next=%08X", a, w, slt ? (op == 0x0A ? "slti" : "sltiu") : "li", (w >> 16) & 31, rs, imm, n);
+                out << b << "\n"; ++shown;
+            }
+            out << "[rosterprobe] done\n";
         }
         else if (c == "skel")   // live skeleton scan: bone count, world translations of bones 0..10 (legs), collision block at +0x30..+0x50
         {
@@ -663,6 +780,8 @@ void svr06con::runCommands(uint8_t *rdram)
             int n = -1; ls >> n; g_svr06DrawLimit.store(n);
             out << "drawlimit=" << n << " (per presentation interval; -1 = off)\n";
         }
+        else if (svr06SsConsole(c, ls, out)) {}
+        else if (c == "aslots") { long long m = -1; std::string a; if (ls >> a) m = std::stoll(a, nullptr, 0); out << svr06_music_slots(m); }
         else if (c == "quit")
         {
             out << "quitting\n"; out.flush();
@@ -730,6 +849,7 @@ void svr06con::runCommands(uint8_t *rdram)
         }
         else if (c == "perf")
             out << "fps=" << g_svr06PerfFps.load() << " presented=" << g_svr06PerfPresented.load() << " frame=" << frame << " flags=" << g_svr06Flags.load() << "\n";
+        else if (svrdbg::consoleCommand(rdram, c, ls, out)) {} // CL-0390 debugger commands (dbghelp)
         else
             out << "unknown command\n";
     }

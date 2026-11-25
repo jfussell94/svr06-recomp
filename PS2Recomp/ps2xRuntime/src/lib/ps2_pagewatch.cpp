@@ -152,7 +152,77 @@ void svr06HwWatchHost(uint8_t *hostBase, uint32_t addr, uint32_t len)
     std::fflush(g_pwOut);
 }
 void svr06PageWatchSet(uint8_t *rdram, uint32_t addr, uint32_t len) { svr06HwWatchHost(rdram, addr, len); }
+// CL-0310b live EE stack sampler support (used by the prof.req sampler in ps2_runtime.cpp). No allocation while the target is suspended.
+uint32_t svr06CurOsTid() { return (uint32_t)GetCurrentThreadId(); }
+uint64_t svr06ExeBase() { return (uint64_t)(uintptr_t)GetModuleHandleW(nullptr); }
+int svr06SampleThreadStack(uint32_t osTid, uint64_t *rips, int maxFrames)
+{
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, (DWORD)osTid);
+    if (!h) return 0;
+    int n = 0;
+    if (SuspendThread(h) != (DWORD)-1)
+    {
+        CONTEXT c; ZeroMemory(&c, sizeof c); c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (GetThreadContext(h, &c))
+        {
+            while (n < maxFrames && c.Rip != 0)
+            {
+                rips[n++] = c.Rip;
+                DWORD64 imageBase = 0;
+                PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+                if (!rf) { if (c.Rsp == 0) break; c.Rip = *(DWORD64 *)c.Rsp; c.Rsp += 8; }
+                else { PVOID hd = nullptr; DWORD64 ef = 0; RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, rf, &c, &hd, &ef, nullptr); }
+            }
+        }
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    return n;
+}
+
+// ---- CL-0314 crash reporter: one small file analysis/live/crash.txt, written only when the process dies (no per-frame cost) ----
+#include <csignal>
+#include <exception>
+#include "svr06_prof.h"
+static void svr06WriteCrash(const char *why, EXCEPTION_POINTERS *ep)
+{
+    static volatile LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return;
+    FILE *f = std::fopen("analysis/live/crash.txt", "w");
+    if (!f) return;
+    const unsigned char *base = (const unsigned char *)GetModuleHandleA(nullptr);
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+    const unsigned long long size = nt->OptionalHeader.SizeOfImage;
+    std::fprintf(f, "why=%s hosttid=%lu\n", why, (unsigned long)GetCurrentThreadId());
+    std::fprintf(f, "guest pc=%X eeTid=%u zone=%d eeHostTid=%u\n", (unsigned)svr06prof::g_pc.load(), (unsigned)svr06prof::g_tid.load(), (int)svr06prof::g_zone.load(), (unsigned)svr06prof::g_eeOsTid.load());
+    if (ep && ep->ExceptionRecord && ep->ContextRecord)
+    {
+        const EXCEPTION_RECORD *er = ep->ExceptionRecord; const CONTEXT *c = ep->ContextRecord;
+        std::fprintf(f, "code=%08lX flags=%lX rip=exe+%llX (%p)\n", (unsigned long)er->ExceptionCode, (unsigned long)er->ExceptionFlags, (unsigned long long)((const unsigned char *)er->ExceptionAddress - base), er->ExceptionAddress);
+        if (er->NumberParameters >= 2) std::fprintf(f, "param0=%llu (0 read,1 write,8 exec) param1=%p\n", (unsigned long long)er->ExceptionInformation[0], (void *)er->ExceptionInformation[1]);
+        std::fprintf(f, "rax=%llX rbx=%llX rcx=%llX rdx=%llX rsi=%llX rdi=%llX rbp=%llX rsp=%llX\n", (unsigned long long)c->Rax, (unsigned long long)c->Rbx, (unsigned long long)c->Rcx, (unsigned long long)c->Rdx, (unsigned long long)c->Rsi, (unsigned long long)c->Rdi, (unsigned long long)c->Rbp, (unsigned long long)c->Rsp);
+        std::fprintf(f, "r8=%llX r9=%llX r10=%llX r11=%llX r12=%llX r13=%llX r14=%llX r15=%llX\n", (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->R10, (unsigned long long)c->R11, (unsigned long long)c->R12, (unsigned long long)c->R13, (unsigned long long)c->R14, (unsigned long long)c->R15);
+        std::fprintf(f, "stack (return addresses inside the exe):");
+        int shown = 0;
+        for (int i = 0; i < 512 && shown < 48; ++i)
+        {
+            unsigned long long v = 0; SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), (const void *)(c->Rsp + (unsigned long long)i * 8), &v, 8, &got) || got != 8) break;
+            if (v >= (unsigned long long)base && v < (unsigned long long)base + size) { std::fprintf(f, " exe+%llX", v - (unsigned long long)base); ++shown; }
+        }
+        std::fprintf(f, "\n");
+    }
+    std::fclose(f);
+}
+static LONG WINAPI svr06CrashFilter(EXCEPTION_POINTERS *ep) { svr06WriteCrash("unhandled-exception", ep); return EXCEPTION_CONTINUE_SEARCH; }
+static void svr06TerminateHook() { svr06WriteCrash("std::terminate", nullptr); std::abort(); }
+static void svr06AbortHook(int) { svr06WriteCrash("SIGABRT", nullptr); std::_Exit(3); }
+static struct Svr06CrashInstall { Svr06CrashInstall() { SetUnhandledExceptionFilter(svr06CrashFilter); std::set_terminate(svr06TerminateHook); std::signal(SIGABRT, svr06AbortHook); } } s_svr06CrashInstall;
+
 #else
+uint32_t svr06CurOsTid() { return 0; }
+uint64_t svr06ExeBase() { return 0; }
+int svr06SampleThreadStack(uint32_t, uint64_t *, int) { return 0; }
 void svr06HwWatchHost(uint8_t *, uint32_t, uint32_t) {}
 void svr06StartPageWatch(uint8_t *) {}
 void svr06PageWatchSet(uint8_t *, uint32_t, uint32_t) {}

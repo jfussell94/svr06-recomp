@@ -6,6 +6,8 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdlib>
+static inline bool svr06VerboseLog() { static const bool v = std::getenv("SVR06_VERBOSE") != nullptr; return v; } // CL-0283: per-event debug prints are off unless SVR06_VERBOSE is set
 
 namespace ps2x::iop::detail
 {
@@ -400,7 +402,7 @@ namespace ps2x::iop::detail
             if (id == 12)
             {
                 static int s_s12 = 0;
-                if (++s_s12 < 400000)
+                if (svr06VerboseLog() && ++s_s12 < 400000)
                     std::fprintf(stderr, "[iop-sema12] signal cur=%d ra=0x%x thr=%d\n", it->second.current, cpu.gpr[31], m_currentThread ? m_currentThread->id : -1);
             }
             if (id == 8 || id == 9 || id == 10)
@@ -426,7 +428,7 @@ namespace ps2x::iop::detail
             if (id == 12)
             {
                 static int s_w12 = 0;
-                if (++s_w12 < 400000)
+                if (svr06VerboseLog() && ++s_w12 < 400000)
                     std::fprintf(stderr, "[iop-sema12] wait cur=%d ra=0x%x thr=%d\n", it->second.current, cpu.gpr[31], m_currentThread ? m_currentThread->id : -1);
             }
             if (id == 8)

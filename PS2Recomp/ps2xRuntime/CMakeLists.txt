@@ -375,6 +375,13 @@ function(ps2x_stage_ffmpeg_runtime_dlls target_name)
     )
 endfunction()
 
+# CL-0271: the native VU1 programs are generated from the game's own microcode (tools/vu1bench/gen.cpp) and are never published.
+# Without them the runtime builds with an empty table and runs every VU1 program in the interpreter.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu/ps2_vu1_native_gen.cpp")
+    set(PS2X_VU1_NATIVE_SRC src/lib/vu/ps2_vu1_native_gen.cpp)
+else()
+    set(PS2X_VU1_NATIVE_SRC src/lib/vu/ps2_vu1_native_none.cpp)
+endif()
 add_library(ps2_runtime STATIC
     src/lib/game_overrides.cpp
     src/lib/gs/ps2_gif_arbiter.cpp
@@ -388,6 +395,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_ship_menu.cpp
+    src/lib/ps2_arcade_holdem.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
@@ -397,6 +405,8 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/vu/ps2_vu1_sampler.cpp
+    src/lib/ps2_modal_pump.cpp
+    ${PS2X_VU1_NATIVE_SRC}
     src/lib/games_database.cpp
 )
 

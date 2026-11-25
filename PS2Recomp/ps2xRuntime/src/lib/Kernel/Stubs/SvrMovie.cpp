@@ -34,6 +34,10 @@ extern "C"
 
 namespace
 {
+    std::vector<uint8_t> g_tailRgba; int g_tailW = 0, g_tailH = 0; // CL-0251
+    std::atomic<bool> g_titleMovie{false};
+    std::atomic<bool> g_inWorld{false}; // CL-0302: moved up so the decoder can see it
+    std::atomic<bool> g_vramFeed{false}; // CL-0256: frames go into the game's own video texture; the host presenter does not draw the movie // CL-0253: the title movie (LOGOP entry 3) is the current movie
     struct Src
     {
         std::ifstream f;
@@ -98,6 +102,7 @@ namespace
         int fw = 0, fh = 0;
         bool fresh = false;
         bool anyFrame = false;
+        uint64_t seq = 0; // CL-0256: new-frame counter for svr06_movie_grab_frame
 
         std::mutex am;
         std::deque<int16_t> pcm;
@@ -136,6 +141,12 @@ namespace
             finish();
             return;
         }
+        if (entry == -100)
+        {   // CL-0319: a plain video file (Custom Titantrons) instead of an AFS entry
+            src.f.seekg(0, std::ios::end); src.size = static_cast<int64_t>(src.f.tellg()); src.base = 0; src.pos = 0; src.f.seekg(0, std::ios::beg);
+        }
+        else
+        {
         uint8_t head[8];
         src.f.read(reinterpret_cast<char *>(head), 8);
         uint32_t count = 0;
@@ -153,6 +164,7 @@ namespace
         src.size = ent[1];
         src.pos = 0;
         std::fprintf(stderr, "[movie] playing %s entry %d offset=0x%x size=%u\n", path.c_str(), entry, ent[0], ent[1]);
+        }
 
         const int ioSize = 1 << 16;
         uint8_t *ioBuf = static_cast<uint8_t *>(av_malloc(ioSize));
@@ -269,6 +281,7 @@ namespace
                             g.fh = h;
                             g.fresh = true;
                             g.anyFrame = true;
+                            ++g.seq;
                         }
                         ++frames;
                         if ((frames % 30) == 1) std::fprintf(stderr, "[movie] frame %d pts=%.2f src=%lld/%lld\n", frames, ts == AV_NOPTS_VALUE ? -1.0 : ts * av_q2d(tb), (long long)src.pos, (long long)src.size);
@@ -292,7 +305,7 @@ namespace
                         std::vector<int16_t> out(static_cast<size_t>(maxOut) * 2);
                         uint8_t *op[1] = {reinterpret_cast<uint8_t *>(out.data())};
                         const int n = swr_convert(swr, op, maxOut, const_cast<const uint8_t **>(afr->extended_data), afr->nb_samples);
-                        if (n > 0)
+                        if (n > 0 && !g_inWorld.load() && !g_vramFeed.load()) // CL-0302: no consumer for in-world / VRAM-fed movie audio: drop it instead of stalling the decoder 200 ms per packet
                         {
                             for (int tries = 0; !g.abort.load() && tries < 40; ++tries)
                             {
@@ -345,6 +358,43 @@ namespace
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
+
+        // CL-0251: title movie skipped early -> the held picture behind the real PRESS START button must be the movie's FINAL logo frame,
+        // not the early frame we stopped on. Seek to the last ~2 s, decode to the end without pacing, keep the brightest late frame.
+        if (g.abort.load() && vctx && entry == 3 && path.find("LOGOP") != std::string::npos && fc->duration > 0)
+        {
+            g_tailW = 0; g_tailH = 0; g_tailRgba.clear();
+            const int64_t target = std::max<int64_t>(0, fc->duration - 3 * AV_TIME_BASE);
+            if (avformat_seek_file(fc, -1, INT64_MIN, target, target, 0) >= 0 || av_seek_frame(fc, -1, std::max<int64_t>(0, src.size - 2600000), AVSEEK_FLAG_BYTE) >= 0)
+            {
+                avcodec_flush_buffers(vctx);
+                uint64_t peak = 0; int got = 0;
+                for (int n = 0; n < 900; ++n)
+                {
+                    if (av_read_frame(fc, pkt) < 0) break;
+                    if (pkt->stream_index == vIdx && avcodec_send_packet(vctx, pkt) >= 0)
+                    {
+                        while (avcodec_receive_frame(vctx, fr) >= 0)
+                        {
+                            const int w = fr->width, h = fr->height;
+                            sws = sws_getCachedContext(sws, w, h, static_cast<AVPixelFormat>(fr->format), w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            rgba.resize(static_cast<size_t>(w) * h * 4);
+                            uint8_t *dst[1] = {rgba.data()}; int dstStride[1] = {w * 4};
+                            sws_scale(sws, fr->data, fr->linesize, 0, h, dst, dstStride);
+                            uint64_t sum = 0, cnt = 0; const size_t px = static_cast<size_t>(w) * h;
+                            for (size_t i = 0; i < px; i += 97) { const uint8_t *p4 = rgba.data() + i * 4; sum += std::max(p4[0], std::max(p4[1], p4[2])); ++cnt; }
+                            const uint64_t m = cnt ? sum / cnt : 0;
+                            ++got;
+                            if (m > peak) peak = m;
+                            if (m > 28 && m * 10 >= peak * 9) { g_tailRgba = rgba; g_tailW = w; g_tailH = h; }
+                        }
+                    }
+                    av_packet_unref(pkt);
+                }
+                std::fprintf(stderr, "[movie] title skipped early: tail frame %s (decoded %d, peak brightness %llu)\n", g_tailW ? "ready" : "NOT found", got, (unsigned long long)peak);
+            }
+            else std::fprintf(stderr, "[movie] title skipped early: seek to the end failed\n");
+        }
         std::fprintf(stderr, "[movie] diag abort=%d readRet=%d pkts=%d vpkts=%d sendFail=%d decoded=%d shown=%d vIdx=%d aIdx=%d srcPos=%lld/%lld\n", (int)g.abort.load(), dgReadRet, dgPkts, dgVpkts, dgSendFail, dgDecoded, frames, vIdx, aIdx, (long long)src.pos, (long long)src.size);
         std::fprintf(stderr, "[movie] finished (%d frames)\n", frames);
         av_frame_free(&fr);
@@ -392,6 +442,7 @@ bool svr06_music_stop(uint32_t);
 void svr06_movie_hold()
 {
     g_holdKill.store(false); s_holdFrames = 0;
+    if (g_tailW > 0 && !g_tailRgba.empty()) { s_bright = g_tailRgba; s_brightW = g_tailW; s_brightH = g_tailH; s_brightShown = false; g_tailRgba.clear(); g_tailW = 0; } // CL-0251
     g_hold.store(true); s_holdPrevBtn = true; s_holdMax = 0.0f; s_holdDark = 0; s_brightShown = false;
     std::fprintf(stderr, "[movie] holding last frame behind game screen\n");
 }
@@ -422,6 +473,7 @@ bool svr06_movie_start(const char *afsRelPath, int entry, bool loop)
 {
     svr06_movie_stop();
     g_hold.store(false); s_bright.clear(); s_brightShown = false; s_brightMax = 0;
+    g_tailRgba.clear(); g_tailW = 0; // CL-0251
     const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
     std::filesystem::path root = paths.cdRoot;
     std::filesystem::path p = root / afsRelPath;
@@ -431,6 +483,7 @@ bool svr06_movie_start(const char *afsRelPath, int entry, bool loop)
         std::fprintf(stderr, "[movie] missing file %s\n", p.string().c_str());
         return false;
     }
+    g_titleMovie.store(entry == 3 && std::strstr(afsRelPath, "LOGO") != nullptr);
     g.done.store(false);
     g.acked.store(false);
     g.running.store(true);
@@ -438,8 +491,31 @@ bool svr06_movie_start(const char *afsRelPath, int entry, bool loop)
     return true;
 }
 
-static std::atomic<bool> g_inWorld{false};
+bool svr06_movie_start_file(const char *absPath, bool loop)
+{
+    svr06_movie_stop();
+    g_hold.store(false); s_bright.clear(); s_brightShown = false; s_brightMax = 0;
+    g_tailRgba.clear(); g_tailW = 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(absPath, ec)) { std::fprintf(stderr, "[movie] missing custom file %s\n", absPath); return false; }
+    g_titleMovie.store(false);
+    g.done.store(false); g.acked.store(false); g.running.store(true);
+    g.th = std::thread(runMovie, std::string(absPath), -100, loop);
+    return true;
+}
+
+static std::atomic<bool> g_previewGate{false}; static int s_gateFrames = 0;
+void svr06_movie_set_gate(bool v) { g_previewGate.store(v); s_gateFrames = 0; } // [cl0215c] preview inside a menu: wait for the game's own UI before covering the window
 void svr06_movie_set_inworld(bool v) { g_inWorld.store(v); } // [entfix] ISS-127
+bool svr06_movie_active();
+bool svr06_movie_title_playing() { return g_titleMovie.load() && svr06_movie_active() && !g_vramFeed.load(); }
+void svr06_movie_set_vram_feed(bool v) { g_vramFeed.store(v); } // CL-0256
+bool svr06_movie_grab_frame(std::vector<uint8_t> &out, int &w, int &h, uint64_t &lastSeq) // CL-0256: newest decoded RGBA frame, only when it changed
+{
+    std::lock_guard<std::mutex> lk(g.vm);
+    if (!g.anyFrame || g.seq == lastSeq || g.fw <= 0 || g.fh <= 0) return false;
+    out = g.frame; w = g.fw; h = g.fh; lastSeq = g.seq; return true;
+}
 bool svr06_movie_active()
 {
     if (g_inWorld.load()) return false; // Titantron: decoded for the game's clock only, never drawn fullscreen
@@ -468,6 +544,7 @@ bool svr06_movie_skip_requested()
 bool svr06_movie_present(float dx, float dy, float dw, float dh)
 {
     const bool active = svr06_movie_active();
+    if (active && g_vramFeed.load()) return false; // CL-0256: the game draws the title video itself (frames fed into its VRAM video texture)
     if (!active)
     {
         if (s_asPlaying)
@@ -566,6 +643,13 @@ bool svr06_movie_present(float dx, float dy, float dw, float dh)
         }
     }
 
+    if (g_previewGate.load())
+    {   // [cl0215c] the preview window (TV bezel) opens a little after the menu is drawn: hold the movie back ~0.8 s after the UI appears
+        static int s_gatePass = 0; if (s_gateFrames == 0) s_gatePass = 0;
+        ++s_gateFrames;
+        if (s_gateFrames < 120 && g_svr06FrameLum.load() < 3.0f && s_gatePass == 0) return false;
+        if (s_gatePass < 50) { ++s_gatePass; return false; }
+    }
     ClearBackground(BLACK);
     if (s_tex.id != 0)
     {

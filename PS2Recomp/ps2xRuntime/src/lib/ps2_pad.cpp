@@ -187,9 +187,19 @@ bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
             btns |= sh; btns &= ~s_latched[player];
         }
     }
+    {   // CL-0291: Cross on the main menu's Arcade Mode row opens Hold'em (ps2_arcade_holdem.cpp); the game never sees that press
+        extern std::atomic<bool> g_svr06ArcadeOnEntry; extern std::atomic<int> g_svr06ArcadeRequest;
+        static bool s_prevX[2] = {false, false};
+        const bool x = !(btns & PAD_CROSS);
+        if (player >= 0 && player < 2)
+        {
+            if (g_svr06ArcadeOnEntry.load() && x) { if (!s_prevX[player]) g_svr06ArcadeRequest.store(1); btns |= PAD_CROSS; }
+            s_prevX[player] = x;
+        }
+    }
     svr06RevTick(player, btns);
     g_svr06PadView[player].store((uint64_t)btns | ((uint64_t)data[6] << 16) | ((uint64_t)data[7] << 24) | ((uint64_t)data[4] << 32) | ((uint64_t)data[5] << 40));
-    { extern std::atomic<bool> g_svr06MenuOpen; if (g_svr06MenuOpen.load()) { data[2] = data[3] = 0xFF; data[4] = data[5] = data[6] = data[7] = kPadStickCenter; return true; } } // menu open: game sees an idle pad
+    { extern std::atomic<bool> g_svr06MenuOpen; extern std::atomic<bool> g_svr06ArcadeOpen; if (g_svr06MenuOpen.load() || g_svr06ArcadeOpen.load()) { data[2] = data[3] = 0xFF; data[4] = data[5] = data[6] = data[7] = kPadStickCenter; return true; } } // menu open: game sees an idle pad
 
     if (player != 0)
     {

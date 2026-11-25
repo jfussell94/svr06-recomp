@@ -20,6 +20,11 @@ FILES = ['svr06_overrides.cpp', 'svr06_funcs.h', 'svr06_engine.h']
 rx = re.compile(r'\b0x([0-9A-Fa-f]{5,6})([uU]?)\b')
 rep = []
 def conv(v):
+    # CL-0270: the upper overlay area (Title.bin, MainGame.bin, event.bin, CAS, Create, Locker, moves, OnlineMenu: PAL base 0x5A2700)
+    # loads 0x1380 higher on the USA disc; Title.bin and MainGame.bin are byte-identical apart from that shift (all functions match).
+    if 0x5A0000 <= v < 0x680000: return v + 0x1380, 'ovl+1380'
+    # CL-0270: Menu.bin (lower overlay area) differs between the discs; single functions matched by recompiled body (99.8%)
+    if v == 0x561D10: return 0x5630A0, 'menu-ovl matched'
     if v < 0x100010 or v >= 0x400000: return None, 'keep'
     # CL-0168: the data delta is not uniform. Measured from matching code references and the ELF images: PAL data below
     # 0x381550 moves by DATA_DELTA (0x1280); the region-specific text block 0x381550..0x399780 differs between the discs;

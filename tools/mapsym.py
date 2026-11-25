@@ -3,7 +3,7 @@
 usage: mapsym.py RVA_HEX [...]    or   mapsym.py --hot RUN_ERR [N]   (aggregates [sample] hot32 lines, bucket = rva>>5<<5? see sampler)"""
 import sys,re,bisect,os,collections
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MAP=os.path.join(ROOT,'analysis','svr06.map'); CACHE=MAP+'.idx'
+MAP=os.environ.get('SVR06_MAP') or os.path.join(ROOT,'analysis','svr06.map'); CACHE=MAP+'.idx'  # CL-0286: SVR06_MAP=analysis/svr06_usa.map for USA
 def load():
     import pickle
     if os.path.exists(CACHE) and os.path.getmtime(CACHE)>os.path.getmtime(MAP): return pickle.load(open(CACHE,'rb'))

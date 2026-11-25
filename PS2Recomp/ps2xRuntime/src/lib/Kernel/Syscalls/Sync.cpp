@@ -1,3 +1,6 @@
+#include <chrono>
+#include <atomic>
+#include <cstdio>
 #include <cstdio>
 #include "Common.h"
 #include "Sync.h"
@@ -107,8 +110,10 @@ namespace ps2_syscalls
         signalSemaphoreImpl(rdram, ctx, runtime, true);
     }
 
+struct Svr06BlkScope { const char *what; uint32_t ra; uint32_t arg; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now(); ~Svr06BlkScope() { const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(); static std::atomic<int> n{0}; if (ms >= 40 && ms < 4000 && n.fetch_add(1) < 400) std::fprintf(stderr, "[blk] %s arg=%u ra=%X blocked %lld ms\n", what, arg, ra, (long long)ms); } };
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        Svr06BlkScope blk{"WaitSema", getRegU32(ctx, 31), getRegU32(ctx, 4)}; // CL-0362
         scheduler(rdram, ctx, runtime).waitSemaphore(static_cast<int>(getRegU32(ctx, 4)));
     }
 

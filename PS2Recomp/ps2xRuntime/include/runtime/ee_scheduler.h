@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -143,6 +144,7 @@ struct EeSemaphore
     int initCount = 0;
     uint32_t attr = 0;
     uint32_t option = 0;
+    uint64_t lastWaitCycle = 0; // CL-0300 stall watchdog: eeCycle when a thread last began waiting here
     std::deque<int> waiters;
 };
 
@@ -360,7 +362,12 @@ public:
     [[nodiscard]] EeKernelSnapshot snapshot() const;
     void publishSnapshot();
 
+    // CL-0392 in-session save states (see SvrSavestate.cpp)
+    [[nodiscard]] std::shared_ptr<void> captureState();
+    void restoreState(const std::shared_ptr<void> &state);
+
 private:
+    struct StateBlob;
     struct ScheduledEvent
     {
         uint64_t deadlineCycle = 0;
@@ -397,6 +404,7 @@ private:
     void copyMainContextToRuntime();
     void publishDebugContext(const R5900Context &context);
     void publishIdleDebugContext();
+    void svr06CheckStall(); // CL-0300 stall watchdog
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;

@@ -26,5 +26,7 @@ namespace ps2x::iop
         // mix `frames` stereo frames (interleaved L,R int16) at 48 kHz
         void render(int16_t *out, size_t frames);
         bool anyActivity() const;
+        // CL-0223: host-side volumes (settings audio.sfx / audio.stream), 0..1: SPU2 voices and the AutoDMA stream
+        static void setGains(float voices, float stream);
     };
 }

@@ -224,6 +224,12 @@ private:
     std::array<uint64_t, kMaxDecodedPairs> m_noFlagGen{};
     std::array<uint8_t, kMaxDecodedPairs> m_noFlagVal{};
     bool programReadsNoFlags(const uint8_t *vuCode, uint32_t startPC);
+    // CL-0218: ahead-of-time compiled programs (src/lib/vu/ps2_vu1_native.h); selection cached per entry pair and code generation
+    friend struct Vu1Native;
+    typedef int (*NativeFn)(VU1Interpreter &vu, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint64_t limit);
+    std::array<uint64_t, kMaxDecodedPairs> m_natGen{};
+    std::array<NativeFn, kMaxDecodedPairs> m_natFn{};
+    NativeFn nativeLookup(const uint8_t *vuCode, uint32_t pairIndex, uint64_t generation);
     const DecodedInstructionPair &decodedEntry(const uint8_t *vuCode, uint32_t pairIndex);
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;

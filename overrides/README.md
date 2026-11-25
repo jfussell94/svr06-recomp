@@ -1,1 +1,1 @@
-Hand-written runtime hooks only. Overlay banks (ovl*/ovx*), recompiled functions (sub_*/entry_*) and *_functions.h are generated from your own disc and are git-ignored.
+Hand-written runtime hooks only. `overrides/usa/` holds the USA (SLUS-21286) hooks with USA addresses; the files next to this README are the PAL reference. Overlay banks (ovl*/ovx*), recompiled functions (sub_*/entry_*) and *_functions.h are generated from your own disc and are git-ignored.

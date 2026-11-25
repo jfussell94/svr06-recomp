@@ -1,5 +1,11 @@
+#include <chrono>
 #include <cstdio>
+#include <cstdint>
+#include <cstdlib>
 void svr06VifFence(); // CL-0127 (ps2_memory.cpp)
+void svr06VifFenceS(int site); // CL-0295
+bool svr06VifAsyncOn(); // CL-0232 (ps2_memory.cpp)
+void svr06VifFrameThrottle(uint64_t vsyncTick); // CL-0237 (ps2_memory.cpp)
 #include <atomic>
 std::atomic<unsigned> g_svr06Ord{0};
 void svr06MtgsWaitIdle(); // gs_frontend.cpp (global)
@@ -123,7 +129,14 @@ namespace ps2_stubs
                 return;
             }
 
-            runtime->memory().processPendingTransfers(); ::svr06VifFence(); runtime->gifArbiter().drain(); // ISS-132: keep direct register writes ordered after queued GIF data
+            { // CL-0284: time the ordering drain (VIF/VU1 fence) the game thread waits on before each GS clear
+                const auto t0 = std::chrono::steady_clock::now();
+                runtime->memory().processPendingTransfers(); ::svr06VifFenceS(10); runtime->gifArbiter().drain(); // ISS-132: keep direct register writes ordered after queued GIF data
+                static uint64_t s_n = 0, s_ns = 0, s_max = 0; static auto s_last = t0;
+                const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+                ++s_n; s_ns += ns; if (ns > s_max) s_max = ns;
+                if (t0 - s_last >= std::chrono::seconds(3)) { std::fprintf(stderr, "[gsclear] 3s: n=%llu fence=%.1fms max=%.2fms\n", (unsigned long long)s_n, s_ns / 1e6, s_max / 1e6); s_n = s_ns = s_max = 0; s_last = t0; }
+            }
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);
@@ -357,7 +370,7 @@ namespace ps2_stubs
             {
                 packetQwords >>= 1u;
             }
-            if (flag != 2u)
+            if (flag < 2u) // CL-0221 upstream e563698: IMAGE (2) and FLG=3 count qwords directly
             {
                 uint32_t nreg = static_cast<uint32_t>((tagValue >> 60u) & 0xFu);
                 if (nreg == 0u)
@@ -639,8 +652,28 @@ namespace ps2_stubs
             return;
         }
 
+        // CL-0314c: never read past the end of EE RAM (a missing per-slot picture gave an ~8 MB image from near the top of RAM -> host access violation)
+        uint32_t availBytes = 0xFFFFFFFFu;
+        if ((srcAddr >> 28) != 7u) { const uint32_t phys = srcAddr & 0x1FFFFFFFu; availBytes = phys < 0x2000000u ? 0x2000000u - phys : 0u; }
+        if (availBytes < totalImageBytes) { static int cl_ = 0; if (cl_++ < 8) { if (FILE *cf = std::fopen("analysis/live/clamp.txt", "a")) { std::fprintf(cf, "LoadImage clamped src=%08X bytes=%08X avail=%08X w=%d h=%d psm=%d ra=%08X\n", srcAddr, totalImageBytes, availBytes, (int)img.width, (int)img.height, (int)img.psm, getRegU32(ctx, 31)); std::fclose(cf); } } }
+        if (availBytes < totalImageBytes) { // [cl0314d] one-shot register + struct dump for the bogus image
+            static int d_ = 0;
+            if (d_++ < 2) if (FILE *df = std::fopen("analysis/live/clampregs.txt", "a")) {
+                std::fprintf(df, "--- clamp event %d ra=%08X\n", d_, getRegU32(ctx, 31));
+                for (int r = 2; r < 32; ++r) std::fprintf(df, "r%d=%08X%s", r, getRegU32(ctx, r), (r % 6 == 1) ? "\n" : " ");
+                std::fprintf(df, "\n");
+                for (int r : {4, 5, 16, 17, 18, 19, 20, 21, 22, 23}) {
+                    const uint32_t b = getRegU32(ctx, r) & 0x1FFFFFFFu;
+                    if (b > 0x2000000u - 0x100u) continue;
+                    std::fprintf(df, "mem@r%d=%08X:", r, b);
+                    for (int w = -4; w < 28; ++w) { uint32_t v = 0; if ((int64_t)b + w * 4 >= 0) std::memcpy(&v, rdram + b + w * 4, 4); std::fprintf(df, " %08X", v); }
+                    std::fprintf(df, "\n");
+                }
+                std::fclose(df);
+            }
+        }
         uint32_t dbp = static_cast<uint32_t>(img.vram_addr); // libgraph: DBP is in 64-word units, passed through unchanged
-        { static int c2=0, c3=0; if(c2++<400 || (dbp>=0x3D00u && c3++<600)){ uint64_t sum=0; for(uint32_t k=0;k<totalImageBytes && k<65536;k+=4){uint32_t v; std::memcpy(&v,src+k,4); sum+=(v!=0);} std::cout<<std::hex<<"[gsapi] LoadImage seq="<<std::dec<<(++g_svr06Ord)<<std::hex<<" dbp=0x"<<dbp<<" dbw="<<fbw<<" psm="<<(int)img.psm<<" x="<<std::dec<<img.x<<" y="<<img.y<<" w="<<img.width<<" h="<<img.height<<" bytes="<<totalImageBytes<<" nonzeroWordsInFirst64K="<<sum<<" src=0x"<<std::hex<<srcAddr<<" ra=0x"<<getRegU32(ctx,31)<<" sp=0x"<<getRegU32(ctx,29)<<" ra1=0x"<<[&](){uint32_t v=0; std::memcpy(&v,rdram+((getRegU32(ctx,29)+0x90)&0x1ffffff),4); return v;}()<<" ra2=0x"<<[&](){uint32_t v=0; uint32_t f=getRegU32(ctx,29)+0x110; std::memcpy(&v,rdram+((f+0x40)&0x1ffffff),4); return v;}()<<std::dec<<std::endl; } }
+        { static int c2=0, c3=0; if(c2++<400 || (dbp>=0x3D00u && c3++<600)){ uint64_t sum=0; for(uint32_t k=0;k<totalImageBytes && k<65536 && k+4u<=availBytes;k+=4){uint32_t v; std::memcpy(&v,src+k,4); sum+=(v!=0);} std::cout<<std::hex<<"[gsapi] LoadImage seq="<<std::dec<<(++g_svr06Ord)<<std::hex<<" dbp=0x"<<dbp<<" dbw="<<fbw<<" psm="<<(int)img.psm<<" x="<<std::dec<<img.x<<" y="<<img.y<<" w="<<img.width<<" h="<<img.height<<" bytes="<<totalImageBytes<<" nonzeroWordsInFirst64K="<<sum<<" src=0x"<<std::hex<<srcAddr<<" ra=0x"<<getRegU32(ctx,31)<<" sp=0x"<<getRegU32(ctx,29)<<" ra1=0x"<<[&](){uint32_t v=0; std::memcpy(&v,rdram+((getRegU32(ctx,29)+0x90)&0x1ffffff),4); return v;}()<<" ra2=0x"<<[&](){uint32_t v=0; uint32_t f=getRegU32(ctx,29)+0x110; std::memcpy(&v,rdram+((f+0x40)&0x1ffffff),4); return v;}()<<std::dec<<std::endl; } }
         uint32_t dsax = static_cast<uint32_t>(img.x);
         uint32_t dsay = static_cast<uint32_t>(img.y);
 
@@ -667,14 +700,15 @@ namespace ps2_stubs
                 const uint64_t tag = (static_cast<uint64_t>(2) << 58) | static_cast<uint64_t>(n) | ((t + 1u == imageTags) ? (1ULL << 15) : 0ULL);
                 std::memcpy(wp, &tag, 8); std::memset(wp + 8, 0, 8); wp += 16;
                 const uint32_t off = doneQ * 16u;
-                const uint32_t len = std::min<uint32_t>(n * 16u, totalImageBytes - off);
+                uint32_t len = std::min<uint32_t>(n * 16u, totalImageBytes - off);
+                len = (off < availBytes) ? std::min<uint32_t>(len, availBytes - off) : 0u;   // CL-0314c
                 std::memcpy(wp, src + off, len); // tail of the last qword stays zero
                 wp += static_cast<size_t>(n) * 16u;
                 doneQ += n;
             }
         }
 
-        runtime->memory().processPendingTransfers(); ::svr06VifFence();
+        runtime->memory().processPendingTransfers(); ::svr06VifFenceS(11);
         runtime->gifArbiter().submit(GifPathId::Path3, hostPkt.data(), static_cast<uint32_t>(hostPkt.size()));
         runtime->gifArbiter().drain();
 
@@ -724,8 +758,27 @@ namespace ps2_stubs
                           (static_cast<uint64_t>(0u) << 48);
         uint64_t trxreg = static_cast<uint64_t>(img.height) << 32 | static_cast<uint64_t>(img.width);
 
+        // CL-0295: depth-buffer readbacks (Z32/Z24/Z16, psm 0x30-0x3F) return no data on the Vulkan GS (the software path below
+        // reported got=0 for every one), yet the fence + GIF drain + MTGS wait in front of them flushed the whole async pipeline
+        // ~27 times per second in entrances and matches (3-11 ms game-thread stalls each, the main source of the frame dips).
+        // The game reads a few Z pixels for light/flare occlusion. Skip the flush and the transfer: dst stays as it was, which is
+        // exactly what the game received before. SVR06_ZREADSYNC=1 restores the old flush.
+        if (gsvk::enabled() && (img.psm & 0x30u) == 0x30u && !::svr06GsShadow())
+        {
+            static const bool s_zsync = std::getenv("SVR06_ZREADSYNC") != nullptr;
+            if (!s_zsync)
+            {
+                static uint64_t s_zn = 0;
+                const uint64_t zn = ++s_zn;
+                if ((zn & (zn - 1u)) == 0u)
+                    std::fprintf(stderr, "[storeimg-z] skipped Z readback #%llu psm=%X %ux%u sbp=%X (no data on the Vulkan GS; pipeline flush avoided)\n",
+                                 (unsigned long long)zn, (unsigned)img.psm, (unsigned)img.width, (unsigned)img.height, sbp);
+                setReturnS32(ctx, 0);
+                return;
+            }
+        }
         // ISS-130: finish queued DMA/GIF work (restore tile uploads, CLUT uploads) before the readback; without this the save captured stale VRAM
-        runtime->memory().processPendingTransfers(); ::svr06VifFence();
+        runtime->memory().processPendingTransfers(); ::svr06VifFenceS(12);
         runtime->gifArbiter().drain();
         ::svr06MtgsWaitIdle(); // ISS-130: the GS worker queue must be empty too, or the save reads VRAM that is missing the newest uploads/draws (skin set saved stale, restored over the live skin)
         if (gsvk::enabled() && img.psm == 0u && !::svr06GsShadow())
@@ -877,7 +930,7 @@ namespace ps2_stubs
                         mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
                         mem.writeIORegister(GIF_CHANNEL + 0x20u, 8u);
                         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
-                        mem.processPendingTransfers(); ::svr06VifFence();
+                        mem.processPendingTransfers(); ::svr06VifFenceS(13);
                         runtime->guestFree(pktAddr);
                     }
                     else
@@ -925,7 +978,12 @@ namespace ps2_stubs
         }
 
         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
+        // CL-0379: real libgs seeds the DBuffDc display env with read circuit 2 only (PMODE 0x66: EN1=0 EN2=1 MMOD=1 AMOD=1,
+        // confirmed in every PCSX2 GS dump of the Season cutscene). The old seed (EN1+EN2, ALP=0x80) blended circuit 1 at a fixed
+        // DISPFB over circuit 2 at 50%; when the game flips DISPFB2 itself (256/320) in Season cutscenes, circuit 1 kept showing
+        // the buffer being drawn -> black arena, wrestlers cut at the waist, good/bad flicker. SVR06_OLDPMODE=1 restores the old seed.
+        static const bool s_oldPmode = std::getenv("SVR06_OLDPMODE") != nullptr;
+        const uint64_t pmode = s_oldPmode ? makePmode(1u, 1u, 0u, 0u, 0u, 0x80u) : makePmode(0u, 1u, 1u, 1u, 0u, 0u);
         const uint64_t smode2 =
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
@@ -1227,7 +1285,7 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear0))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
-                ::svr06VifFence(); runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
+                ::svr06VifFenceS(14); runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
             }
             applyGsClearPacket(runtime, db.clear0);
         }
@@ -1238,7 +1296,7 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear1))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
-                ::svr06VifFence(); runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
+                ::svr06VifFenceS(14); runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
             }
             applyGsClearPacket(runtime, db.clear1);
         }
@@ -1280,7 +1338,11 @@ namespace ps2_stubs
 
         if (mode == 0)
         {
-            mem.processPendingTransfers(); ::svr06VifFence();
+            // CL-0231: no worker fence here. DMA completes at the kick (CHCR/D_STAT already final) and the worker only consumes a copy of the data;
+            // every consumer of worker-owned state has its own fence site. SVR06_SYNCFENCE=1 restores the old behaviour.
+            static const bool oldFence = [] { const char *v = std::getenv("SVR06_SYNCFENCE"); return v && *v == '1'; }();
+            mem.processPendingTransfers(); if (oldFence) ::svr06VifFenceS(15);
+            { if (!oldFence && ::svr06VifAsyncOn()) { ::svr06VifFrameThrottle(mem.gs().vsyncTick.load(std::memory_order_acquire)); setReturnS32(ctx, 0); return; } } // CL-0232: async worker owns the GIF path; the DMA is already final at the kick, so do not poll (and fence on) the GIF FIFO/STAT registers
 
             uint32_t count = 0;
             constexpr uint32_t kTimeout = 0x1000000;
@@ -1326,14 +1388,19 @@ namespace ps2_stubs
         else
         {
             uint32_t result = 0;
+            // CL-0235: with the async VIF1/GIF worker the VIF1_STAT / GIF_STAT reads fence the worker, and the game polls mode 1 in a
+            // loop (47% of the match game thread). DMA completes at the kick, so report only the DMA channels; VIF1/GIF count as idle.
+            static const bool oldFence1 = [] { const char *v = std::getenv("SVR06_SYNCFENCE"); return v && *v == '1'; }();
+            const bool vifAsync = !oldFence1 && ::svr06VifAsyncOn();
+            if (vifAsync) ::svr06VifFrameThrottle(mem.gs().vsyncTick.load(std::memory_order_acquire)); // CL-0237
 
             if ((mem.readIORegister(0x10009000) & 0x100) != 0)
                 result |= 1;
             if ((mem.readIORegister(0x1000A000) & 0x100) != 0)
                 result |= 2;
-            if ((mem.readIORegister(0x10003C00) & 0x1F000003) != 0)
+            if (!vifAsync && (mem.readIORegister(0x10003C00) & 0x1F000003) != 0)
                 result |= 4;
-            if ((mem.readIORegister(0x10003020) & 0xC00) != 0)
+            if (!vifAsync && (mem.readIORegister(0x10003020) & 0xC00) != 0)
                 result |= 0x10;
 
             setReturnS32(ctx, result);

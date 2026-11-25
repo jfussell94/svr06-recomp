@@ -90,6 +90,11 @@ _luirefs(code_lo, code_hi, w)
 for _lo, _hi, _b, _ob in _others:
     _luirefs(_lo, _hi, lambda a, _b=_b, _ob=_ob: struct.unpack_from('<I', _b, a - _ob)[0] if 0 <= a - _ob < len(_b) - 3 else 0)
 print('hidden function starts added', _hidden)
+# (CL-0373) extra entry points for mid-function re-entry (return addresses reached through coroutine-style returns):
+# SVR06_EXTRA_EPS="0x564E10,0x5661A0" -- each becomes its own function start (must lie inside this overlay's code)
+for _t in filter(None, os.environ.get('SVR06_EXTRA_EPS', '').split(',')):
+    _t = int(_t, 16)
+    if code_lo <= _t < code_hi and _t % 4 == 0: eps.add(_t)
 eps = sorted(eps)
 open(f'{bank}.toml', 'w').write(f'# {bank} = {name} (MWo3 id {oid}) from {os.path.basename(dump)}\n[general]\ninput = "{bank}.elf"\nghidra_output = ""\noutput = "out/"\nsingle_file_output = false\npatch_syscalls = false\npatch_cop0 = true\npatch_cache = true\nstubs = []\nentry_points = [\n' + ''.join(f'  "0x{e:08X}",\n' for e in eps) + ']\n')
 r = subprocess.run([os.environ.get('PS2_RECOMP', os.path.expanduser('~/prc/ps2xRecomp/bl/ps2_recomp')), f'{bank}.toml'], capture_output=True, text=True)

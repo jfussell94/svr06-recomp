@@ -6,7 +6,10 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib> // CL-0262
 extern std::atomic<uint32_t> g_svr06Diag;
+// CL-0262: per-UNPACK analysis aids ([zrace] scanned up to 2 KB of RAM per UNPACK, [unp320] logging) only with SVR06_VIFDIAG=1
+static const bool s_vifDiag = std::getenv("SVR06_VIFDIAG") != nullptr;
 void svr06PageWatchSet(uint8_t *rdram, uint32_t addr, uint32_t len);
 void svr06HwWatchHost(uint8_t *hostBase, uint32_t addr, uint32_t len);
 extern uint8_t *g_svr06Scratchpad;
@@ -67,7 +70,7 @@ namespace
                 payloadBytes = static_cast<uint64_t>(nloop) * nreg * 8ull;
                 payloadBytes = (payloadBytes + 15ull) & ~15ull;
             }
-            else if (flg == kGifFmtImage)
+            else if (flg == kGifFmtImage || flg == 3u) // CL-0221 upstream e563698
             {
                 payloadBytes = static_cast<uint64_t>(nloop) * 16ull;
                 const uint64_t availableBytes = sizeBytes - offset;
@@ -679,7 +682,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            {   // [zrace] ISS-132 analysis aid: UNPACKs whose first 64 source bytes are all zero; re-check the same RAM later (race vs never-written)
+            if (s_vifDiag) {   // [zrace] ISS-132 analysis aid: UNPACKs whose first 64 source bytes are all zero; re-check the same RAM later (race vs never-written)
                 static std::atomic<int> s_zn{0}, s_zres{0}, s_zstill{0}, s_zall{0};
                 struct Pend { uint32_t ga; uint32_t vuAddr; uint32_t num; uint32_t age; };
                 static Pend pend[32]; static int npend = 0;
@@ -710,7 +713,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
                 }
             }
-            {   // [unp320] ISS-132 analysis aid: UNPACKs that cover VU1 data qword 0x320 (per-batch loop-count block)
+            if (s_vifDiag) {   // [unp320] ISS-132 analysis aid: UNPACKs that cover VU1 data qword 0x320 (per-batch loop-count block)
                 static std::atomic<int> s_u3{0};
                 if (vuAddr <= 0x320u && (vuAddr + writeVectorCount) > 0x320u)
                 {
@@ -760,7 +763,36 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 break;
             }
             ++s_vev_n; s_vev_qw += writeVectorCount; s_vev_lo = std::min(s_vev_lo, vuAddr); s_vev_hi = std::max(s_vev_hi, vuAddr + writeVectorCount);
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            // CL-0262: fast UNPACK for the common case (no mask, MODE 0, CL == WL, 32/16/8-bit formats): destination qwords are
+            // consecutive and every write reads one source vector, so the generic per-lane mask/mode loop reduces to plain stores.
+            // Same results as the generic loop below (missing components keep the old lanes, S-xx broadcasts, 16/8-bit sign/zero extend).
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && !maskEnable && (vif1_regs.mode & 3u) == 0u && cl == wl && vl != 3u)
+            {
+                const uint8_t *src = data + pos;
+                const uint32_t nc = static_cast<uint32_t>(components);
+                for (uint32_t i = 0; i < writeVectorCount; ++i, src += bytesPerVector)
+                {
+                    uint8_t *dst = m_vu1Data + ((vuAddr + i) & 0x3FFu) * 16u;
+                    if (vl == 0u)
+                    {
+                        if (nc == 4u) std::memcpy(dst, src, 16);
+                        else if (nc == 1u) { uint32_t sc; std::memcpy(&sc, src, 4); const uint32_t v[4] = {sc, sc, sc, sc}; std::memcpy(dst, v, 16); }
+                        else std::memcpy(dst, src, nc * 4u);
+                    }
+                    else
+                    {
+                        uint32_t v[4]; std::memcpy(v, dst, 16);
+                        for (uint32_t c = 0; c < nc; ++c)
+                        {
+                            if (vl == 1u) { uint16_t r; std::memcpy(&r, src + c * 2u, 2); v[c] = zeroExtend ? static_cast<uint32_t>(r) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(r))); }
+                            else { const uint8_t r = src[c]; v[c] = zeroExtend ? static_cast<uint32_t>(r) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(r))); }
+                        }
+                        if (nc == 1u) { v[1] = v[0]; v[2] = v[0]; v[3] = v[0]; }
+                        std::memcpy(dst, v, 16);
+                    }
+                }
+            }
+            else if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;

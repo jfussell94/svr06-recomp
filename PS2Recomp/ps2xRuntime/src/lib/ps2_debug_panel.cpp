@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -2329,6 +2330,184 @@ namespace
 }
 // ---- end flag editor ----
 
+// ---- CL-0390 in-game debugger tab (SvrDebugger.cpp) ----
+void svr06PageWatchSet(uint8_t *rdram, uint32_t addr, uint32_t len);
+void svr06HwWatchRwMode(int readsToo);
+namespace svrdbg
+{
+std::string disasm(uint32_t pc, uint32_t w);
+std::string bpAdd(uint32_t addr, int mode, bool hasCond, uint32_t condReg, uint32_t condVal);
+std::string bpDel(uint32_t addr);
+std::string bpList();
+bool isPaused();
+uint32_t pausedAddr();
+uint32_t pausedSp();
+void resume();
+std::string regsText();
+std::vector<std::string> logTail(size_t n);
+void logClear();
+std::string findFirst(int sz, uint32_t val, uint32_t lo, uint32_t hi);
+std::string findNext(const std::string &mode, uint32_t val);
+std::vector<std::pair<uint32_t, uint32_t>> findResults(size_t maxN);
+size_t findCount();
+std::string threadsText();
+std::vector<uint32_t> backtrace(uint32_t sp, int maxFrames);
+void attach(PS2Runtime *rt);
+}
+void drawDebuggerTab(PS2Runtime &runtime)
+{
+    static uint32_t s_bpAddr = 0, s_disAddr = 0x100000, s_findVal = 0, s_findLo = 0x100000, s_findHi = 0x2000000, s_wpAddr = 0, s_wpLen = 4;
+    static int s_bpMode = 0, s_findType = 2, s_nextMode = 0;
+    static bool s_wpRead = false, s_condOn = false;
+    static int s_condReg = 0; static uint32_t s_condVal = 0;
+    static std::string s_msg;
+    uint8_t *rdram = runtime.memory().getRDRAM();
+    auto rd32 = [rdram](uint32_t a) { uint32_t v = 0; a &= 0x1FFFFFFu; if (rdram && a <= 0x2000000u - 4u) std::memcpy(&v, rdram + a, 4); return v; };
+    if (svrdbg::isPaused())
+    {
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1), "GAME THREAD PAUSED at breakpoint %08X", svrdbg::pausedAddr());
+        ImGui::SameLine();
+        if (ImGui::Button("Continue (F5)") || ImGui::IsKeyPressed(ImGuiKey_F5)) svrdbg::resume();
+        ImGui::SameLine();
+        if (ImGui::Button("Show code")) s_disAddr = svrdbg::pausedAddr();
+    }
+    if (!s_msg.empty()) ImGui::TextDisabled("%s", s_msg.c_str());
+    if (!ImGui::BeginTabBar("dbg-sub")) return;
+    if (ImGui::BeginTabItem("Breakpoints"))
+    {
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputScalar("Function", ImGuiDataType_U32, &s_bpAddr, nullptr, nullptr, "%08X", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+        const char *modes[] = {"Log", "Pause", "Count"};
+        ImGui::Combo("##mode", &s_bpMode, modes, 3);
+        ImGui::SameLine(); ImGui::Checkbox("only if", &s_condOn);
+        if (s_condOn)
+        {
+            ImGui::SameLine(); ImGui::SetNextItemWidth(60);
+            const char *regs[] = {"a0", "a1", "a2", "a3"};
+            ImGui::Combo("##creg", &s_condReg, regs, 4);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(100);
+            ImGui::InputScalar("==", ImGuiDataType_U32, &s_condVal, nullptr, nullptr, "%08X", ImGuiInputTextFlags_CharsHexadecimal);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add")) s_msg = svrdbg::bpAdd(s_bpAddr, s_bpMode, s_condOn, 4u + static_cast<uint32_t>(s_condReg), s_condVal);
+        ImGui::SameLine();
+        if (ImGui::Button("Remove")) s_msg = svrdbg::bpDel(s_bpAddr);
+        ImGui::SameLine();
+        if (ImGui::Button("Remove all")) s_msg = svrdbg::bpDel(0);
+        ImGui::TextDisabled("Breakpoints sit on function entries (native build: no single-instruction stepping). Log also goes to analysis/live/dbg.txt");
+        ImGui::BeginChild("bplist", ImVec2(0, 110), true);
+        ImGui::TextUnformatted(svrdbg::bpList().c_str());
+        ImGui::EndChild();
+        if (svrdbg::isPaused())
+        {
+            ImGui::BeginChild("regs", ImVec2(0, 170), true);
+            ImGui::TextUnformatted(svrdbg::regsText().c_str());
+            std::string bt = "call stack:";
+            for (uint32_t r : svrdbg::backtrace(svrdbg::pausedSp(), 16)) { char b[16]; std::snprintf(b, sizeof b, " %08X", r); bt += b; }
+            ImGui::TextWrapped("%s", bt.c_str());
+            ImGui::EndChild();
+        }
+        if (ImGui::Button("Clear log")) svrdbg::logClear();
+        ImGui::BeginChild("bplog", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+        for (const std::string &s : svrdbg::logTail(300)) ImGui::TextUnformatted(s.c_str());
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Disassembly"))
+    {
+        ImGui::SetNextItemWidth(110);
+        ImGui::InputScalar("Address", ImGuiDataType_U32, &s_disAddr, nullptr, nullptr, "%08X", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::SameLine(); if (ImGui::Button("-0x100")) s_disAddr -= 0x100;
+        ImGui::SameLine(); if (ImGui::Button("+0x100")) s_disAddr += 0x100;
+        ImGui::TextDisabled("* = function entry (breakpoint possible). Click an entry to break there; click a jal/branch target to follow it.");
+        ImGui::BeginChild("dis", ImVec2(0, 0), true);
+        s_disAddr &= ~3u;
+        for (uint32_t i = 0; i < 96; ++i)
+        {
+            const uint32_t a = s_disAddr + i * 4u, w = rd32(a);
+            const bool entry = runtime.lookupFunction(a) != nullptr;
+            const std::string d = svrdbg::disasm(a, w);
+            char line[200];
+            std::snprintf(line, sizeof line, "%s%08X  %08X  %s", entry ? "* " : "  ", a, w, d.c_str());
+            ImGui::PushID(static_cast<int>(a));
+            if (ImGui::Selectable(line, svrdbg::isPaused() && svrdbg::pausedAddr() == a))
+            {
+                if (entry) { s_bpAddr = a; s_msg = "function " + std::to_string(a) + " selected: press Add on the Breakpoints tab"; char b[64]; std::snprintf(b, sizeof b, "selected function %08X (Breakpoints tab > Add)", a); s_msg = b; }
+                const size_t x = d.find("0x");
+                if (x != std::string::npos && (d.rfind("j", 0) == 0 || d.rfind("b", 0) == 0)) s_disAddr = static_cast<uint32_t>(std::strtoul(d.c_str() + x, nullptr, 16));
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Threads + stacks"))
+    {
+        ImGui::BeginChild("ths", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::TextUnformatted(svrdbg::threadsText().c_str());
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Memory search"))
+    {
+        const char *types[] = {"u8", "u16", "u32", "f32"};
+        ImGui::SetNextItemWidth(70); ImGui::Combo("type", &s_findType, types, 4);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(110);
+        ImGui::InputScalar("value (hex, f32 bits)", ImGuiDataType_U32, &s_findVal, nullptr, nullptr, "%08X", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::SetNextItemWidth(110); ImGui::InputScalar("from", ImGuiDataType_U32, &s_findLo, nullptr, nullptr, "%08X", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(110); ImGui::InputScalar("to", ImGuiDataType_U32, &s_findHi, nullptr, nullptr, "%08X", ImGuiInputTextFlags_CharsHexadecimal);
+        if (ImGui::Button("First scan")) s_msg = svrdbg::findFirst(s_findType == 0 ? 1 : (s_findType == 1 ? 2 : 4), s_findVal, s_findLo, s_findHi);
+        ImGui::SameLine();
+        const char *nm[] = {"eq", "ne", "inc", "dec", "changed", "same"};
+        ImGui::SetNextItemWidth(90); ImGui::Combo("##next", &s_nextMode, nm, 6);
+        ImGui::SameLine();
+        if (ImGui::Button("Next scan")) s_msg = svrdbg::findNext(nm[s_nextMode], s_findVal);
+        ImGui::Text("%zu results", svrdbg::findCount());
+        ImGui::BeginChild("found", ImVec2(0, 0), true);
+        for (const auto &p : svrdbg::findResults(500))
+        {
+            char b[64]; std::snprintf(b, sizeof b, "%08X = %08X", p.first, p.second);
+            ImGui::PushID(static_cast<int>(p.first));
+            if (ImGui::Selectable(b)) { s_wpAddr = p.first; }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Watchpoints"))
+    {
+        ImGui::SetNextItemWidth(110); ImGui::InputScalar("Address", ImGuiDataType_U32, &s_wpAddr, nullptr, nullptr, "%08X", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(60); ImGui::InputScalar("len", ImGuiDataType_U32, &s_wpLen);
+        ImGui::SameLine(); ImGui::Checkbox("reads too", &s_wpRead);
+        ImGui::SameLine();
+        if (ImGui::Button("Arm")) { svr06HwWatchRwMode(s_wpRead ? 1 : 0); svr06PageWatchSet(rdram, s_wpAddr & 0x1FFFFFFu, s_wpLen ? s_wpLen : 4u); s_msg = "watch armed"; }
+        ImGui::SameLine();
+        if (ImGui::Button("Disarm")) { svr06PageWatchSet(rdram, s_wpAddr & 0x1FFFFFFu, 0); s_msg = "watch disarmed"; }
+        ImGui::TextDisabled("Hits (guest pc / ra of the writing code) from analysis/live/pagew.txt:");
+        ImGui::BeginChild("wplog", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+        static std::vector<std::string> s_lines; static int s_tick = 0;
+        if ((s_tick++ % 30) == 0)
+        {
+            s_lines.clear();
+            std::ifstream f("analysis/live/pagew.txt");
+            std::string ln; std::deque<std::string> q;
+            while (std::getline(f, ln)) { if (ln.find("ctx=") != std::string::npos || ln.find("armed") != std::string::npos) { q.push_back(ln); if (q.size() > 200) q.pop_front(); } }
+            s_lines.assign(q.begin(), q.end());
+        }
+        for (const std::string &s : s_lines) ImGui::TextUnformatted(s.c_str());
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+}
+// ---- end CL-0390 debugger tab ----
+
+bool svr06MenuInstall(void *hwnd);
+int svr06MenuTakeCommand();
+void svr06MenuShowHelp();
+
 void PS2DebugPanel::initialize()
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
@@ -2359,20 +2538,46 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
+    svrdbg::attach(&runtime); // CL-0390
+    static bool s_menuTried = false, s_dbgOpen = false;
+    if (!s_menuTried) { s_menuTried = true; svr06MenuInstall(GetWindowHandle()); }
+    auto liveCmd = [](const char *c) { std::error_code ec; std::filesystem::create_directories("analysis/live", ec); std::ofstream f("analysis/live/cmd.txt", std::ios::app); f << c << "\n"; };
+    switch (svr06MenuTakeCommand())
+    {
+    case 1001: toggleVisible(); break;
+    case 1002: s_dbgOpen = !s_dbgOpen; break;
+    case 1004: svr06ResetGame(); break;
+    case 1005: ps2settings::set("graphics.fullscreen", ps2settings::getInt("graphics.fullscreen", 0) ? 0 : 1); break;
+    case 1006: ps2settings::set("graphics.showFps", ps2settings::getInt("graphics.showFps", 1) ? 0 : 1); break;
+    case 1007: svrdbg::resume(); break;
+    case 1008: svrdbg::bpDel(0); break;
+    case 1009: liveCmd("quit"); break;
+    case 1010: liveCmd("shot"); break;
+    case 1011: liveCmd("ramdump"); break;
+    case 1012: liveCmd("vramdump"); break;
+    case 1020: svr06MenuShowHelp(); break;
+    default: break;
+    }
+    if (IsKeyPressed(KEY_F2))
+        s_dbgOpen = !s_dbgOpen;
+    if (IsKeyPressed(KEY_F5) && svrdbg::isPaused())
+        svrdbg::resume();
+
     if (IsKeyPressed(KEY_F1))
     {
         toggleVisible();
     }
 
-    if (!m_visible)
+    if (!m_visible && !s_dbgOpen)
     {
         return;
     }
 
     rlImGuiBegin();
+    const bool showMain = m_visible;
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
+    if (showMain && ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
     {
         if (ImGui::BeginMenuBar())
         {
@@ -2390,7 +2595,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             if (ImGui::BeginMenu("Settings")) { ImGui::TextDisabled("Graphics / Audio / Controls: see the Settings tab"); ImGui::EndMenu(); }
             if (ImGui::BeginMenu("Enhancements")) { ImGui::TextDisabled("(in development) - see the Settings tab"); ImGui::EndMenu(); }
             if (ImGui::BeginMenu("Cheats")) { ImGui::TextDisabled("(in development) - see the Settings tab"); ImGui::EndMenu(); }
-            if (ImGui::BeginMenu("Developer")) { ImGui::MenuItem("Registers", nullptr, &m_showRegisters); ImGui::TextDisabled("Tools: tabs CPU, Threads, GS, Logs, Memory"); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Developer")) { ImGui::MenuItem("Registers", nullptr, &m_showRegisters); if (ImGui::MenuItem("Debugger (F2)")) s_dbgOpen = true; ImGui::TextDisabled("Tools: tabs CPU, Threads, GS, Logs, Memory"); ImGui::EndMenu(); }
             ImGui::EndMenuBar();
         }
 
@@ -2478,7 +2683,15 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             ImGui::EndTabBar();
         }
     }
-    ImGui::End();
+    if (showMain)
+        ImGui::End();
+    if (s_dbgOpen)
+    {
+        ImGui::SetNextWindowSize(ImVec2(940.0f, 680.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("SvR06 Debugger (F2)", &s_dbgOpen))
+            drawDebuggerTab(runtime);
+        ImGui::End();
+    }
 
     rlImGuiEnd();
 #else

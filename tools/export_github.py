@@ -4,7 +4,7 @@ usage: python tools/export_github.py <out_dir> [--old-repo <existing git checkou
 Writes <out_dir>/ and DELETED_FROM_REPO.txt (files in the old repo that no longer exist). Safe to re-run (output is rebuilt)."""
 import os, re, sys, shutil, subprocess, json, time
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.dirname(HERE)
-RT_SRC = os.path.abspath(os.path.join(ROOT, '..', 'PS2Recomp'))
+RT_SRC = os.path.abspath(os.environ.get('SVR06_RT_SRC') or os.path.join(ROOT, '..', 'PS2Recomp'))  # SVR06_RT_SRC=..\PS2Recomp_usa vendors the USA runtime (CL-0396)
 out = os.path.abspath(sys.argv[1]); old = None
 if '--old-repo' in sys.argv: old = os.path.abspath(sys.argv[sys.argv.index('--old-repo') + 1])
 os.makedirs(out, exist_ok=True)   # files are overwritten in place (a connected-folder shell cannot delete)
@@ -27,9 +27,17 @@ def walk(base, exts=None, skipdirs=(), maxsize=1500000, skipnames=lambda n: Fals
             except OSError: continue
             yield p, os.path.relpath(p, base)
 # ---- original code
-for p, r in walk(os.path.join(ROOT, 'tools'), {'.py', '.sh', '.ps1', '.cmd', '.md', '.txt', '.js', '.css', '.html', '.cpp', '.h'}, skipdirs=('__pycache__', 'codeaudit'),
-                 skipnames=lambda n: n in ('progress.json', 'game_completion.json')):
+# CL-0271: never publish game-derived VU1 data (tools/vu1bench/img, natlist.txt) or the native programs generated from it
+NEVER = ('ps2_vu1_native_gen.cpp', 'natlist.txt', 'native_gen.cpp', 'empty_gen.cpp')
+for p, r in walk(os.path.join(ROOT, 'tools'), {'.py', '.sh', '.ps1', '.cmd', '.md', '.txt', '.js', '.css', '.html', '.cpp', '.h', '.woff2'}, skipdirs=('__pycache__', 'codeaudit', 'img', '_to_delete'),
+                 skipnames=lambda n: n in ('progress.json', 'game_completion.json') or n in NEVER):
     put(p, 'tools/' + r)
+# CL-0271: launcher artwork (original work): app icon, launcher icon, font licence
+for rel in ('tools/launcher/ui/icon.png', 'tools/launcher/ui/fonts/OFL-Archivo.txt'):
+    if os.path.exists(os.path.join(ROOT, rel)): put(os.path.join(ROOT, rel), rel)
+for p, r in walk(os.path.join(ROOT, 'art'), {'.png', '.ico'}, maxsize=3000000):
+    put(p, 'art/' + r)
+if os.path.exists(os.path.join(ROOT, 'docs', 'images', 'logo.png')): put(os.path.join(ROOT, 'docs', 'images', 'logo.png'), 'docs/images/logo.png')
 for p, r in walk(os.path.join(ROOT, 'scripts'), {'.ps1', '.cmd', '.sh', '.py'}, skipnames=lambda n: n.startswith('_') or n in ('probe_env.cmd',)):
     put(p, 'scripts/' + r)
 NOGAMEDOC = re.compile(r'(FILE_LOOKUP|GAME_FILE_INVENTORY|DPAC_TOC|MUSIC_LIST_MAP|COLLISION_MAP|PUBLISH_code-audit)', re.I)
@@ -41,10 +49,15 @@ HAND = ['svr06_engine.h', 'svr06_funcs.h', 'svr06_hot_api.h', 'svr06_hotload.cpp
 for f in HAND:
     s = os.path.join(ROOT, 'overrides', f)
     if os.path.exists(s): put(s, 'overrides/' + f)
-text('overrides/README.md', 'Hand-written runtime hooks only. Overlay banks (ovl*/ovx*), recompiled functions (sub_*/entry_*) and *_functions.h are generated from your own disc and are git-ignored.\n')
+USA_RUN = os.path.abspath(os.path.join(ROOT, '..', 'PS2Recomp_usa', 'ps2xRuntime', 'src', 'runner'))  # CL-0396: USA hand-edited hooks (USA addresses)
+for f in ('svr06_overrides.cpp', 'svr06_funcs.h', 'svr06_hotload.cpp', 'svr06_overlay.cpp'):
+    s = os.path.join(USA_RUN, f)
+    if os.path.exists(s): put(s, 'overrides/usa/' + f)
+text('overrides/README.md', 'Hand-written runtime hooks only. `overrides/usa/` holds the USA (SLUS-21286) hooks with USA addresses; the files next to this README are the PAL reference. Overlay banks (ovl*/ovx*), recompiled functions (sub_*/entry_*) and *_functions.h are generated from your own disc and are git-ignored.\n')
 # ---- regions
 REG = json.load(open(os.path.join(ROOT, 'regions', 'regions.json')))
 put(os.path.join(ROOT, 'regions', 'regions.json'), 'regions/regions.json')
+put(os.path.join(ROOT, 'regions', 'regions.json'), 'release/regions.json')   # CL-0271: README and packaging refer to release/regions.json
 for r in REG['regions']:
     rid = r['id']
     src = os.path.join(ROOT, r['recomp_config'])
@@ -67,7 +80,7 @@ Shared code (runtime, launcher, tools) is region independent; region-specific ho
 ''')
 # ---- vendored PS2Recomp (upstream + our runtime changes)
 GEN = re.compile(r'^(sub_|entry_|ovl[A-Za-z]|ovx|ps2_recompiled_|register_functions)|_functions\.h$')
-def rt_ok(f): return not GEN.search(f)
+def rt_ok(f): return not GEN.search(f) and f != 'ps2_vu1_native_gen.cpp'   # CL-0271: generated from the game's VU1 microcode, never published
 oldlist = []
 if old:
     try: oldlist = subprocess.run(['git', 'ls-files'], cwd=old, capture_output=True, text=True, timeout=60).stdout.split('\n')
@@ -86,7 +99,7 @@ for f in ('ps2xRuntime/CMakeLists.txt', 'ps2xIOP/CMakeLists.txt'):
     if rel not in seen and os.path.exists(os.path.join(RT_SRC, f)): put(os.path.join(RT_SRC, f), rel)
 # ---- repo scaffolding
 shutil.copyfile(os.path.join(ROOT, 'tools', 'github_templates', '.gitignore'), os.path.join(out, '.gitignore')) if os.path.exists(os.path.join(ROOT, 'tools', 'github_templates', '.gitignore')) else None
-for f in ('.gitignore', '.gitattributes', 'README.md', 'BUILDING.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'release/README.md', 'release/package_release.py',
+for f in ('.gitignore', '.gitattributes', 'README.md', 'BUILDING.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'THIRD_PARTY_NOTICES.md', 'release/README.md', 'release/package_release.py',
           '.github/workflows/ci.yml', '.github/workflows/release.yml', '.github/workflows/issue-lifecycle.yml', '.github/ISSUE_TEMPLATE/bug_report.yml', '.github/ISSUE_TEMPLATE/config.yml', '.github/labels.json', 'tools/launcher/build_launcher.ps1'):
     t = os.path.join(HERE, 'github_templates', f.replace('/', os.sep))
     if os.path.exists(t): put(t, f)

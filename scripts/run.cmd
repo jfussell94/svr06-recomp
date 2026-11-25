@@ -29,8 +29,8 @@ if not defined ELF (
   goto :eof
 )
 echo Boot ELF: %ELF%
-if not defined SVR06_GSDUMPTICK set "SVR06_GSDUMPTICK=10300"
-if not defined SVR06_GSDUMPLEN set "SVR06_GSDUMPLEN=20"
+rem CL-0284: default GS dump disabled (hitch every run)
+rem (SVR06_GSDUMPLEN default removed)
 set "SVR06_TRACE=1b80f0:TtlA,1b8830:TtlB,1b8b00:TtlC,182ba0:MwStop,199698:SfStop,199718:SfEnd,187e98:MwChk2,187da0:MwChk1,187d78:MwChk0"
 rem ISS-156 bisect: optional per-experiment environment (scripts\probe_env.cmd), delete the file for the normal run
 if exist "%~dp0probe_env.cmd" call "%~dp0probe_env.cmd"

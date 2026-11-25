@@ -601,7 +601,7 @@ namespace ps2_syscalls
             {
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
             }
-            if (iopResult.signalCompletion)
+            else if (iopResult.signalCompletion) // CL-0302: a NOWAIT call signalled the completion semaphore twice
             {
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
             }

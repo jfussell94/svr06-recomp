@@ -2,8 +2,10 @@
 #include "svr06_prof.h"
 #include <fstream>
 #include <atomic>
+#include <cstdlib>
 #include "runtime/ps2_vu1.h"
 #include "ps2_vu1_inline.h"
+#include "ps2_vu1_native.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
@@ -12,6 +14,7 @@
 
 #include <algorithm>
 #include <cfenv>
+#include <xmmintrin.h> // CL-0262
 #include <cmath>
 #include <cstdio>
 #include <chrono>
@@ -1148,7 +1151,7 @@ void VU1Interpreter::progressXgkick()
                     tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
                 else if (format == 1u)
                     tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-                else if (format == 2u)
+                else if (format == 2u || format == 3u) // CL-0221 upstream e563698: FLG=3 = IMAGE
                     tagBytes += static_cast<uint64_t>(nloop) * 16u;
                 else
                 {
@@ -1225,7 +1228,7 @@ void VU1Interpreter::progressXgkick()
                 tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
             else if (format == 1u)
                 tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-            else if (format == 2u)
+            else if (format == 2u || format == 3u) // CL-0221 upstream e563698: FLG=3 = IMAGE
                 tagBytes += static_cast<uint64_t>(nloop) * 16u;
             else
             {
@@ -2259,8 +2262,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
-    const int previousRoundingMode = std::fegetround();
-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    // CL-0262: SSE rounding mode via MXCSR directly (fegetround/fesetround cost ~3% of the VU1 worker at ~400k runs/s); set only when not already round-to-zero
+    const unsigned int vuCsr0 = _mm_getcsr();
+    const bool useVuRounding = (vuCsr0 & 0x6000u) != 0x6000u;
+    if (useVuRounding) _mm_setcsr(vuCsr0 | 0x6000u);
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
     while (m_cycle < budgetEnd && !m_stopRequested)
@@ -2475,8 +2480,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
-    if (useVuRounding && previousRoundingMode != -1)
-        std::fesetround(previousRoundingMode);
+    if (useVuRounding)
+        _mm_setcsr(vuCsr0); // CL-0262
 }
 
 
@@ -2484,11 +2489,46 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 // Fast functional VU1 path (CL-0039): no pipeline timing, results visible
 // immediately.  Verified against the exact interpreter via runChecked().
 // ============================================================================
+// CL-0218: native program selection. A program matches when every pair it was compiled from is still in VU1 code memory.
+static uint64_t s_natRuns = 0, s_natMissRuns = 0;
+VU1Interpreter::NativeFn VU1Interpreter::nativeLookup(const uint8_t *vuCode, uint32_t pairIndex, uint64_t)
+{
+    const uint32_t pc = pairIndex * 8u;
+    const bool vu0 = m_unit == Unit::VU0; // CL-0371: VU0 micro programs have their own table (4 KiB code)
+    const Vu1NativeProg *const tab = vu0 ? g_vu0NativeProgs : g_vu1NativeProgs;
+    const uint32_t cnt = vu0 ? g_vu0NativeProgCount : g_vu1NativeProgCount;
+    for (uint32_t i = 0; i < cnt; ++i)
+    {
+        const Vu1NativeProg &p = tab[i];
+        if (p.entryPc != pc) continue;
+        bool same = true;
+        for (uint32_t k = 0; k < p.pairCount && same; ++k)
+            same = std::memcmp(vuCode + static_cast<uint32_t>(p.pairs[k]) * 8u, &p.words[k * 2u], 8u) == 0;
+        if (same) return p.fn;
+    }
+    return nullptr;
+}
+// Run start PCs without a native program: after 3000 such runs write the 16 KiB code image once (max 6 per PC, 64 in total) so
+// tools/vu1bench/gen can compile it: analysis/live/vu1nat_<pc>_<hash>.bin
+static void svr06NatMiss(const uint8_t *vuCode, uint32_t pc)
+{
+    static uint32_t s_cnt[2048]; static uint8_t s_per[2048]; static uint64_t s_seen[64]; static int s_files = 0;
+    ++s_natMissRuns;
+    const uint32_t pi = (pc >> 3) & 2047u;
+    const uint32_t c = ++s_cnt[pi];
+    if ((c != 3000u && c != 30000u && c != 300000u) || s_files >= 64 || s_per[pi] >= 6u) return;
+    uint64_t h = 1469598103934665603ull;
+    for (uint32_t i = 0; i < 16384u; ++i) { h ^= vuCode[i]; h *= 1099511628211ull; }
+    for (int i = 0; i < s_files; ++i) if (s_seen[i] == (h ^ pc)) return;
+    s_seen[s_files++] = h ^ pc; ++s_per[pi];
+    char nm[96]; std::snprintf(nm, sizeof nm, "analysis/live/vu1nat_%04x_%08x.bin", pc, static_cast<uint32_t>(h));
+    if (FILE *f = std::fopen(nm, "wb")) { std::fwrite(vuCode, 1, 16384u, f); std::fclose(f); std::fprintf(stderr, "[vunat] no native program for start pc %x: wrote %s\n", pc, nm); }
+}
+
 void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
-    const auto _perfT0 = std::chrono::steady_clock::now();
     const uint64_t _perfC0 = m_cycle;
     const uint64_t _tscRun0 = __rdtsc();
     {   // ISS-144 diagnostic sampler (idle unless debug flag 14 is set)
@@ -2541,8 +2581,10 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
         }
     }
 
-    const int previousRoundingMode = std::fegetround();
-    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+    // CL-0262: SSE rounding mode via MXCSR directly (fegetround/fesetround cost ~3% of the VU1 worker at ~400k runs/s); set only when not already round-to-zero
+    const unsigned int vuCsr0 = _mm_getcsr();
+    const bool useVuRounding = (vuCsr0 & 0x6000u) != 0x6000u;
+    if (useVuRounding) _mm_setcsr(vuCsr0 | 0x6000u);
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
     DecodedInstructionPair decodedTmp;
@@ -2554,10 +2596,51 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
         (void)getDecodedInstructionPairForPc(vuCode, codeSize, memory, 0u);
         directDecode = m_decodedCodeCacheValid && m_cachedVuCode == vuCode && m_cachedMemory == memory && m_cachedCodeSize == codeSize;
     }
+    // CL-0218: ahead-of-time compiled programs (ps2_vu1_native.h). Same model as this loop, so entering/leaving at any pair boundary
+    // is exact. Off with debug flag 30, the bisect switches, exact mode or the debug rings. Native code stops 3800 cycles into a run so
+    // the runaway safeguard below (first check at 4096 cycles, needs <= 240 ring entries) sees the same loop it always did.
+    static uint64_t s_intPc[2048];
+static const bool s_natOff = std::getenv("SVR06_VUNONATIVE") != nullptr;
+    static const bool s_nat0Off = std::getenv("SVR06_VU0NONATIVE") != nullptr; // CL-0371
+    bool natOK = directDecode && m_fastPipe && !m_fastExact && s_cl133Off == 0u && !dbgRings && !s_natOff &&
+                 ((m_unit == Unit::VU1 && codeSize == 16384u && g_vu1NativeProgCount != 0u) ||
+                  (m_unit == Unit::VU0 && codeSize == 4096u && g_vu0NativeProgCount != 0u && !s_nat0Off)); // flag 30 is already used by CL-0206 (VU0 fast path, ON by default), so native-off is the env var SVR06_VUNONATIVE=1
+    const uint64_t natGen = natOK ? (m_unit == Unit::VU0 ? memory->getVU0CodeGeneration() : memory->getVU1CodeGeneration()) + 1u : 0u;
+    const uint64_t natStop = runStartC + 32000u; // CL-0229: was 3800 (long programs finished on the interpreter). The [runaway] check only reads interpreter PCs, so it still arms after a native run returns here.
+    bool natFirst = true;
+    bool natChain = false; // CL-0220: native program just handed off (dynamic jump to a pc with no native entry): record that pc as a miss too
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         if (m_state.pc + 8u > codeSize)
             break;
+
+        if (natOK && !m_state.branchPending && !m_state.ebit && !m_state.haltAfterDelaySlot && runawayStage == 0 && (m_state.pc & 7u) == 0u)
+        {
+            const uint32_t pi = m_state.pc >> 3;
+            if (m_natGen[pi] != natGen) { m_natFn[pi] = nativeLookup(vuCode, pi, natGen); m_natGen[pi] = natGen; }
+            NativeFn fn = m_natFn[pi];
+            if (fn != nullptr)
+            {   // native code keeps vf0/vi0 constant instead of rewriting them after every pair: they must be canonical on entry
+                static const uint32_t kVf0[4] = {0u, 0u, 0u, 0x3F800000u};
+                if (std::memcmp(m_state.vf[0], kVf0, 16) != 0 || m_state.vi[0] != 0) fn = nullptr;
+            }
+            if (fn != nullptr)
+            {
+                const uint64_t lim = budgetEnd < natStop ? budgetEnd : natStop;
+                if (m_cycle < lim)
+                {
+                    const uint64_t c0 = m_cycle;
+                    ++s_natRuns;
+                    if (fn(*this, vuData, dataSize, gs, memory, lim) != 0) { programEnded = true; break; }
+                    if (m_cycle >= natStop) natOK = false;
+                    natFirst = false;
+                    if (m_cycle != c0) { natChain = true; continue; }
+                }
+                else natOK = false;
+            }
+            else if ((natFirst || natChain) && m_unit == Unit::VU1) svr06NatMiss(vuCode, m_state.pc);
+            natFirst = false; natChain = false;
+        }
 
         const DecodedInstructionPair *decodedPtr;
         if (directDecode && (m_state.pc & 7u) == 0u && (m_state.pc >> 3) < kMaxDecodedPairs)
@@ -2569,6 +2652,9 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
         }
         const DecodedInstructionPair &decoded = *decodedPtr;
         s_pcRing[s_pcRi++ & 255u] = static_cast<uint16_t>(m_state.pc >> 3);
+        if (m_unit == Unit::VU1 && codeSize == 16384u && m_state.pc >= 0x1b50u && m_state.pc <= 0x1b58u)
+        {   static int s_dn = 0; if (s_dn < 6) { ++s_dn; std::fprintf(stderr, "[vuint1b50] pc=%x natOK=%d direct=%d fastPipe=%d fastExact=%d cl133=%u dbgRings=%d natProgs=%u bp=%d ebit=%d halt=%d rstage=%d fn=%p runStartPc=%x cyc=%llu budget=%llu\n", m_state.pc, (int)natOK, (int)directDecode, (int)m_fastPipe, (int)m_fastExact, (unsigned)s_cl133Off, (int)dbgRings, g_vu1NativeProgCount, (int)m_state.branchPending, (int)m_state.ebit, (int)m_state.haltAfterDelaySlot, (int)runawayStage, (void*)m_natFn[m_state.pc >> 3], (unsigned)0, (unsigned long long)(m_cycle - runStartC), (unsigned long long)(budgetEnd - runStartC)); } }
+        if (m_unit == Unit::VU1 && codeSize == 16384u) ++s_intPc[(m_state.pc >> 3) & 2047u]; // CL-0220: where does the interpreter still run?
         if (dbgRings && m_state.pc != s_btPrev + 8u && m_unit == Unit::VU1)
         {   Svr06Bt &e = s_bt[s_btI++ & 1023u]; e.from = s_btPrev; e.to = m_state.pc; e.cyc = m_cycle - runStartC; for (int r = 0; r < 16; ++r) e.vi[r] = (int32_t)m_state.vi[r]; }
         s_btPrev = m_state.pc;
@@ -2847,16 +2933,19 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
     m_state.cycles = m_cycle;
     m_fast = false;
     {   // [vufast] perf diag (ISS-132/perf): cycles per run and ns per cycle
-        static uint64_t s_runs = 0, s_cyc = 0, s_ns = 0, s_spins = 0; static int64_t s_last = 0;
-        const auto _t1 = std::chrono::steady_clock::now();
-        ++s_runs; s_cyc += (m_cycle - _perfC0); s_tRun += __rdtsc() - _tscRun0;
-        if (m_unit == Unit::VU1) { const uint32_t hp = (m_spinStart >> 3) & 2047u; s_hTsc[hp] += __rdtsc() - _tscRun0; ++s_hRuns[hp]; s_hCyc[hp] += (m_cycle - _perfC0); }
-        s_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(_t1 - _perfT0).count();
+        static uint64_t s_runs = 0, s_cyc = 0, s_ns = 0, s_spins = 0; static int64_t s_last = 0; static uint64_t s_lastTsc = 0;
+        // CL-0214: no wall-clock call per run (QueryPerformanceCounter ~25 ns x2); use rdtsc and read the wall clock every 256 runs only
+        const uint64_t _tscEnd = __rdtsc();
+        ++s_runs; s_cyc += (m_cycle - _perfC0); s_tRun += _tscEnd - _tscRun0;
+        if (m_unit == Unit::VU1) { const uint32_t hp = (m_spinStart >> 3) & 2047u; s_hTsc[hp] += _tscEnd - _tscRun0; ++s_hRuns[hp]; s_hCyc[hp] += (m_cycle - _perfC0); }
+        s_ns += _tscEnd - _tscRun0; // tsc ticks here; converted to ns at the 3 s report
         if (!programEnded && m_cycle >= budgetEnd) ++s_spins;
-        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(_t1.time_since_epoch()).count();
-        if (s_last == 0) s_last = nowMs;
-        if (nowMs - s_last >= 3000)
+        int64_t nowMs = 0;
+        if ((s_runs & 255u) == 0u) nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (s_last == 0 && nowMs) { s_last = nowMs; s_lastTsc = _tscEnd; }
+        if (nowMs && nowMs - s_last >= 3000)
         {
+            if (_tscEnd > s_lastTsc) s_ns = (uint64_t)((double)s_ns * ((double)(nowMs - s_last) * 1e6 / (double)(_tscEnd - s_lastTsc))); s_lastTsc = _tscEnd;
             std::fprintf(stderr, "[vufast] 3s: runs=%llu spins=%llu cycles=%llu avgCyc=%llu ns/cyc=%llu vuMs=%llu xgOk=%llu xgFail=%llu(F8:%llu)\n", (unsigned long long)s_runs, (unsigned long long)s_spins,
                          (unsigned long long)s_cyc, (unsigned long long)(s_runs ? s_cyc / s_runs : 0), (unsigned long long)(s_cyc ? s_ns / s_cyc : 0), (unsigned long long)(s_ns / 1000000), (unsigned long long)s_xgOk, (unsigned long long)s_xgFail, (unsigned long long)s_xgFailF8);
             std::fprintf(stderr, "[vufast2] run=%llu Mtsc xgprog=%llu Mtsc (submit=%llu Mtsc) pkts=%llu avgBytes=%llu\n", (unsigned long long)(s_tRun >> 20), (unsigned long long)(s_tProg >> 20), (unsigned long long)(s_tSubmit >> 20), (unsigned long long)s_nPkt, (unsigned long long)(s_nPkt ? s_bytesPkt / s_nPkt : 0));
@@ -2868,13 +2957,13 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
                 std::fprintf(stderr, "\n");
                 std::memset(s_hTsc, 0, sizeof s_hTsc); std::memset(s_hRuns, 0, sizeof s_hRuns); std::memset(s_hCyc, 0, sizeof s_hCyc);
             }
-            std::fprintf(stderr, "[vufast3] lazyDecodes=%llu noflagRuns=%llu flagRuns=%llu\n", (unsigned long long)s_nLazyDec, (unsigned long long)s_nSkipRuns, (unsigned long long)s_nFlagRuns); s_nLazyDec = 0; s_nSkipRuns = s_nFlagRuns = 0;
+            std::fprintf(stderr, "[vufast3] lazyDecodes=%llu noflagRuns=%llu flagRuns=%llu\n", (unsigned long long)s_nLazyDec, (unsigned long long)s_nSkipRuns, (unsigned long long)s_nFlagRuns); std::fprintf(stderr, "[vunat] nativeRuns=%llu missRuns=%llu progs=%u\n", (unsigned long long)s_natRuns, (unsigned long long)s_natMissRuns, g_vu1NativeProgCount); { uint64_t tot = 0; for (int i = 0; i < 2048; ++i) tot += s_intPc[i]; std::fprintf(stderr, "[vuint] interpPairs=%llu top:", (unsigned long long)tot); for (int k = 0; k < 8; ++k) { int bi = 0; for (int i = 1; i < 2048; ++i) if (s_intPc[i] > s_intPc[bi]) bi = i; if (s_intPc[bi] == 0) break; std::fprintf(stderr, " %x:%llu", (unsigned)(bi << 3), (unsigned long long)s_intPc[bi]); s_intPc[bi] = 0; } std::fprintf(stderr, "\n"); for (int i = 0; i < 2048; ++i) s_intPc[i] = 0; } s_natRuns = s_natMissRuns = 0; s_nLazyDec = 0; s_nSkipRuns = s_nFlagRuns = 0;
             s_tRun = s_tProg = s_tSubmit = s_nPkt = s_bytesPkt = 0;
             s_runs = s_cyc = s_ns = s_spins = 0; s_xgOk = s_xgFail = s_xgFailF8 = 0; s_last = nowMs;
         }
     }
-    if (useVuRounding && previousRoundingMode != -1)
-        std::fesetround(previousRoundingMode);
+    if (useVuRounding)
+        _mm_setcsr(vuCsr0); // CL-0262
 }
 
 void VU1Interpreter::runChecked(uint8_t *vuCode, uint32_t codeSize,

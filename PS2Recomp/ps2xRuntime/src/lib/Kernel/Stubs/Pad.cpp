@@ -2,6 +2,9 @@
 #include <cstdlib>
 #include "Common.h"
 #include "Pad.h"
+void svr06_music_skip_menu(); // CL-0350 (SvrMusic.cpp)
+#include <atomic>
+extern std::atomic<int> g_svr06PadCapture; // CL-0356 (SvrCustomMusic.cpp)
 
 namespace ps2_stubs
 {
@@ -318,6 +321,19 @@ namespace ps2_stubs
                 }
             }
 
+            { // CL-0350: L3 (rising edge, pad 1) = next menu song
+                static bool s_l3Prev = false;
+                const bool l3 = (state.buttons & kPadBtnL3) == 0u;
+                if (port == 0 && slot == 0)
+                {
+                    if (l3 && !s_l3Prev) svr06_music_skip_menu();
+                    s_l3Prev = l3;
+                }
+            }
+
+            { // CL-0356: our select screen is open -> the game sees a released controller
+                if (::g_svr06PadCapture.load(std::memory_order_relaxed)) { state.buttons = 0xFFFFu; state.lx = state.ly = state.rx = state.ry = 0x80u; }
+            }
             fillPadStatus(outData, state, portState);
 
             {

@@ -766,6 +766,13 @@ namespace ps2_stubs
                     {
                         pattern = "*";
                     }
+                    // ISS-mc (2026-11-14): sceMcGetDir("/") without a wildcard names the root itself, which has no directory entry,
+                    // so the real card answers 0. Answering "." made SvR's CMcGetDirList (0x109970) count the root as found, so a
+                    // blank card read as "save found but icon.sys missing" = corrupted instead of "no save data".
+                    if (!hasWildcard && guestQuery == "/")
+                    {
+                        pattern = std::string(1, '\x01'); // matches nothing -> 0 entries, result 0
+                    }
 
                     std::filesystem::path hostDir = getMcRootPath(port);
                     if (!parentRel.empty())

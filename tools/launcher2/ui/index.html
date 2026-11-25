@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en" data-theme="graphite" data-accent="raw">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SvR06 Launcher</title>
+<meta name="color-scheme" content="dark light">
+<link rel="stylesheet" href="/ui/style.css">
+<script>window.TOKEN = "__TOKEN__";</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div id="app">
+  <nav id="rail" aria-label="Pages"></nav>
+  <div id="stage">
+    <header id="top">
+      <div class="titles"><h1 id="pageTitle"></h1><p id="pageSub"></p></div>
+      <div class="search"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="M13 13l4 4"/></svg>
+        <input id="q" type="search" placeholder="Search every setting" autocomplete="off" aria-label="Search settings" spellcheck="false">
+        <kbd>Ctrl K</kbd></div>
+    </header>
+    <main id="main" tabindex="-1"></main>
+  </div>
+</div>
+<div id="toasts" role="status" aria-live="polite"></div>
+<div id="modal" hidden></div>
+<script src="/ui/app.js"></script>
+</body>
+</html>

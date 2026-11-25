@@ -1,6 +1,6 @@
 # SVR06 change log addendum, 2026-10-28 (continues changelog/CHANGELOG.md; next free number before this: CL-0035)
 
-> Version tags: see the version table at the top of CHANGELOG.md. Current v0.5.2-alpha.
+> Version tags: see the version table at the top of CHANGELOG.md. Current v0.9.0-beta.
 
 | id | date | area | change | files | issue | verified |
 |---|---|---|---|---|---|---|
@@ -825,3 +825,603 @@ Why: testing meant rebuilding and clicking by hand; a freeze could not be detect
 ## CL-0173 verification (2026-11-10 21:16) - any-gender titles CONFIRMED in Exhibition
 - User tested in Exhibition: men can win women's-division titles and women can win men's titles, and mixed man+woman teams can win tag titles. Status: Exhibition any-gender titles = verified working (PAL).
 - Still untested/open: GM mode any-gender titles, USA port of the title patch.
+
+## CL-0217 Render-target (RTT) instrumentation for the Season skip-match cutscene (2026-11-12/13) - PARKED
+- gs_vulkan_bridge.cpp, all env-gated (SVR06_RTTLOG, SVR06_RTTFLUSH): FRAME/ZBUF change log for blocks 15000-16200, AD-register log (TEXA/ALPHA/CLAMP/TEST/TEX0), XFER (BITBLTBUF/TRXDIR) log, per-present colour/Z page non-zero counts, rtt_<pres>.bin dump, rttpass snapshot writer. Backups .bak_texa, .bak_texa2, .bak_rttpass.
+- Findings: PCSX2 and our run use identical GS state for the crowd RTT (FRAME_1 0x0a0101de, ZBUF_1 0x010101e6, TEXA, ALPHA 0x44). The 64x128 PSMCT16S target is reused ~80x per frame and each snapshot at composite time is a correct coloured figure. The composite samples tbp 15296 as PSMT8H (tbw 4, 256x256, CLUT) and PSMCT32 (64x256), not as 16S. Suspect (unverified): paraLLEl-GS reading RT pages with a different format/swizzle. Flush-every-packet and SVR06_PGS_NOMEMO=1 changed nothing.
+- Separate small bugs: StoreImage readback of Z (psm 0x31, sbp 0x1000) returns 0 bytes; the Season cutscene has no commentary/sfx.
+- Also: ovxMenu label fix `case 0x564e10u` in overrides\ovxMenu_00564DF0_0x564df0.cpp (add the entry to the generator before regenerating).
+- Status: user parked the cutscene bug on 2026-11-13 in favour of match speed. Not a fix.
+
+## CL-0218 Native (AOT) VU1 programs - match speed (2026-11-13) - BUILT, NOT YET RUN IN GAME
+- Why: stack profile of the game thread in a Raw match (20,000 samples): ~49% in ps2_vu1_core.cpp (VU1Interpreter::runFast 40.7%), gsvk::gifTransfer 8.4%. Guest speed is ~17 of 50 vsync/s. Hot start PCs by VU1 time: 28b8 ~31%, 2638 11-18%, 22b0 ~10%, e60 ~8%, 5a0 ~6%, 2570 ~5%, 22c8 ~4%.
+- Change: ps2_vu1_native.h (macros, table types), ps2_vu1_native_gen.cpp (GENERATED from game microcode - local only, never publish), hook in VU1Interpreter::runFast + VU1Interpreter::nativeLookup + ps2_vu1.h members (m_natGen/m_natFn). Backups .bak_native. A native program is the runFast loop unrolled per instruction pair with decode as constants; it reuses the interpreter handlers and state and can hand back at any pair boundary. Matched by entry PC and by comparing every compiled pair's code words with VU1 memory (a different program at the same PC falls back).
+- Safety: debug flag 30 (1<<30) disables it; off in exact mode, debug rings and CL-0133 bisect flags; stops 3800 cycles into a run so the [runaway] check (4096) is unchanged; entry requires no pending branch/E-bit and canonical vf0/vi0.
+- Misses: `[vunat]` counters every 3 s (nativeRuns/missRuns/progs); start PCs without a program write analysis\live\vu1nat_<pc>_<hash>.bin after 3000/30000/300000 runs for regeneration.
+- Generator/harness: tools\vu1bench\gen.cpp, stage2_patch.py (shadow normalised operands, fast FMAC finish, lighter tails), WSL scripts setup_wsl.sh, base.sh, nat.sh (`nat.sh install`), prof.sh. Stage 1: 15.1 -> 13.5 ns/VU cycle overall (22b0/22c8 14.8 -> 8.7). Stage 2 offline: hashes identical in all 4 modes, 0 random-state differences, 0 shadow mismatches. 22b0 was not compilable in stage 1 (D/T bit or reserved decode) - revisit.
+- Build: BUILD_ONLY started 2026-11-13 09:38 local; at 09:50 it was at [2714/2717], linking. Expected result unknown until run.
+- Next: user runs a match via RUN_LOGGED, compare vsync/s vs ~17; handle [vunat] misses; then GS submit batching, async worker (flag 15), re-profile. Apply to USA runtime after PAL verification.
+- CL-0218 build fix (2026-11-13 10:10): first link FAILED with `undefined symbol g_vu1NativeProgs / g_vu1NativeProgCount` - src/lib/vu/ps2_vu1_native_gen.cpp was not in the explicit source list in PS2Recomp\ps2xRuntime\CMakeLists.txt. Added it after ps2_vu1_sampler.cpp (backup CMakeLists.txt.bak_native). The generated file itself has not been compiled by the real toolchain yet (only in WSL), so compile errors in it are still possible on the next build. PS2Recomp_usa CMakeLists needs the same line when CL-0218 is ported.
+- CL-0218 fix 2 (2026-11-13 10:35): the linked build loaded 13 native programs but ran 0 (`[vunat] nativeRuns=0 missRuns=0 progs=13`, ~250k VU1 runs/3 s). Root cause: native-off was wired to debug flag 30, but CL-0206 already sets flag 30 ON BY DEFAULT in svr06InitFlags() (VU0 fast interpreter), so natOK was always false. Native-off is now the env var SVR06_VUNONATIVE=1 (cached static in VU1Interpreter::runFast, ps2_vu1_core.cpp, backup .bak_natflag). All earlier CL-0218 text that says "debug flag 30 disables native" should read SVR06_VUNONATIVE=1. Needs another build (only ps2_vu1_core.cpp + relink).
+- CL-0218 first in-game result (2026-11-13 10:33, PAL match, build with native on): `[vunat] nativeRuns=45k-65k missRuns=368k-422k progs=13` per 3 s, i.e. ~85% of VU1 runs still miss. The match uses several different microcode images at the same start PCs (hashes d027fb1f, e542babe, 260ff6f2, 56d4b043, 0f3ac084, 0b4eb6a5 ...), the compiled one came from a single capture. 19 images dumped by the miss writer were copied to tools\vu1bench\img\ (game-derived: local only, add to .gitignore); tools\vu1bench\natlist.txt lists image:pc entries; nat.sh now copies that list into ~/vb/natlist.txt (backup nat.sh.bak_natlist). Next: user runs `wsl bash tools/vu1bench/nat.sh install` (all four checks must stay IDENTICAL/0/0), then BUILD_ONLY, play again. Hot [vuprog] shares in this match: 28b8 33-36%, 2638 9-16%, 2908 15%, e60 8-9%, 22b0 8-9%, 2570 5-6%.
+- CL-0218 regenerated with the match images (2026-11-13 10:55, done remotely, user away): 29 native programs (was 13) from 7 images (cap + d027fb1f, e542babe, 260ff6f2, 56d4b043, 0f3ac084, 0b4eb6a5 ...) installed as ps2_vu1_native_gen.cpp (previous 13-program file kept as .bak_stage2). Verification ran in this session's Linux VM with g++ 11 (no clang/WSL there; sources, captures and baselines rebuilt in ~/vb of that VM, baseline = core.cpp.bak_native): bench hashes IDENTICAL to the pre-native baseline in modes 0/512/65536 (mode 1<<30 is no longer the native-off switch); randomised differential test native vs interpreter (SVR06_VUNONATIVE=1): 0 differences in 2700 runs on each of 7 code images (cap_*), shadow-register self-check build (-DVN_CHECK): 0 mismatches on all 7. Caveats: g++ -O1 not clang -O2, random-state coverage only, 22b0 still not compilable from the e542babe image. NOT yet built or run in game.
+- CL-0218 29-program build (2026-11-13 11:33 local, started remotely while user away): BUILD_ONLY exit clean (0 errors; ps2_vu1_native_gen.cpp compiled by the real toolchain), game launched via RUN_LOGGED at 11:35 after a console `quit` closed the previous run. Log shows `[vunat] ... progs=29`. No VU1 work yet at 11:42 (game idle on a non-3D screen, needs user input), so hit rate and vsync/s are still UNMEASURED; needs a match.
+- CL-0218 test attempt 2 (2026-11-13 ~18:25 local): the 29-program build launched at 11:35 stayed on a non-3D screen for ~13 h (vsyncTick 657k, `[vuprog] total=0`, `[vunat] nativeRuns=0 missRuns=0 progs=29` throughout); log shows only the LOGOP movie then "hold released" and no further [movie]/[resload] progress, so VU1 never ran. Looks like the known intermittent boot/title stall (ISS-157/160), not the native path (no VU1 work at all), but unproven. Closed with console `quit`. Not relaunched: computer-use approval expired. Hit rate and speed still UNMEASURED.
+
+## CL-0219 Graphics card selection (2026-11-13) - BUILT? NO: needs one rebuild (context.cpp) + launcher restart
+- Runtime: PS2Recomp\ps2xRuntime\third_party\parallel-gs\Granite\vulkan\context.cpp (backup .bak_gpupick; same change copied to PS2Recomp_usa): after the existing GRANITE_VULKAN_DEVICE_INDEX check, env `SVR06_GPU` picks the Vulkan device whose name contains the given text (case-insensitive, trimmed). Logs `SVR06_GPU="..." matched Vulkan GPU: ...`, or an error line and falls back to the automatic choice when nothing matches. Unset = unchanged behaviour. `GRANITE_VULKAN_DEVICE_INDEX=n` still works and wins.
+- Launcher: new global pref `gpu` (server.py .bak_gpu, ui/app.js .bak_gpu): Settings -> "Graphics card" dropdown (Auto + the cards the game logged as "Found Vulkan GPU:" in earlier runs + Windows video controllers from PowerShell, marked "not yet seen by Vulkan"); build_env exports SVR06_GPU; shown in the env summary; "Last run used: ..." from the log. Applies at the next game start (the device is created once at startup).
+- Tested here: server functions only (gpu_list found the logged "AMD Radeon RX 6700", build_env sets/clears SVR06_GPU). Not compiled, not run on a machine with two GPUs. Not done: in-game F1 menu entry (needs a restart anyway), per-game-version setting, Software renderer interplay.
+- Manual use without the launcher: set SVR06_GPU=RTX (or any part of the name) before running scripts\RUN_LOGGED.cmd.
+- CL-0218 FIRST SPEED RESULT (2026-11-13 22:20 local, PAL, user in a match, build of 04:16 UTC with 29 programs + GPU option): `[vunat] nativeRuns=508k-575k per 3 s, missRuns=1.7k-6.5k` (~99% native hit rate, was ~15%). Guest vsync rate from watchdog vsyncTick over 60 s: 10358 -> 12075 = ~28.6 vsync/s vs ~17 before (PAL target 50) = ~1.7x. Single 60 s sample, not controlled (same match type but not the same moment). Remaining misses: start pc 22b0 (images e542babe and new 3c9950af; 22b0 from e542babe is "not compilable" in the generator - D/T bit or reserved decode). Hot programs now: 28b8 52%, e60 10%, 22b0 10%, 22c8 9%, 35f8 8%, 2570 4% of VU1 time. Next: look at why 22b0 is not compilable, then 28b8 itself (still half the VU1 time; per-run 193 cycles), GS submit batching, async worker (flag 15), re-profile.
+- CL-0218 fix 3 (2026-11-13 22:50): start pc 22b0 (images e542babe/3c9950af, also cap) was "not compilable" because its entry pair has the D bit (upper 0x100002ff). The interpreter only halts on D/T pairs when the VU's dBitEnabled/tBitEnabled flags are set (never by default), so gen.cpp now compiles D/T pairs as ordinary pairs and emits a guard `if (s.dBitEnabled || s.tBitEnabled) return 0;` at the entry of any program containing one (gen.cpp.bak_dt). Regenerated from all 33 miss images in tools\vu1bench\img: 31 programs (was 29), no "not compilable" left. Verified in the Linux VM with g++ -O1: bench hashes IDENTICAL in modes 0/512/65536, native vs interpreter 0 differences in 2700 random runs on each of 10 code images, shadow-check build 0 mismatches on all 10 (random states never enable D/T halts, so the guard path itself is untested). Previous 29-program file kept as ps2_vu1_native_gen.cpp.bak_29. Installed in the runtime tree; NOT yet built (game was running).
+- CL-0218 result with 31 programs (2026-11-13 22:42 local, PAL, user in entrances): `[vunat] nativeRuns=272k-303k per 3 s, missRuns=418-539` (~99.8% native). Guest vsync ~31.3/s (vsyncTick 4577 -> 5985 in 45 s); present avg 7.6 ms. Entrances are a different load from matches, so this is not directly comparable with the 28.6/s match figure. VU1 time now: 28b8 40%, 22b0 19% (506 cyc/run, now native), e60 7%, 22c8 6%, 2638 5%, 2570 4%.
+- CL-0218 MATCH RESULT with 31 programs (2026-11-13 22:44 local, PAL, user in a match): `[vunat] nativeRuns=~581k per 3 s, missRuns=0` (100% native). Guest vsync 34.4/s (vsyncTick 8812 -> 10874 in 60 s) vs ~17 before = ~2.0x; PAL target 50 (~69%). One 60 s sample. VU1 time: 28b8 28%, 2638 16%, 22b0 13%, 5a0 7%, 2570 6%, e60 5%, a0 5%, 22c8 5%.
+- CL-0218 analysis note (2026-11-13 23:00, nothing changed): VU1 is still ~half of a frame. `[vuprog] total=4857 Mtsc` per 3 s at ~34 vsync/s = ~48 Mtsc per guest frame (about 14 ms at a ~3.5 GHz TSC, assumed) of a ~29 ms frame. Bench native cost is still ~10-14 ns per VU cycle, so the AOT unroll only removed decode/dispatch, not the per-op work. Line profile of program 22c8 (bench, g++ -O1 -g1 in the Linux VM, only 330 samples, so indicative only; -O1 does not inline the _mm_* wrappers, which inflates the SSE helper rows): ~45% of samples are in the FMAC result finish (`fin<DEST>`, `vu1fast::fmacFinish` and the and/or/cmpeq/andnot intrinsics = denormal/NaN/overflow normalisation + MAC/status flag building), ~15% in the unrolled function body, ~9% in execLower/execLowerPre/floatToInt. Conclusion: next VU1 speed-up must target fmacFinish (e.g. emit specialised inline normalisation per DEST mask, keep results normalised in the shadow registers so the next op skips norm4, and skip MAC/status work for pairs whose flags are provably overwritten before any read - a per-program static analysis in gen.cpp), then true SSE codegen for the upper ops. Needs a -O2 clang profile (hot plugin sampler on the real build) to confirm before investing.
+
+### CL-0218 profile of the real optimised build (2026-11-14, match, 31 native programs) — tools/sampsym.py
+20,000 samples of the busiest thread (hot plugin v9 sampler), symbolized with svr06.map:
+- VU1 run() inclusive 50.7% (native f* ~27.6% leaf, of which f20 alone 9.1%; fmacFinish only 2.5% -> the earlier -O1 guess of ~45% in FMAC finish was WRONG for the real build; do not spend time there).
+- Interpreter still ~14% leaf (runFast 3.9, run 3.8, execLower 2.9, execUpper 2.0, calculatePairReadyCycle 1.2): native-exit continuations / non-native segments.
+- GS path: submitGifPacket 12.8% inclusive (GifArbiter::drain 11.3%, svr06MtgsSubmit 11.3%, gsvk::gifTransfer 10.5%), progressXgkick 9.7%.
+- 21.6% of leaf samples are in non-exe modules (GPU driver / ntdll) = GS/Vulkan submit cost.
+- processVIF1Data 4.5% leaf, std::vector insert 2.8% + operator new 1.5% (allocations in the VIF/GIF packet path).
+Next candidates: (1) remove vector insert/new in the VIF1->GIF packet copy; (2) find why interpreter still runs ~14%; (3) async GS submit (flag 15). sampler line in svr06_hot.cpp commented out again (needs scripts\build_hot.cmd).
+
+### CL-0220 (2026-11-14) packet-copy realloc + interpreter-fallback instrumentation (PAL)
+- ps2_memory.cpp (.bak_chainres): chainBuf.reserve(8192) in the DMA chain walker (was growing by repeated realloc+copy; vector insert + operator new were ~4% of samples).
+- ps2_vu1_core.cpp (.bak_intpc): per-PC counter of pairs run by the interpreter on VU1; logged every 3 s as `[vuint] interpPairs=N top: pc:count ...` next to `[vunat]`. Purpose: find why ~14% of samples are still interpreter code in a match. Expected result: a few PCs (non-compiled entry points / post-XGKICK resumes) that can be added to the native list. Instrumentation only; remove or keep (cost: one array increment per interpreted pair).
+- CL-0220 finding: ~14% interpreter time in a match = hot loop at VU1 pc 0x1b50.. (~5M interpreted pairs / 3 s). Run starts at pc 0 (12-pair native dispatcher), jumps (dynamic) to 0x1b50 which has no native entry; svr06NatMiss only fired for the first pair of a run so no image was dumped. Fix (ps2_vu1_core.cpp .bak_natchain): also call svr06NatMiss when native just handed off (natChain). Next: play a match, take analysis/live/vu1nat_1b50_*.bin (+ any other new handoff pcs), add to natlist, regenerate (nat.sh in the Linux VM), rebuild. Diagnostic [vuint1b50] (6 lines max) stays until then.
+- CL-0220 (cont.): the handoff logger dumped vu1nat_1a40/1220_4ae4af93.bin; 1b50 lies inside program 1a40 (and is also a dispatcher target). Added entries 1a40,1220,1b50 from img/vu1nat_1a40_4ae4af93.bin to natlist.txt (.bak_1a40) -> 34 native programs (.bak_31 of the gen file). Verified: rbench (rbench.cpp now also tests 0x1a40/0x1220/0x1b50) 300 seeds x 17 pcs on cap and cap_4ae4af93: 0 native-vs-interpreter differences, 0 shadow mismatches. Needs rebuild + match test: expect [vuint] interpPairs to drop from ~5M/3s and vsync/s to rise above ~34.
+- CL-0220 result (match, 34 programs): [vuint] interpPairs 5M -> 0.8-1.0M per 3 s (-80%); vsync/s ~34 -> ~44 (estimated from watchdog tick deltas). Remaining interpreted hot spots: 10e0/1048, 2830/2860. Regenerated with the newly dumped handoff entries (1180,16e0,1710,18a8,2100,2818 + guessed 1048,10e0,2830,2860 on image 4ae4af93; 1a40,1220,1b50,1180 on 0f3ac084; 1a40,1220,1b50 on d027fb1f) -> 44 programs (.bak_34). rbench 150 seeds x 27 pcs on 4 images: 0 diffs, 0 shadow mismatches. natlist.txt .bak_1a40b. Needs rebuild + match test.
+- CL-0220 CORRECTION (match, 44 programs, 06:12-06:14 UTC): interpreter pairs fell further (~5M -> ~0.3M per 3 s, -94%), BUT speed did not improve measurably: watchdog tick delta over a 40 s window = ~30 vsync/s (guest 60 ticks/guest-s; wall rate uncertain +-10% because watchdog lines lag), nativeRuns/3 s ~490-525k vs ~570k before, [vuprog] total ~4970-5030 Mtsc/3 s unchanged. The earlier "~44 vsync/s" figure was a bad estimate; discard it. Conclusion: the interpreter tail was not the bottleneck; VU1 time is dominated by native pc28b8 (49% of VU1 time, ~270k runs/3 s x ~196 cyc) plus GS submit / driver (~22% of samples) and VIF1/GIF copying. Remaining interpreted hot pcs: 10e0/1048 (~0.3M pairs/3 s). Next: re-run the sampler (uncomment in svr06_hot.cpp, build_hot.cmd) on this build to see the new split, then optimise 28b8's native code and the GS submit path.
+
+### CL-0221 (2026-11-14) dependency check + upstream GIF FLG=3 fix (PAL + USA)
+- Upstream ran-j/PS2Recomp: only one commit after our base eb8688b: e563698 "GIF: treat FLG=3 like IMAGE everywhere a GIFtag is parsed". Applied by hand to both runtimes (Kernel/Stubs/GS.cpp, gs/gs_frontend.cpp, gs/ps2_gif_arbiter.cpp, ps2_vif1_interpreter.cpp, vu/ps2_vu1_core.cpp x2; PAL also gs/gs_vulkan_bridge.cpp nqw), backups .bak_flg3. Correctness only (FLG=3 packets were mis-sized/rejected); no speed effect expected.
+- parallel-gs (Arntzen-Software) cc6184a = upstream HEAD: nothing to update.
+- Sampler re-enable attempt (06:16 UTC) produced no samp_raw.txt in 12 min; sampler commented out again (needs scripts\build_hot.cmd). Cause unknown (thread suspend/unwind stall?).
+- PC Ports survey (C:\Users\ajizz\Games\PC Ports, PS2 recomps updated since 11-10): useful references for speed: GTA VCS/LCS recomp (11-11) runs VIF1+VU1 on a "Vu1Worker" thread with a batch queue (src/ps2xRuntime/src/lib/ps2_memory.cpp asyncVif1WorkerLoop; docs/lcs-windows-perf-handoff.md: XGKICK flush batching, VIF unpack fast path, AVX program copy), Rogue Galaxy docs/VU1-NATIVE.md (whole VU1 programs as C++ mesh builders + harvest/verify), HCTP hctp_native_vu1.cpp (11-04, already studied; same Yuke's engine family, p07 MorphWeights at 0x2800/0x2908 = our 0x28b8 neighbourhood). Our async worker (flag 15, CL-0127/0129) fenced after every job -> candidate rework following the VCS batch design.
+
+### CL-0222 (2026-11-14) async VIF1/GIF worker (flag 15): remove the needless "seq" fence
+- Live test in a match (flag 15 on for 40 s via cmd.txt, then off): `[vifasync] 3s: jobs=82-86 fences=82-86`, `[fencesite] ... seq=82-137`, all other sites 0. So 100% of the waits came from site 8 in processPendingTransfers: the game thread called it again with NO GIF/VIF1 transfers pending (ps2_runtime.cpp calls it every pass) and still fenced, i.e. it waited for the worker right after every enqueue -> zero overlap (explains CL-0129).
+- Fix (ps2_memory.cpp .bak_seqfence): fence there only when GIF/VIF1 transfers are actually pending for synchronous processing. Async-off behaviour unchanged (nothing is ever queued then; pending transfers still fence once after a live toggle-off).
+- Flag 15 stays OFF by default. Test plan after rebuild: in a match, `flag 15 1` via cmd.txt, read [vifasync]/[fencesite] and vsync rate for ~40 s, then `flag 15 0`. Watch for the CL-0129 freeze (VU1 stops while frames advance).
+- CL-0222 test (2026-11-14 06:51 UTC, match, build 06:49): flag off = ~25 vsync/s (30 s window). `flag 15 1` -> the game hard-hung within seconds: whole log silent from 06:52:51, cmd.txt no longer consumed (console thread stuck too), no `[vifasync] FENCE WAIT` line (so not the fence wait loop), no `[vifasync]` stats. Removing the needless fence lets the worker overlap for real and exposes a lock-order deadlock (suspects: worker GS/MTGS submit vs game-thread GS stub / log / memory locks). Flag 15 stays OFF (default) - the CL-0222 change only affects the flag-on path. Next: get a hang dump (thread stacks) from a flag-15 run before changing anything else.
+- CL-0222 hang catcher (overrides/hot/svr06_hot.cpp v10, .bak_v10): background thread watches analysis/live/heartbeat.txt; if it stops changing for 6 s it suspends each thread in turn, unwinds 24 frames into a static buffer, resumes it, then writes analysis/live/hang_stacks.txt (exeBase, per-thread frames with module+offset) and logs `[hang]`. Once per plugin load; harmless in normal play (a >6 s present stall only writes the file). Needs scripts\build_hot.cmd (live reload, no game rebuild).
+- CL-0222 second test (07:00:59 UTC): flag 15 on -> the process EXITED about 1 s later (user: "it crashed"), no message in run_err/run_out; the 06:52 "hang" was most likely the same crash. The hang catcher could not help (process gone). Likely a data race now that worker and game thread really overlap (shared GS/VIF/VU1 state or the unordered_map m_ioRegisters). Hot plugin v11 (.bak_v11): vectored crash catcher -> analysis/live/crash_stack.txt (faulting thread's registers + 32-frame unwind with module+offset; also SIGABRT). Flag 15 stays OFF.
+- CL-0222 crash caught (07:13:32 UTC, crash catcher v11): access violation on the GAME thread in gsvk::gifTransfer <- svr06MtgsSubmit <- GifArbiter::drain <- PS2Memory (DMA kick in writeIORegister) <- submitDmaSend (Kernel/Stubs/DMA.cpp) <- game sub_0011DD90. The game thread drained the GIF arbiter / submitted to the GS while the worker was doing the same (GIF channel / direct path not covered by any fence).
+- Fix (gs/ps2_gif_arbiter.cpp .bak_arbfence): GifArbiter::submit and ::drain fence (site 9, `gifarb=` in [fencesite], ps2_memory.cpp .bak_arbfence) when called from any thread other than the worker. No-op with flag 15 off (pending is false). Needs rebuild; then retest flag 15 in a match.
+- CL-0222 retest (build 07:20 UTC, match): flag 15 on is now STABLE (30 s, no crash), but slower: ~19 vsync/s vs ~25 with it off. `[vifasync] jobs=146-162 fences=145-161`, `[fencesite] gifarb=145-161`, all other sites 0: the game thread itself submits GIF (path 3, DMA kicked synchronously in writeIORegister) after nearly every worker job, so it waits again -> no overlap, plus hand-off cost. Flag 15 turned off again, stays OFF by default. To gain anything the game thread's own GIF channel DMAs must also be queued to the worker (copy + enqueue like VIF1) instead of submitted synchronously.
+- CL-0222 gifarb source found: processPendingTransfers ended with `if (!asyncQueued) m_gifArbiter->drain()`, so every call with no GIF/VIF1 work (VIF0/VU0 DMA kicks, very frequent) drained the arbiter on the game thread -> fence (site 9) after almost every worker job. Fix (ps2_memory.cpp .bak_drainskip): with flag 15 on, drain there only if this call ran GIF/VIF1 work itself or runs on the worker; flag off = always drains (unchanged). Needs rebuild + match retest.
+- CL-0222 RESULT (build 07:33 UTC, match, crash catcher v11 loaded): flag 15 OFF ~31 vsync/s (25 s), ON ~43 vsync/s (30 s) = +39%, no crash. `[vifasync] jobs=212-256 fences=211-255`, `[fencesite] rio=106-128` (game thread reading GIF/VIF registers 0x10003000-0x10003FFF), the rest are unlabelled stub fences (GS.cpp/Font.cpp). Left ON for the user's session to check visuals/stability; default still OFF until a longer test (full match, entrances, menus) passes. Next: see which GIF/VIF register reads cause the rio fences (likely VIF1_STAT/GIF_STAT polls) and answer them without waiting where safe.
+
+### CL-0223 (2026-11-14) referee/stream audio FIFO, per-category volume sliders, memory card rename/import, presenter waits for worker, worker on by default (PAL)
+- User report: referee voice still stretched when the frame rate drops; yellow screens on transition screens and movie skips (worker on).
+- Referee / streamed speech = SPU2 AutoDMA (core 0, double buffer 0x57e10/0x58610, 2 KiB = 512 frames per DMA, refilled at emulated speed). The mixer looped the last block until the next DMA, so a slow frame rate stretched it. Fix (ps2xIOP iop_spu2.cpp + spu2.h, .bak_admafifo): each block is copied into a per-core FIFO at DMA start and played exactly once at 48 kHz (21 ms prebuffer, 100 ms cap; underrun = silence, never a repeat). SVR06_ADMA_LEGACY=1 = old behaviour. Note: when the game runs below full speed the stream now gaps instead of stretching; a fully native referee player would need the ADXT StartMem path (SOUND.PAC REFM/REFF) identified.
+- Volume sliders: F1 > Settings > Audio > Mixer (ps2_ship_menu.cpp .bak_vol, no longer DEV-only): Music, Commentary, Announcer, Crowd, Referee / Streamed Voice (audio.stream), Effects (audio.sfx). Native ADX slots (SvrMusic.cpp .bak_vol) get master * mute * category gain by archive (PBPPAC/CASVOICE = commentary, ANNOUNCE = announcer, CHEER/BG_ENV/SFX_ENV = crowd, else music); before, master volume only reached the SPU2. SPU2 voices * audio.sfx, AutoDMA stream * audio.stream (Spu2::setGains from the SPU2 stream callback, ps2_runtime.cpp .bak_vol).
+- Launcher (tools/launcher, .bak_audiocard): Audio page (was "planned") with the same sliders + mute, synced live through svr06_settings.json (GSET keys added); memory card Rename and Import buttons next to New card. Import folder copies a card folder (one sub folder per save); Import PCSX2 card extracts a .ps2/.mcd/.bin image with the new read-only tools/launcher/ps2mc.py (tested on synthetic raw and ECC images built in the sandbox, not yet on a real PCSX2 card). Both refuse while the game runs; nothing is overwritten.
+- Yellow screens: the presenter latched a frame when MTGS looked idle, but with the worker on, GS work can still be queued on the worker between jobs -> half-drawn frames on fades/skips. Fix (ps2_runtime.cpp .bak_presidle, ps2_memory.cpp svr06VifIdle): the latch also waits for the worker queue to be empty.
+- Async VIF1/GIF worker (flag 15) now ON by default (SvrConsole.cpp .bak_vifdefault); SVR06_VIFSYNC=1 or console `flag 15 0` turns it off.
+- USA (PS2Recomp_usa, .bak_cl0223): same audio changes applied (iop_spu2.cpp/spu2.h/SvrMusic.cpp copied from PAL - USA differed only in logging; ship menu sliders; SPU2 gains). Worker/presenter changes are PAL-only (USA has no CL-0127 worker).
+- CL-0223 test (user, 2026-11-14 09:45): yellow screens GONE; Effects slider works; crowd followed the Music slider and Commentary/Announcer/Referee sliders did nothing. Cause: the game's own native streams start in svr06_music_start, which never set the slot category (only svr06_voice_play did). Fix (SvrMusic.cpp .bak_cat2, PAL + USA): set the category there as well. Referee slider: still to verify after this build (if it does nothing, the referee is not the AutoDMA stream).
+
+### CL-0224 (2026-11-14) wrong entrance theme with extra music slots + crowd cue hijack
+- User: Undertaker's entrance played Christy Hemme's theme; Create-an-Entrance previews the right track. Log (entrance): `[trk] ra=001CAB68 bank=0 n=363 -> ptid=9 fid=3` = BGM3ENVH #3 (theme 43) instead of BGM2ENVH #1 (n=321). Cause: CL-0121 extra slots sorted the custom songs alphabetically IN BETWEEN the stock rows of the game's music list (pointer left at our table), so every stock row moved; entrance music is resolved by row, so wrestlers got other wrestlers' themes.
+- Fix (overrides/svr06_overrides.cpp .bak_mxorder): stock rows keep their original order and positions; custom songs are appended after them (alphabetical among themselves). Entrances saved in Create-an-Entrance while the old order was active may hold a shifted row and need their music re-picked once.
+- Also: the extra-slots track swap ran for the crowd cue bank too (base 20, cnt 40): `[extraslots] track 11 (bank 4) -> Gregory Helms...` replaced a crowd cue. Now limited to the music partitions (base < 10).
+- CL-0224 speed (entrance, build with CL-0223): ~35 vsync/s; [vuint] showed an interpreted loop at 0x2360 (~1.5M pairs / 3 s) and new handoff dumps (16c0/1888/2780 on images 0f3ac084/d027fb1f, 22b0 on c7c0250b). natlist.txt (.bak_cl0224): the full handoff entry list on both images + c7c0250b (22b0,22c8,2360,0,2500,2fc0,2fd8) -> 51 native programs (gen file .bak_44). rbench 100 seeds x 31 pcs on 5 images: 0 diffs, 0 shadow mismatches.
+
+### CL-0225 (2026-11-14) launcher test build: native window exe + first concept screens
+- Concept canvas: https://claude.ai/artifact/MQPXy5EmhS4W7tDBf4n8Uw (project doc claude/launcher-native-exe-concept-2026-11-14.md).
+- New tools/launcher/launcher_app.py: same backend/pages in a native window (pywebview -> WebView2), frameless with the launcher's own title bar (minimize / maximize / close, drag, double-click to maximize). Falls back to launcher.py (Edge) if pywebview is missing.
+- New scripts/build_launcher_exe.cmd: pip install pywebview + pyinstaller (user), PyInstaller --onefile --windowed -> svr06-recomp\SvR06Launcher.exe. The exe uses the live tools/launcher/ui files when present, so UI changes need no exe rebuild (server.py .bak_native).
+- UI (ui/*.bak_native): title bar + Ctrl+K search palette (pages, settings, volumes, cheats, presets); Play page presets Original 1:1 / Enhanced / Performance (graphics.internalRes + graphics.filter; "Custom" when nothing matches); live session card while the game runs (guest frames/s over 10 s and a 60 s graph from heartbeat.txt's vsync counter, Screenshot / Report / Close game); new Memory cards page (card list, saves per card, use / rename / open folder, import, automatic backups with restore-as-new-card).
+- server.py: session_speed(), saves + backups per card, card_backup() before every launch (cards_backup/<card>/<stamp>, last 10 kept), cardrestore / cardopen actions.
+
+### CL-0226 (2026-11-14) blank memory card shown as corrupted (PAL + USA)
+- User: a new empty card (launcher "New card") gave the in-game corrupted-card screen. Game side: CMcGetDirList (state machine at 0x109970, strings "CMcGetDirList...") looks up a path list ("/", "/BESLES-53676SD7", its icon.sys, SDvsRAW.ico, data file) with sceMcGetDir(maxent 1); any hit sets a found flag (+0x8a), and "found but icon.sys missing" (0x1074F0 = 0, -995) is the corrupted case. Our sceMcGetDir answered "/" with its "." entry (a directory), so the root counted as found on every card.
+- Fix (Kernel/Stubs/MemoryCard.cpp .bak_rootdir, PAL + USA): a non-wildcard GetDir of "/" returns 0 entries, like a real card. Wildcard listings ("/*") are unchanged. Expected: a blank card now reads "no save data" and the game offers to create one. Also likely the USA "never creates the save" item from 2026-11-08.
+
+### CL-0227 (2026-11-14) custom entrance songs collided with arena mixes (wrong theme at entrances)
+- User: picking "Undertaker '07" (custom) in Create-an-Entrance played Christy Hemme's theme at the entrance; stock Undertaker played Johnny Nitro '07 (custom).
+- Cause: an arena entrance asks for the song's arena mix as n + 120 (ENVB) or n + 240 (ENVH) (logs: custom 243 -> n=363 = BGM3ENVH #3 Christy; stock Undertaker 81 -> n=201 = custom slot "Johnny Nitro '07"). The CL-0143 expansion of custom numbers to 160..255 and 7..39 overlapped those arena numbers (the original 36 slots 57..79 / 147..159 were collision-free).
+- Fix (Kernel/Stubs/SvrCustomMusic.cpp .bak_arena, PAL + USA): allowed custom numbers = 57..79, 147..159 (36 safe within a byte), then 400.. in blocks of 360 (first 120 of each block), so n, n+120, n+240 never hit a stock track, a stock arena mix or another custom song; old colliding numbers in Entrances/_slots.txt are renumbered on the next scan ("[custommusic] ... renumbered"); the track resolver also maps n+120 / n+240 back to the custom song ("[custommusic] arena mix ...").
+- Open: songs numbered 400+ only work if the game stores the entrance music number wider than a byte (to verify). Entrances that used renumbered custom songs need their music re-picked once.
+
+## ISS-162 recurrence (2026-11-14 ~17:25 UTC, PAL, build with CL-0222..0227) — NOW LOADING after a match
+- After match end: music stops, arena repartition #7, MISC/PRTCLS/COM/SOUND.PAC reads, sound RPC 0x67 (load) completes (handled=1 cb=1); then the loading screen loops forever (main loop alive, presenter 55 fps). Threads: th1 per-frame wait 0x14CA68 (stack 1C3460 1C4494 1C0284 1BFC9C 1A6EF4 1A929C ...), th5 (entry 0x113C80) waits sema 10, th3 (sound RPC, entry 0x1C0980) waits sema 9.
+- Not the async worker: turning flag 15 off live did not release it. Memory card fine (save created on the new card).
+- New in this run only: IOP CRI ADX printf "E2004090216 : Specified handle is invalid." right after the music/voice Stops (sid 0x90000200 fn 0x409), absent in the 6 previous runs and the 11-09 hang logs.
+- Evidence: analysis/hang_loading_20261114_run_err.txt / _run_out.txt, analysis/dumps/hang_loading_2026-11-14.bin (RAM, via console ramdump).
+- ISS-162 audio-path review (2026-11-14 11:40 local), no fix yet:
+  - "Specified handle is invalid" = the 16th CRI ADX IOP destroy (sid 0x90000200 fn 0x409, EE caller 0x162210) after 16 creates (fn 0x408): one destroy for a handle the IOP no longer/never had. Our ADXT hooks (StartAfs/GetStat/Stop native) never touch the IOP handles, so this is the game's own create/destroy pairing; it did not stop the following loads (SOUND.PAC reads + RPC 0x67 completed after it). Not proven to be the hang cause.
+  - IOP thread stacks: ExitDeleteThread threads are freed by cleanupDeadThreads() at the end of the timeslice; DeleteThread frees too; no heap failure logged ([iopheap] dump only prints on failure: none). The 10th sound-bank load (0x67) completed normally.
+  - Hanging state: main loop runs the per-frame wait (th1 at 0x1C3460 -> 0x14CA68), loader idle; same picture as the 11-09 hang logs. Root cause still at game level (what the loading state machine waits for). Next: instrument the loading state machine / request pool around 0x1CF8220 (see hang3 note) on the next repro; RAM dump saved for offline analysis.
+  - The parked 59-program native VU1 set (images f59eeefe / c7c0250b 2658) was generated but NOT verified or installed.
+
+### CL-0228 (2026-11-14) entrance speed: 59 native VU1 programs
+- Entrance measured at ~31 of 50 vsync/s with the interpreter still running 0x2360 (~0.86M pairs / 3 s) and new handoff dumps vu1nat_22b0_f59eeefe / vu1nat_2658_c7c0250b. natlist.txt (.bak_cl0228): both images with 22b0,22c8,2360,2638,2658,0,2500,2fc0,2fd8 -> 59 programs (gen file .bak_51). rbench 80 seeds x 32 pcs on 5 images: 0 differences, 0 shadow mismatches. Needs rebuild + entrance test.
+- ISS-162 auto-capture (overrides/svr06_overrides.cpp .bak_autohang): the watchdog writes analysis/live/autohang_HHMMSS.bin (32 MB RAM) and a hex dump of the loader request pool area 0x1CF8200..0x1CF8400 ([autohang] lines) when the EE thread state has not changed for ~32 s; max 3 per run (a long idle menu can also trigger it). Next NOW LOADING hang is captured without user action.
+
+### CL-0229 (2026-11-14) native VU1 runs up to 32000 cycles per run (was 3800)
+- ps2_vu1_core.cpp (.bak_natstop): natStop = runStart + 32000. With 3800, every VU1 run longer than ~3800 cycles finished on the interpreter (entrance: ~1.2M interpreted pairs / 3 s at 0x2a48/0x2ba0 with 59 native programs). The ISS-132 [runaway] safeguard is unchanged: it samples interpreter PCs, so after a native run returns at the limit the interpreter continues and the loop check still arms. Native code is the same verified code; only where it hands back changes. Needs rebuild + match/entrance speed test.
+- CL-0229 result (18:16 UTC): [vuint] interpPairs=0 (no VU1 code left on the interpreter), ~37 of 50 vsync/s (scene not confirmed).
+- Hot plugin failed to load with "LoadLibrary failed err=126" when the game was started from SvR06Launcher.exe (plugin imports only KERNEL32). svr06_hotload.cpp (.bak_abspath): load the copy by absolute path with LOAD_WITH_ALTERED_SEARCH_PATH. Needs a game rebuild.
+
+### Profile 2026-11-14 18:36 UTC (match, CL-0229 build, worker on, 4000 samples of the busiest thread = the VIF1/GIF worker)
+- The worker is now the speed limit: busy ~90% (10% idle in workerMain). Leaf split: native VU1 programs ~40% (f20 alone 11%), interpreter handlers called from native code ~12% (execLower 3.7, execUpper 2.6, fmacFinish 3.2, runFast 1.1+), processVIF1Data 6.3% (VIF unpack), GS path ~7% (gsvk::gifTransfer 4.0, ParallelGS drawing_kick_append 1.7, svr06MtgsSubmit 1.3), operator new 1.4%, ntdll 20% (mostly the worker's own idle wait), amdvlk64 1.5%, CRT memcpy/memcmp ~4% (some from runFast).
+- To reach 50 the worker needs ~25-30% less work. Candidates in order: (1) inline the remaining lower-pipe ops in the native generator (execLower/execUpper/fmacFinish calls, ~12%); (2) VIF UNPACK fast paths for the common formats (V4-32/V4-16/V3-32 with cl=wl) (~4%); (3) move gsvk::gifTransfer parsing to the MTGS side so the worker only hands off packets (~5%); (4) remove per-packet allocations (operator new). Sampler commented out again (scripts\build_hot.cmd to unload).
+
+## CL-0230 - Native VU1 generator: inline ILW / ISW / FCAND (2026-11-14)
+- tools/vu1bench/gen.cpp (.bak_inlinelo): lower ops ILW (0x04), ISW (0x05, via vu.queueStore) and FCAND (0x12) are emitted inline instead of calling vu.execLower. Generic lower calls in the 59 native programs: 909 -> 508.
+- Verified: rbench differential test on 6 captured images x 150 seeds (4800 runs each): 0 native-vs-interpreter diffs, 0 shadow mismatches (check build).
+- Installed into PS2Recomp/ps2xRuntime/src/lib/vu/ps2_vu1_native_gen.cpp (backup .bak_inlinelo). Local only, never publish.
+- Needs rebuild; expected effect: less worker-thread time per VU1 run. Measure match/entrance vsync/s afterwards.
+
+## CL-0231 - sceGsSyncPath(0) no longer fences the VIF1/GIF worker (2026-11-14)
+- Entrance profile of the GAME thread (sampler follows the 2nd-busiest thread when analysis/live/samp_second.txt exists; hot plugin .bak_v14): 39% of game-thread time was inside svr06VifFence called from sceGsSyncPath; the worker itself was ~1/3 idle, so the game thread was blocking on the worker, not the reverse.
+- Kernel/Stubs/GS.cpp (.bak_syncfence, PAL+USA): mode 0 keeps processPendingTransfers() but skips ::svr06VifFence() (DMA completes at the kick; the worker consumes a copy; all worker-owned state readers have their own fence sites). SVR06_SYNCFENCE=1 restores the old fence.
+- Also seen: 13% of game-thread time in gsvk::gifTransfer -> GSInterface::init_transfer -> GSRenderer::wait_timeline (direct, non-worker GIF submit waiting on the GPU). Next candidate.
+- Needs rebuild. Watch for: missing/garbled GS output after SyncPath (then use SVR06_SYNCFENCE=1 to confirm).
+
+## CL-0232 - sceGsSyncPath(0): skip the GIF register polls when the async worker is on (2026-11-14)
+- Game-thread profile after CL-0231: still 40% of game-thread time in svr06VifFence, now via readIORegister(0x10003C00 / 0x10003020) in sceGsSyncPath's polling loops (fence site 7).
+- Kernel/Stubs/GS.cpp (.bak_syncfence2, PAL+USA): with async worker on (flag 15) mode 0 returns 0 right after processPendingTransfers(). Mode 1 (status query) unchanged. SVR06_SYNCFENCE=1 restores the old behaviour.
+- Needs rebuild; measure entrance vsync/s again (Taker entrance read ~40 before this).
+
+## CL-0233 - GS submit queue thread + faster GIF scan; continuous multi-thread sampler (2026-11-14)
+- Match profile with the new multi-thread sampler (hot plugin v15, .bak_v15; writes analysis/live/samp_t0..4.txt + samp_threads.txt every ~20 s): busiest thread = VIF1/GIF worker at 88% of a core (VU1 ~55%, of which program 0x28b8 = f20 ~29%; GIF->paraLLEl-GS ~25%, gifTransfer's own icon/texture-pack scan ~12% leaf). Game thread 23%, presenter 19%. The worker caps the match at ~35-40 fps.
+- gs/gs_vulkan_bridge.cpp (.bak_gsq, PAL+USA): new gsq queue. gsvk::gifTransfer called on the VIF worker copies the packet into a queue (pooled buffers, 48 MB back-pressure) and a dedicated thread feeds paraLLEl-GS. Ordering: writeReg / uploadImage / presentFrame / readLocalToHostCT32 / readVramPages / dumpVram and any non-worker gifTransfer drain the queue first. SVR06_GSQ=0 disables it.
+- ipStream (icon patch / texture pack GIF scanner): data blocks without an IMAGE upload of interest are skipped in one step instead of one qword per loop.
+- ps2_memory.cpp (.bak_gsq, PAL+USA): svr06VifFence also drains the GS queue; svr06VifIdle (presenter) requires the GS queue empty too. include/runtime/gs/gs_vulkan_bridge.h: drainQueue(), queueIdle().
+- Ordering test of the queue logic (standalone, 200k packets from a worker thread + one non-worker submit): order preserved.
+
+## CL-0234 - Game's own sceGsSyncPath (0x1A6F20) routed to the HLE stub (2026-11-14)
+- Match after CL-0233: 42-46 fps (was ~35-40). Thread loads: worker 77%, game thread 66%, GS submit thread 41%, presenter 17%.
+- Game-thread profile: 36% inside svr06VifFence, reached from sub_001A6F20 -> Load32 -> readIORegister. 0x1A6F20 is the game's statically linked libgraph sceGsSyncPath (polls 0x10009000, 0x1000A000, 0x10003C00, 0x10003020); the VIF/GIF register reads fence the worker on every poll.
+- overrides/svr06_overrides.cpp (.bak_gssync): replaceFunction(0x1A6F20, ps2_stubs::sceGsSyncPath) (stub has no worker fence, CL-0231/0232). SVR06_NOGSSYNCHLE=1 keeps the recompiled function. PAL only (USA address not mapped yet).
+
+## CL-0235 - sceGsSyncPath mode 1 (status poll) skips the VIF1/GIF status reads with the async worker (2026-11-14)
+- After CL-0234 (build 04:57 UTC): match 30-47 fps; thread loads worker 61%, GS queue 31%, game 14%, presenter 12%: nothing saturated, the game thread waits.
+- Game-thread profile: 47% in svr06VifFence inside ps2_stubs::sceGsSyncPath -> readIORegister: the game polls sceGsSyncPath(1) and the VIF1_STAT/GIF_STAT reads fence the worker every time.
+- Kernel/Stubs/GS.cpp (.bak_syncmode1, PAL+USA): with the async worker on, mode 1 reports only D1/D2 CHCR busy bits; VIF1/GIF count as idle. SVR06_SYNCFENCE=1 restores the reads.
+
+## CL-0236 - No worker fence on GS CSR reads with Vulkan GS; VIF fence no longer drains the GS queue (2026-11-14)
+- After CL-0235 (build 05:07 UTC): match 31-47 fps; worker 70%, GS queue 61%, game 42%. Game-thread profile: 49% in svr06VifFence via PS2Memory::read64 -> isGsPrivReg: the game polls GS CSR.
+- With paraLLEl-GS, CSR is never fed by the GIF stream (FINISH/SIGNAL bits are only set by the software GS; VSYNC/field come from EeScheduler), so the fence bought nothing; and since CL-0233 each fence also waited for the GS queue (GPU submits).
+- ps2_memory.cpp (.bak_csrfence, PAL+USA): isGsPrivReg skips the fence for CSR (0x12001000) when gsvk::enabled(); svr06VifFence no longer calls gsvk::drainQueue() (gsvk entry points drain themselves; the presenter idle check still includes the queue).
+
+## CL-0237 - Frame throttle between the game thread and the VIF1/GIF worker (2026-11-14)
+- After CL-0236 (build 05:18 UTC): the game thread no longer waits on the worker at all; it ran ahead (vsync ~80/s while only 15-18 frames/s were shown, then stalls with vsync frozen); worker at 97%. Stutter instead of speed.
+- ps2_memory.cpp (.bak_throttle, PAL+USA): job tickets (enq/done) in the worker; svr06VifFrameThrottle(vsyncTick): once per vsync, the caller waits (max 200 ms) until the worker has finished everything that was queued one vsync earlier. One frame of pipelining: the game builds frame N+1 while the worker renders frame N.
+- Kernel/Stubs/GS.cpp (.bak_throttle, PAL+USA): sceGsSyncPath mode 0 and mode 1 call the throttle when the async worker is on.
+
+## CL-0238 - Presenter latch waits for the finished frame, not for an idle worker (2026-11-14)
+- After CL-0237 (build 05:32 UTC): steady 17-19 fps with every thread mostly idle (worker 19%). Cause: the presenter (ps2_runtime.cpp) waited until "no draw for 4 ms + MTGS idle + worker idle" (cap 40 ms); with one frame of pipelining the worker is never idle, so every present hit the 40 ms cap.
+- ps2_memory.cpp (.bak_latch, PAL+USA): g_svr06FrameTicket = worker job count at the game's last frame boundary (set by the CL-0237 throttle); svr06VifFrameDone() = worker finished those jobs.
+- ps2_runtime.cpp (.bak_latch, PAL): with the async worker on, the latch waits only for svr06VifFrameDone() (max 40 ms); the old idle test stays for the synchronous path and the movie path. USA runtime has no presenter idle wait (unchanged).
+
+## CL-0239 - PAL vblank 50 Hz; no vsync catch-up bursts (2026-11-14)
+- User: "smoother but it looked too fast". Found: Kernel/EeScheduler.cpp paced the emulated vblank at 16667 us (NTSC 60 Hz) in the PAL build. The PAL game advances its logic per vsync, so at full speed it ran 20% fast; earlier this was hidden because the game never reached full speed. Also, after a slowdown the scheduler ran missed vsyncs back to back (~80 vsync/s bursts).
+- EeScheduler.cpp (.bak_catchup): PAL tree kVBlankPeriod / kVBlankPeriodCycles = 20000 us (50 Hz). USA tree stays 60 Hz (NTSC). Both trees: when the next vblank is more than two periods behind wall-clock time, pacing restarts from now (no catch-up burst).
+
+## CL-0240 - Presenter latch ticket = previous frame boundary (2026-11-14)
+- After CL-0238/0239 (build 05:42 UTC): vsync ~45-55/s (correct PAL speed) but still 14-18 presented fps, worker 95%. The latch ticket was the NEWEST frame boundary; the throttle updates it before waiting, so with a busy worker "frame done" was never true and every present hit the 40 ms cap.
+- ps2_memory.cpp (.bak_latch2, PAL+USA): g_svr06FrameTicket = previous boundary (prevT): the frame the worker has to finish before the game may continue.
+
+## CL-0241 - Game-thread GIF submits also go through the GS queue (2026-11-14)
+- After CL-0240 (build 05:52 UTC): match ~50 presented fps, game ~44 of 50 vsync/s. Entrance (05:56): ~34-45 vsync/s, no thread saturated (game 50%, worker 48%, GS queue 39%).
+- Entrance game-thread profile: 27% sceGsExecStoreImage (VRAM save: worker fence + GPU readback, needed for correctness, ISS-122/130), 22% synchronous gsvk::gifTransfer from the game thread waiting in ParallelGS init_transfer -> wait_timeline (GPU).
+- gs/gs_vulkan_bridge.cpp (.bak_gsqall, PAL+USA): with the async worker on, gifTransfer from any thread is queued (not only from the worker). Readbacks still drain the queue first. SVR06_GSQ=0 still turns the queue off.
+- Result (build 06:04 UTC, entrance): vsync exactly 50/s over 35 s (full PAL speed), ~60 presented fps, thread loads 64/52/48/16%. Match (CL-0240 build): ~50 presented fps, game ~44-50 vsync/s.
+
+## CL-0242 - Season post-match cutscene black screen: show the buffer the game draws into (2026-11-15)
+- Symptom (user, RAW "Uneasy Allies", skipped match): post-match cutscene black with brief flashes of Flair/ref/ropes, input locked, Batista music plays.
+- Evidence: hot plugin v16-v18 loggers (analysis/live/gsdisp.txt, gstrace.txt) + gifcap. Menus display FBP 0/128, match 0/80 (double buffered). The cutscene displays DISPFB1 = FBP 256 and DISPFB2 alternating 256/320 (PMODE 0x8007, both circuits, ALP 0x80) while every draw goes to FRAME FBP 0 (plus the crowd RTT at 478). Nothing is drawn into 256/320 -> black. The only libgraph calls in the scene are 2x sceGsExecStoreImage per frame from overlay 0x4FE034 (4x4 PSMZ24 Z readback = light/flare occlusion test); Z readback is unsupported with Vulkan GS (separate bug).
+- gs/gs_vulkan_bridge.cpp (.bak_undrawn, PAL+USA): per-FBP draw tracker in gifTransferNow / writeReg; presenter: if the DISPFB buffer received no primitives for 30+ presents while a same-width buffer received >= 200 draw loops in the last 2 presents, scan out that buffer (both circuits). Double-buffered scenes are unaffected (each displayed buffer is drawn every other frame). SVR06_NOUNDRAWN=1 disables. Logs "[undrawn]" (first 8).
+- Root cause of the 256/320 display address is still open (whatever copies FBP 0 into 256/320 on hardware is not happening here).
+
+## CL-0243 - Season cutscene dialogue (ptid 24 = BGM/SSND1|SSND2.AFS) plays natively; CL-0242 redirect made opt-in (2026-11-15)
+- CL-0242 result: cutscene still stuck, and NOW LOADING / transition screens were squashed and shuffled -> the undrawn-buffer redirect is now opt-in (SVR06_UNDRAWN=1), off by default (PAL+USA gs_vulkan_bridge.cpp).
+- Logged run (RUN_LOGGED, 07:00 UTC): after EVT2.PAC loads, the cutscene starts its dialogue with ADXT_StartAfs(ptid=24, fid=50) and (ptid=24, fid=51); both logged "[voice] StartAfs UNMAPPED". The voice map only covered ptid 18-23 (pbppac..casvoice); PACLISTP order continues ssnd1, ssnd2, and the game keeps the current file name at 0x329728 ("\BGM\SSND2.AFS;1"). The partition loader hook (0x147A98) never fires for it. The scene waits for the line that never plays -> stuck, input locked, no dialogue (also explains "Season cutscene has no commentary").
+- overrides/svr06_overrides.cpp (.bak_ssnd): adxStartAfsHook maps ptid 24/25 to the archive named at 0x329728 (fallback SSND1/SSND2) and plays it through the native ADX player with the game's handle (GetStat/Stop keep working); SSND clips are one-shot (no loop). PAL only (USA address of the SSND path buffer not mapped).
+
+## CL-0244 - Season dialogue partition map fixed: ptid 24 = SSND1, ptid 25 = SSND2 (2026-11-15)
+- CL-0243 result: cutscene now plays and moves on, but the user heard the wrong audio. CL-0243 took the file from the path buffer at 0x329728 (SSND2). The track resolver log shows season lines use banks of cnt=4000; SSND1.AFS has exactly 4000 entries, SSND2.AFS 2450, so ptid 24 = SSND1 and 25 = SSND2 (PACLISTP order). SSND1 fid 50 = 30 s stereo line; SSND2 fid 50 = 91.6 s (the wrong one that played).
+- overrides/svr06_overrides.cpp: fixed map ptid 24 -> BGM/SSND1.AFS, 25 -> BGM/SSND2.AFS.
+
+## CL-0245 - Season event cutscenes: titantron clips are in-world, not a fullscreen preview (2026-11-15)
+- User: video playback froze in a Season cutscene. Log: event overlay ("event.bin") requested NMVP001 entry 8 / NMVP000 entry 19 (224x192 titantron clips); the hook treated every non-"MainGame" overlay as a CAW/locker preview (fullscreen native video + gate); the game stopped the clip right away (MwStop/SfStop after 6-7 frames) and the held fullscreen frame looked frozen.
+- overrides/svr06_overrides.cpp (.bak_evttitan): overlay names starting with "event" use the in-world path (game decodes onto its own screen, we only provide the clock), same as matches.
+- Also seen in that run (not fixed): repeated guest memalign NULLs at 0x101DC4 during Season loads (the loader at 0x101D40 evicts and retries by design; the copy path at 0x102518 does not check NULL); Batista dialogue missing in a later scene; John Cena model oversized/detached in a scene. Season dialogue uses pairs fid n/n+1 (n = 50, 100, 150, 200, 250 so far, all SSND1).
+
+## CL-0246 - Season dialogue: AHX tracks decoded; ADXT Pause/GetTime for native handles (2026-11-15)
+- User: Batista's lines missing in the RAW ring segment (HHH/Flair promo, Batista comes out and answers); screenshot shows Batista talking with the mic.
+- Findings: each Season scene starts two clips, fid n (stereo ADX, scene audio, e.g. 250 = 332 s) and fid n+1 = CRI AHX (ADX header encoding 0x11, mono MPEG-2 Layer II frames with sync FFF5E0C0, cut to their real length; 251 = sparse voice/SFX track over the same 332 s). AHX failed in FFmpeg ("[music] no audio decoder"). The game also pauses / times the scene clip (adxt_Pause 0x156040 sets adxt+0x72; adxt_GetTime 0x154850), which the native player ignored, so the long scene clip kept running through Batista's entrance.
+- Kernel/Stubs/SvrMusic.cpp (.bak_ahx; PAL full, USA pause/time only): AHX entries are re-framed in memory (each frame padded to its header size, played at the ADX header rate) and decoded by FFmpeg's mp2 decoder; verified offline: SSND1 fid 251 -> 6917 frames = 332.0 s. Per-slot pause (silence, ring held) and played-frames counter; new API svr06_music_pause / svr06_music_time.
+- overrides/svr06_overrides.cpp (.bak_adxpause): hooks adxt_Pause (0x156040) and adxt_GetTime (0x154850) for native handles (time = frames at 48 kHz).
+- John Cena cutscene attire (jersey/cap huge and detached, screenshots): cloth (MoHo) nodes intact (guard silent); simulation diverges. Open; asked whether it also happens in Exhibition.
+- (ISS, open) Cena jersey/cap cloth: user screenshots (Exhibition entrance, build 08:13 UTC) show the same fault outside Season: sleeves/jersey balloon and detach in some poses (kneeling, arm raise), fine in others. So it is the cloth (MoHo) simulation in general, not cutscene teleports. Suspects: VU0 macro/micro float edge cases (no Inf/NaN/denormal on hardware; the EE FPU is hardware-exact since CL-0110 but COP2 is not), or variable frame timing since the CL-0237 pipelining. Next: find the cloth integrator (MoHo update 0x20EC00 -> ...), log its per-frame dt and any Inf/NaN/huge values per node.
+
+## CL-0247 - Title screen: keep the movie background behind the real PRESS START button (2026-11-15)
+- User: title shows the movie (logo + baked "Press START") first, then a black screen with only the game's real button; on PS2 both are on one screen. Bug present since early builds.
+- Cause: after the title movie ends the runtime holds its last frame behind the game's own layer (svr06_movie_hold, luminance-keyed overlay). The game starts its title theme (StartAfs ptid=1 fid=1) ~3 s later and the hook called svr06_movie_hold_release() on any game music start, dropping the background (log: "[movie] hold released (game music started)").
+- overrides/svr06_overrides.cpp (.bak_holdmusic): no longer releases the hold on music start (still stops the runtime-started theme). The hold now ends only by the existing rules: Start press edge, game layer faded out, or game drew a full screen.
+- Risk: if a menu transition keeps a bright partial layer, the logo could linger; those cases need a log line "hold released (...)" to tune. USA uses the same overrides file.
+
+## CL-0248 - Refresh Rate option: 50 Hz / 60 Hz / region default (2026-11-15)
+- User: wants a 50 or 60 Hz choice; the shown fps matches it; animation/audio must never speed up; keep headroom so the game never struggles to reach the rate, with the region's fixed rate as the speed guard-rail.
+- Design: game logic, audio and movies stay on the region vblank clock (EeScheduler: PAL 50 Hz, USA 60 Hz = the guard-rail). The option only sets the window's presentation rate (SetTargetFPS in ps2_runtime.cpp), so 60 Hz on PAL repeats frames (no speed change) and the host has spare time. Real 60 Hz game steps with same animation speed are not possible: the game advances per vblank and has no timestep to rescale (no 50/60 Hz mode or timestep constant found in the executable).
+- ps2_runtime.cpp: SetTargetFPS(hz), default PAL 50 / USA 60 (PAL was 60 before, which showed 60 fps while the game ran at 50); logs "[hz] present rate N Hz". Setting game.hz (0 region, 1 = 50, 2 = 60), env SVR06_HZ overrides.
+- ps2_ship_menu.cpp: "Refresh Rate" combo (PAL: Settings > Game > Performance; USA: next to SPU2 Interpolation). PAL: Kernel/Stubs/SvrConsole.cpp maps game.hz to SVR06_HZ. Backups .bak_hz. Applies on next start. Both trees.
+- Not yet built/tested.
+
+## CL-0249 - Launcher: Refresh Rate option (2026-11-15)
+- tools/launcher/server.py (.bak_hz): new per-game pref `hz` (0 region, 1 = 50 Hz, 2 = 60 Hz); in GAME_KEYS; launch env SVR06_HZ; synced both ways with svr06_settings.json key game.hz (the in-game Settings > Refresh Rate), same as the other game options.
+- tools/launcher/ui/app.js (.bak_hz): Home > Quick setup "Refresh rate" segmented control (Region / 50 Hz / 60 Hz); reset-to-defaults includes it.
+- Takes effect with CL-0248 runtime build. If SvR06Launcher.exe bundles the launcher, rebuild it (tools/launcher/build_launcher.ps1) to pick this up; launcher.py runs from source as is.
+
+## CL-0250 - FPS counter colour follows the chosen refresh rate (2026-11-15)
+- User: at 50 Hz the counter should be green when it hits 50 fps (it used a fixed 55 fps threshold, so a 50 Hz lock showed yellow).
+- ps2_runtime.cpp (.bak_hzhud, both trees): g_svr06PresentHz set where SetTargetFPS(hz) is called; counter is green at >= target-2 fps, yellow >= 75% of target, red below.
+- Build log of the CL-0247/0248 build showed "[hz] present rate 50 Hz" and "[movie] hold released (button)" (title hold now ends on Start).
+
+## CL-0251 - Title screen: skipping the intro movie keeps the logo picture behind PRESS START (2026-11-15)
+- User: title screen still wrong after CL-0247. Log of that run: LOGOP entry 3 aborted after 58 of 929 frames (skipped), then "holding last frame" -> the held picture was an early dark frame of the movie, so the real PRESS START button sat on black.
+- Kernel/Stubs/SvrMovie.cpp (.bak_tail, both trees): when the title movie (LOGOP entry 3) is aborted early, the movie thread seeks to its last ~3 s (timestamp seek, byte-seek fallback), decodes to the end without pacing and keeps the brightest late frame; svr06_movie_hold() uses it as the held picture. Log line "[movie] title skipped early: tail frame ready|NOT found".
+- Not yet built/tested. If the log says "seek to the end failed" or "NOT found", the next step is to cache the final frame the first time the movie plays through.
+
+## CL-0252 - Boot: skip the first two intro movies, keep the title movie (2026-11-15)
+- User: "remove the first two entries and keep the third as the default" (the boot plays LOGO ptid 15 idx 0, OP ptid 16 idx 2, then the title movie ptid 15 idx 3).
+- overrides/svr06_overrides.cpp (.bak_intros): the first two movie requests are ended immediately (PLAYEND) with log "[movie] intro skipped"; the title movie always plays. SVR06_INTROS=1 brings them back. The existing "Skip intro movies" option is unchanged.
+- Not built/tested. PAL addresses/ids only; USA movie names differ (MOVIE/LOGO.AFS, OP.AFS), so USA is not applied yet.
+
+## CL-0253 - Title screen: no text-only "Press START" while the title movie plays (2026-11-15)
+- User screenshots: wrong = movie with "Press START button" text but no pill (X); right = movie background + blue/red pill + text (check). Findings: the title movie (LOGOP entry 3, decoded offline with ffmpeg at 12/22/29.5 s) has NO baked text; during the movie the game's own layer holds only the text (pill is drawn after the movie ends), so the game text was shown alone over the video. Both game buffers (FBP 0/80) hold the pill + text after the movie; a second, off-screen copy of the pill sits at the bottom edge of the buffer.
+- SvrMovie.cpp (.bak_titleov): svr06_movie_title_playing() (title movie running); ps2_runtime.cpp (.bak_titleov): while it is true the game-layer overlay is not drawn, so the title shows the clean movie, then (hold) movie picture + pill + text together. Both trees.
+- Not built/tested.
+
+## CL-0254 - Launcher: maximize no longer covers the Windows taskbar (2026-11-15)
+- tools/launcher/launcher_app.py (.bak_taskbar): the frameless pywebview window used win.maximize(), which covers the whole screen including the taskbar. The maximize button now sizes the window to the monitor's work area (Win32 GetMonitorInfo rcWork, SetWindowPos) and restores the previous rectangle on the second click; falls back to the old call if that fails. Needs a launcher exe rebuild (scripts\build_launcher_exe.cmd).
+- CL-0252 amendment: the boot OP movie index varies (idx 1 in one run, 2 in another), so the skip now ends the first OP request (ptid 16) whatever its index; the idle attract-mode OP is not touched. Title movie (ptid 15 idx 3) always plays.
+
+## CL-0255 (2026-11-15) - title screen: hardware reference + experiment "game decodes the title movie itself" - built: no rebuild needed
+- Research (analysis/bug_title_press_start.md, "Research 04:20-04:35"): PCSX2 shows movie + pill + text together for the whole title movie, then the attract demo after ~30 s; sd7title.sfd is the title background loop (not an intro).
+- Experiment: scripts/probe_env.cmd sets SVR06_GAMETITLE=1 (backup probe_env.cmd.bak_gametitle) so the existing switch in svr06_overrides.cpp leaves ptid 15 idx 3 to the game's own Sofdec/IPU path. Revert = delete that line.
+- CL-0255 result: FAILED (black + text only; the game's own Sofdec stream never starts). Reverted: probe_env.cmd restored from .bak_gametitle.
+
+## CL-0256 (2026-11-15) - title / PRESS START screen rebuilt to hardware behaviour - built: NO (needs rebuild)
+- Root cause (analysis/bug_title_press_start.md): Title.bin's PRESS START object shows the pill only when the movie manager status (0x1C4590) reads 2 = playing for 5 frames, and draws the movie itself as a decal quad from VRAM 0x1E00 (TEX0 0x268029E00). The host FFmpeg player never put the game's Sofdec into 'playing', so the pill waited for the movie end (text-only / pill-only screens since the first builds).
+- svr06_overrides.cpp (.bak_titlefeed): new mwStatHook replaces 0x1C4590 while the title movie plays: each new decoded frame -> gsvk::uploadImage to DBP 0x1E00 DBW 10 CT32 (alpha 0x80), returns 2 once a frame is in VRAM. Title flow: no hold, no Start handling by the runtime (the game handles Start -> menu and the 30 s idle -> demo, then stops the movie); natural end -> PLAYEND. Switch: SVR06_TITLEFEED=0 restores the old path.
+- SvrMovie.cpp (PAL + USA, .bak_titlefeed): frame sequence counter, svr06_movie_grab_frame(), svr06_movie_set_vram_feed(); svr06_movie_present() draws nothing while the feed is on; svr06_movie_title_playing() false under the feed (CL-0253 skip no longer applies).
+- USA: overrides not ported (USA addresses differ); SvrMovie changes are inert there until the hook exists.
+
+## CL-0257 (2026-11-15) - boot videos restored (reverts the CL-0252 default) - built: NO (same rebuild as CL-0256)
+- User: the logo and opening videos must not be removed (the earlier "remove the first two entries" was about the title screen, misread as the intro movies).
+- svr06_overrides.cpp (.bak_introsback): LOGO (ptid 15 idx 0) and OP (ptid 16) play again by default; SVR06_INTROS=0 still skips them for testing.
+- CL-0256b (06:20): first test hung on the title with VRAM garbage ([gsvk-hang] no present, yellow blocks): the 640x448 frame went out as ONE IMAGE packet of 71680 qwords, but GIF NLOOP is 15 bits (max 32767) -> corrupted transfer. Now uploaded in 7 strips of 64 rows (TRXPOS DSAY per strip). Backup .bak_tfchunk. Intros (CL-0257) confirmed playing in that run.
+
+## CL-0258 (2026-11-15) - project icon / artwork - built: launcher exe needs rebuild (scripts\build_launcher_exe.cmd)
+- Original icon (no WWE/brand marks, no wrestlers): blue-vs-red split with light burst and torn white seam, riveted steel plate, chrome "06", RECOMP tag; rounded-square tile like other recomp icons (Zelda64/Banjo/Unleashed/HCTP/No Mercy/Know Your Role checked: analysis/recomp_icons_sheet.png). Small sizes (<=48 px) drop the tag.
+- Files: art\svr06.ico (16-256), art\svr06_icon_{1024,512,256}.png, art\svr06_icon_small_1024.png, art\svr06_icon_preview.png; generator tools\make_icon.py; docs\images\logo.png (512, the path Quiver's fix_missing_icons.py / other recomps use for appIconUrl via GitHub raw).
+- Launcher: build_launcher_exe.cmd --icon art\svr06.ico (.bak_icon); ui\index.html favicon + sidebar logo use ui\icon.png (.bak_icon).
+- Quiver: icons\svr06.png + SvR06 entry in add_manual_apps.py (.bak_svr06), not yet applied (run with Quiver closed).
+- CL-0258b: "SvR" lettering added above the plate (blue S, white v, red R, chrome bevel, generic Inter Black type), plate/numerals moved down; all exported files refreshed in the same places.
+- CL-0258c: "SvR" letters now glossy black with a silver outline (user request); files refreshed.
+- CL-0258d: Quiver changes reverted (add_manual_apps.py restored, icons\svr06.png removed); user will go through Quiver submission process. Icon stays in art\ and docs\images\logo.png for that.
+- CL-0256c (06:40): CL-0256b run: no hang, pill + text from the first frames, but the video area was flat dark teal. The game's own (unfed) Sofdec/IPU decoder still uploads 16x16 macroblocks (DBW 4) to DBP 0x1E00 every frame and overwrote our frame. gs_vulkan_bridge.cpp/.h (PAL + USA, .bak_upblock): gsvk::setUploadBlock(dbp, keepDbw) turns TRXDIR writes for host->local transfers to that DBP with a different DBW into TRXDIR 3 (paraLLEl-GS then ignores the IMAGE data); covers gifTransfer and writeReg. svr06_overrides.cpp (.bak_upblock): block 0x1E00 (keep DBW 10) while the title feed is on, cleared when it ends.
+
+## CL-0259 (2026-11-15) - game: window resolution, display mode, integer scaling - built: NO (needs game rebuild)
+- ps2_runtime.cpp (PAL + USA, .bak_display): svr06_apply_display() applies graphics.resolution (0 default 640x448, 1 480p 854x480, 2 720p, 3 1080p, 4 1440p, 5 2160p 4K) and the display mode live: windowed (window sized and centred; bigger than the monitor shrinks to 90% keeping the shape), borderless fullscreen (graphics.fullscreen=1, graphics.fsMode=0, desktop resolution), exclusive fullscreen (fsMode=1, the monitor switches to the chosen resolution; Default = monitor native). F11 still toggles graphics.fullscreen; the old path toggled exclusive fullscreen at the 640x448 window size. Log line [display].
+- graphics.integer implemented (whole multiples of the 448-line picture); was a DEV placeholder.
+- ps2_ship_menu.cpp (PAL + USA, .bak_display): F1 > Settings > Graphics gets Window Resolution and Fullscreen Type combos; Integer Scaling enabled.
+
+## CL-0260 (2026-11-15) - launcher redesign - built: launcher exe needs rebuild (scripts\build_launcher_exe.cmd); running from source picks it up at once
+- Theme matches the new icon: blue corner vs red corner, torn white seam in the hero, brushed-steel cards, chrome type, blue/red primary button. Default accent pair is now red/blue.
+- Navigation: 17 flat pages -> 9 grouped pages with tabs. Play; Library (Game versions, Memory cards); Settings: Video (Display, Quality, Picture), Audio, Controls (Button icons, Accessibility), Gameplay (Cheats, Game options, Enhancements); Content: Mods (texture pack + planned), Screenshots; Help: Support (Report issue, Logs, Health check, Tools); Launcher (General, Changelog, About & licenses). Old page names still work (links, search, #hash).
+- Video page (new): Resolution, Display mode, Aspect ratio, Integer scaling, Upscale filter, Refresh rate, Vsync, Frame queue, FPS counter, Performance mode; Quality: presets, Internal resolution, Renderer, Graphics card; Picture: brightness, contrast, gamma, black level, saturation, vibrance, color temperature, hue, sharpness + reset. Home keeps a Quick video card (presets, resolution, display mode).
+- Borderless window: edge/corner resize handles (pointer capture + SetWindowPos), Windows 11 rounded corners and shadow (DWM), min size 960x600, resize handles hidden while maximized.
+- server.py (.bak_redesign): GSET accepts graphics.resolution/fullscreen/fsMode/integer/frameQueue and image.*.
+- Files (.bak_redesign): tools/launcher/ui/index.html, app.js, style.css, launcher_app.py. Tested headless against the real server.py: all 10 pages and 19 tabs render without script errors; Video controls write svr06_settings.json.
+- CL-0256d (07:22): CL-0256c run: game uploads blocked, VRAM 0x1E00 holds the perfect title frame (vramfb dump), but the screen behind the pill stayed flat teal = the frame's top-left texel. Player struct 0x64B6C0: TEX0 0x268029E00 correct, picture size at +0x1D0/+0x1D4 = 0/0 (the game's decoder never decoded), and the draw 0x5A44A0 scales the quad UVs by size / next power of two -> one texel. mwStatHook now writes the decoded frame size (640x448) there (a0 - 0x10 = player) while reporting 'playing'. Backup .bak_picsize. Also live: frame rate back to 50 fps.
+- CL-0256 VERIFIED (12:04, build 07:29): title movie + pill + text together from the start, drawn by the game; demo after the movie like hardware. Bug "Press START screen" (present since the first builds) closed.
+- CL-0256e (12:10): user: after the title movie ends the screen goes black, the title music restarts and the PRESS START screen comes back instead of the demo. Log: natural end (929 frames, ~31 s) -> our PLAYEND -> the game replays the title; on the replay the game's idle timer fired after ~4 s (counter not reset) and the demo loaded. Cause: the game's 30 s idle timer (0x5A4350, 1501 frames) counts game frames; at 47-49 fps it needs ~32 s, so the 31 s movie ended first. On hardware the timer always wins. Fix: the title movie is started with loop=true under the feed, so it never ends by itself; the game stops it (Start -> menu, timer -> demo). Backup .bak_titleloop. Needs rebuild.
+- CL-0256f (12:35): CL-0256e run: title movie looped 3+ times, no demo. RAM: PRESS START object counter +0x34 = 1501 (timer fired), phase +0x10 = 3 (closing, 0x21D570), scene state 6. Phase-3 update 0x5A43E0 waits until the movie manager status (0x1CC9A0) is not 2; the feed answered 2 forever. Before CL-0256e this only worked by accident (natural movie end -> black -> second title). Fix: hook 0x1CC9A0; when called from the closing wait (ra 0x5A43FC, Title.bin loaded) set g_titleClosing, after which 0x1C4590 reports the real status (quad not drawn = fade to black like hardware); the game finishes closing, stops the movie object (feed cleared by the existing st!=3 branch) and loads the demo. Backup .bak_titleclose. Needs rebuild.
+
+## CL-0261 (2026-11-15) - speed: GIF packet batching on the VIF1/VU1 worker (heavy-scene fps) - built: NO (needs rebuild, PAL + USA)
+- Measured live, Royal Rumble (PAL build of 12:35, sampler + heartbeat): entrance 49 fps (game thread ~50% idle); match start 44-50 fps;
+  busy ring (4+ wrestlers) 32-36 fps. Bottleneck = the single VIF1/VU1 worker thread at 98% CPU (vu1run 2.4 s per 3 s); game thread
+  ~50% idle, GPU ~10.5 ms per frame (not the limit). Worker breakdown: gifTransfer 12.8%, processVIF1Data 9.4%, VU1 native programs
+  ~35% (f20/f2/f3/f8/f17...), fmacFinish 6.8%, ntdll (mutex / heap) ~24%. ~300,000 GIF packets/s were submitted one by one
+  ([waitprof] submit 317 ms / 911,998 per 3 s).
+- Per XGKICK packet the worker paid: a heap alloc + free in GifArbiter::submit/drain, a copy into the GS queue under its mutex, a
+  possible GS-thread wake-up, and 3 clock reads for [waitprof].
+- Fix (runtime, PAL + USA):
+  - ps2_gif_arbiter.h/.cpp: queue slots and their buffers are reused (m_used); no per-packet allocation.
+  - gs_vulkan_bridge.cpp (gsq): on the VIF1 worker, packets of the same path are appended to a thread-local 64 KB buffer and handed
+    to the GS queue every 32 KB, on a path change, at the start of every drain (readbacks, writeReg, uploadImage...) and at the end of
+    every worker job (gsvk::flushWorkerBatch, called in svr06vw::workerMain before the job is counted done, so fences / frame throttle
+    / presenter latch see everything). The GS byte stream and its order are unchanged (paraLLEl-GS, trackFrames and the icon/texture
+    stream patchers are all stream-stateful per path). SVR06_GIFBATCH=0 restores per-packet submission.
+  - gs_frontend.cpp (PAL only): [waitprof] submit timing sampled 1 in 64 packets (scaled), counts unchanged.
+- Backups: *.bak_gifbatch (ps2_gif_arbiter.h/.cpp, gs_vulkan_bridge.h/.cpp, ps2_memory.cpp, gs_frontend.cpp) in both runtimes.
+- Expected: worker load down by roughly a quarter -> busy Rumble back toward 50 fps. To verify with the same Rumble test after rebuild.
+- CL-0261 VERIFIED built (14:30 Rumble, busy ring): 34-41 fps (was 32-36). Worker ntdll samples 481 -> 286, [waitprof] submit 317 -> ~190 ms per 3 s,
+  gifTransfer gone from the worker profile (pushNow 4.7%). Worker still 94% CPU -> CL-0262.
+
+## CL-0262 (2026-11-15) - speed: VU1 worker hot paths (zero results, rounding mode, UNPACK) - built: NO (needs rebuild, PAL + USA)
+- Profile after CL-0261 (busy Rumble, worker 94%): f20 13.2%, processVIF1Data 11.2%, f3 6.8%, fmacFinish 6.5%, runFast 5.6%, f2 5.4%, ucrtbase 2.8%.
+- Native VU1 FMAC store (ps2_vu1_native_gen.cpp fin<>, and its generator tools/vu1bench/gen.cpp; PAL only, USA has no native VU1 yet):
+  the fast path refused any lane with exponent 0, so every exact 0.0 result went through the full normalise (vu1fast::fmacFinish).
+  Exact +-0 needs no normalisation; the fast path now only excludes denormals and Inf/NaN and sets Z for zero lanes
+  (mac = Z | S<<4, status = Z|S bits), identical to fmacFinish for those inputs.
+- VU1Interpreter::run / runFast (ps2_vu1_core.cpp, PAL + USA): std::fegetround/fesetround per VU run (~400k runs/s) replaced by
+  _mm_getcsr/_mm_setcsr on the MXCSR rounding bits (set only when not already round-to-zero, restored after).
+- VIF1 UNPACK (ps2_vif1_interpreter.cpp, PAL + USA): fast path for no mask, MODE 0, CL == WL, 32/16/8-bit formats (plain stores to
+  consecutive qwords; same results as the generic loop). The per-UNPACK analysis aids [zrace] (scanned up to 32 x 64 bytes of RAM per
+  UNPACK) and [unp320] now run only with SVR06_VIFDIAG=1.
+- Backups: *.bak_cl0262.
+- CL-0262 VERIFIED built (14:58 Rumble, busy ring): 43-47 fps (was 34-41; 32-36 before CL-0261). processVIF1Data 11.2% -> 4.8%,
+  fmacFinish gone from the profile. VU1 runs per 3 s up from 1.27M to 1.53M (more frames done). Worker still 92% -> CL-0263.
+
+## CL-0263 (2026-11-15) - speed: VU1 worker bookkeeping - built: NO (needs rebuild, PAL + USA)
+- svr06_prof.h Scope ([tprof] vu1run around every VU1 run, ~500k/s): 2 clock reads + 4 shared atomic RMWs per call (worker ntdll
+  still 18% of samples). Now 1 call in 64 per thread/index is timed, counted x64 (relaxed atomics); [tprof] numbers stay comparable.
+- gsq batching: the worker's batch buffer is swapped into the queue packet instead of copied (pushSwap; pushNow was 5% of the worker).
+- Backups: *.bak_cl0263.
+
+## CL-0264 (2026-11-15) - launcher identity "Ring apron" - built: launcher reads the live ui folder at once; exe needs scripts\build_launcher_exe.cmd for the bundled copy
+- User: the launcher still looks and feels generic. The CL-0260 layer (rounded SaaS cards, tracked ALL-CAPS labels, system fonts) replaced.
+- One bundled font family, Archivo (OFL, variable width 62-125%, ui/fonts + licence): ultra-condensed heavy slanted cuts for page titles,
+  the hero and Play (like SvR's own menu type); normal width elsewhere. Sentence case everywhere, no letter-spaced capitals.
+- Arena steel palette; SmackDown blue / Raw red only in the hero, split on the diagonal like the box art; the three ring ropes
+  (red, white, blue) as the rule under every page title; steel plates and controls with cut corners instead of rounded cards;
+  active nav / tab / segment marked with the white rope; championship gold used only for the Play button and keyboard focus.
+- Reduced motion respected (page fade removed, prefers-reduced-motion disables animations).
+- Title bar text "SvR06 Recomp". Only style.css and index.html changed (+ ui/fonts); app.js untouched.
+- Backups: style.css.bak_cl0264, index.html.bak_cl0264. Previewed headless (Play, Video, Library, Support).
+
+- CL-0263 built (15:14 Rumble, busy ring): 43-47 fps, about the same as CL-0262. Worker 89% CPU, game thread 61%: both idle part of
+  every frame. Worker ntdll samples: ~190 of 341 are its idle wait (no exe frame), 96 are GS-queue hand-offs (flushLocal: lock +
+  waking the GS thread), the rest heap frees of job data. -> CL-0265.
+
+## CL-0265 (2026-11-15) - speed: two frames of game/worker pipelining, bigger GIF batches - built: NO (needs rebuild, PAL + USA)
+- svr06VifFrameThrottle (ps2_memory.cpp): the game thread may now run two frame boundaries ahead of the VIF1/VU1 worker instead of
+  one (waits for the jobs queued two vsyncs ago). With one frame the two threads took turns at every boundary (both partly idle).
+  Presenter latch ticket unchanged. Cost: up to one more frame (20 ms PAL) between input and picture under load.
+  SVR06_PIPEDEPTH=1 restores the old behaviour.
+- gsq worker batches 32 KB -> 128 KB (fewer locks / GS-thread wake-ups per frame).
+- Backups: *.bak_cl0265.
+
+## CL-0266 (2026-11-15) - launcher: fully borderless window, only the launcher's own buttons - built: NO (rebuild SvR06Launcher.exe with scripts\build_launcher_exe.cmd)
+- User: the Windows minimize / maximize / full-screen buttons still show; use only the borderless title bar's buttons.
+- launcher_app.py style_window (runs when the window is shown): strips WS_CAPTION, WS_THICKFRAME, WS_SYSMENU and WS_MAXIMIZEBOX from
+  the window style and applies it with SWP_FRAMECHANGED, so Windows draws no caption, caption buttons, system menu or sizing frame.
+  WS_MINIMIZEBOX is kept so clicking the taskbar button still minimizes / restores. Moving: the title bar; resizing: the edge handles;
+  minimize / maximize / close: the launcher's own title bar buttons. Rounded corners + shadow unchanged.
+- Backup: launcher_app.py.bak_cl0266.
+
+## CL-0267 (2026-11-15) - revert CL-0265 pipelining default - built: NO (needs rebuild, PAL + USA)
+- CL-0265 build (15:36 Rumble, busy ring): game 45 vsync/s (unchanged) but only 19 frames presented per second. With the game two
+  frame boundaries ahead, the presenter latch (worker done >= prevT) was almost never met in time. Worker still 95%: the bubbles
+  were not the limit. Default is one frame again; SVR06_PIPEDEPTH=2 keeps the experiment. The 128 KB GIF batches stay.
+
+## CL-0268 (2026-11-15) - speed: AVX2 code generation, runtime logs off - built: NO (full rebuild, PAL + USA)
+- Offline VU1 bench (tools/vu1bench harness, same native programs as the game): -mavx2 -mbmi2 -mfma -ffp-contract=off vs the old
+  -msse4.1 -mssse3: ~8.2 vs ~10.3 ns per VU1 cycle (about 20% faster), all bench hashes (registers, flags, VU memory, GIF packets)
+  identical. -ffp-contract=off keeps every float operation separately rounded (no fused multiply-add), so results do not change.
+  The PC's CPU (Ryzen 5 5600X) has AVX2/BMI2/FMA; CPUs without AVX2 (before ~2013) can no longer run this build.
+- PS2X_ENABLE_RUNTIME_LOGS and PS2X_ENABLE_IOP_RPC_TRACE OFF (runtime trace logging in the kernel stubs; suggested in the
+  DevilKings fork notes).
+- Changed in build_svr06b_clang/CMakeCache.txt, PS2Recomp_usa/build_svr06_usa/CMakeCache.txt, scripts/usa_build.ps1 and
+  scripts/link_runtime.ps1 (backups *.bak_cl0268). Flag change = full rebuild of everything (longer than usual).
+- Also in this build: CL-0267 (pipelining back to one frame).
+- Live test after the build: `flag 16 1` in the live console turns on skipping VU1 MAC/status bookkeeping for programs that never
+  read flags (CL-0132); compare busy-Rumble fps with it on and off.
+
+## CL-0269 (2026-11-15) - crash fix: hot plugin sampler stack walk guarded - built: hot plugin only (scripts\build_hot.cmd, seconds)
+- Crash 17:23 (first run of the CL-0268 AVX2 build, ~3 min in): access violation in ntdll on a thread of the hot plugin
+  (loaded_1.dll = svr06_hot.dll) inside a KERNEL32 call. The plugin's profiler thread suspends the busiest game threads every
+  1 ms and walks their stacks with RtlLookupFunctionEntry / RtlVirtualUnwind; a thread stopped at an arbitrary instruction can
+  yield a bad return address, and RtlVirtualUnwind then reads unmapped memory. Diagnostic code, not the game.
+- Fix: the walk moved into sampUnwind() under SEH __try/__except; a fault ends that sample's walk, the thread is still resumed.
+  Plugin version string v19. Backup overrides/hot/svr06_hot.cpp.bak_cl0269.
+- CL-0268 + CL-0269 VERIFIED built (17:30 Rumble, busy ring): 41-51 fps, mostly 46-49 (was 43-47); VU1 runs per 3 s 1.53M -> ~1.73M.
+  No crash with the guarded sampler. Live A/B of flag 16 (CL-0214 default ON): ON 45-51, OFF 40-46 -> stays ON. Worker still ~95%.
+
+## CL-0270 (2026-11-15) - USA brought level with PAL (runtime 1:1, overlay hooks ported) - built: NO (USA build: scripts\USA_BUILD.cmd)
+- User: update the USA build with all PAL changes and fixes so it runs 1:1 with PAL, at 60 Hz.
+- Runtime: the USA tree (PS2Recomp_usa) had fallen behind - 18 runtime files differed (EeScheduler, CD, RPC, SvrConsole, SvrMovie,
+  SvrMusic, gs_frontend, gs_vulkan_bridge, ps2_memory, ps2_runtime, ps2_ship_menu, ps2_pad, VU1 core/inline, ...), ps2_runtime.h,
+  ps2_settings.h, ps2_vu1.h, CMakeLists, ps2xIOP, and it had no native VU1 programs (ps2_vu1_native*.{h,cpp}). usa_build.ps1 copies
+  PAL->USA with robocopy /XO (newer only), so files edited in both trees kept the stale USA version. Checked: no USA-only code in
+  the differing files. PAL ps2xRuntime/src/lib, include, CMakeLists.txt and ps2xIOP (src/include) copied over the USA tree
+  (rsync, *.bak* excluded). Backup of the old USA tree: svr06-recomp/build/usa_runtime_backup_cl0270.tgz.
+  The USA build now has every runtime fix of this week incl. CL-0230..0269 (speed: GIF batching, UNPACK fast path, native VU1
+  programs - same microcode on both discs, AVX2, title feed, display options, ...).
+- Game hooks: tools/usa_port_overrides.py (runs on every USA build) translated only 0x100010..0x3FFFFF. Overlay addresses were
+  copied unchanged, so the title-screen hooks (CL-0255/0256: ra 0x5A42BC/0x5A43FC/0x5A44B4, name check 0x5A2720), the Season
+  event check and the Create-overlay probe pointed at PAL overlay addresses. Measured from the USA overlay ELFs: the upper overlay
+  area loads 0x1380 higher on USA (Title.bin 6/6, MainGame 1293/1293, Create 910/910, CAS, Locker, moves: every function at
+  PAL+0x1380). New rule: 0x5A0000..0x67FFFF -> +0x1380. Menu.bin (lower area) differs; its one hooked function, the music-list
+  builder 0x561D10, matched by recompiled body (99.8%) to USA 0x5630A0.
+- 60 Hz: USA is NTSC; Refresh rate "Region" (default) gives 60 Hz and the game clock follows the region (no change needed).
+- Still PAL-only on USA: HD texture pack (hashes are PAL), controller icon sets, cheats (USA addresses unverified), Season
+  cutscene voice banks ptid 24/25 (unverified), hot plugin (built against the PAL build folder).
+- Backup: tools/usa_port_overrides.py.bak_cl0270.
+
+## CL-0271 (2026-11-15) - repository prepared for submission (not committed; waiting for the user's verification)
+- Clean export rebuilt: `python tools/export_github.py build/github_export/svr06-recomp --old-repo "C:\Users\ajizz\Github Projects\svr06-recomp"`
+  -> 628 files, 14 files removed vs the current repo (moved/obsolete: config/overlays/*, config/svr06_ps2recomp.toml -> regions/pal/recomp.toml,
+  docs/PROJECT_STATE.md, runtime/*, *.cl014x backups). Leak check: no game files, no generated code (sub_/ovl/ovx), no native VU1
+  programs, no VU1 microcode images, no token.
+- Public build without the native VU1 programs: ps2xRuntime/CMakeLists.txt uses src/lib/vu/ps2_vu1_native_gen.cpp only if present,
+  else the new ps2_vu1_native_none.cpp (empty table -> interpreter). PAL + USA trees (.bak_cl0271).
+- export_github.py (.bak_cl0271): never exports ps2_vu1_native_gen.cpp, natlist.txt, tools/vu1bench/img; now exports the launcher
+  fonts (+ OFL licence), launcher icon, art/ (app icon), docs/images/logo.png, release/regions.json.
+- Template .gitignore: exceptions for the project artwork PNGs, never-publish rules for the VU1 native/microcode files.
+- CHANGELOG.md (repo summary): new section for 2026-11-13..15 (speed, title screen, Season dialogue, display options, launcher, USA).
+- To publish after verification: run build\github_export\SYNC_TO_REPO.ps1 (mirrors into the git checkout and stages), review in GitHub
+  Desktop, commit, push. Re-run the export first if anything changed after this point.
+
+## CL-0272 - USA back to 60 Hz + ISS-161 IPU spin diagnostics (2026-11-16)
+- Regression from CL-0270 (USA runtime copied from PAL): the EE scheduler vblank was the PAL constant (20000 us), so the USA build ran its game clock at 50 Hz (heartbeat fps=50). Now the region clock comes from the disc serial: main.cpp sets SVR06_REGION_HZ (SLES/SCES = 50, every other serial = 60; a value set by hand wins); EeScheduler reads it for the vblank period (kVBlankPeriod / kVBlankPeriodCycles are now region-dependent), and the presenter's default output rate follows it (Settings > Refresh Rate still overrides). Same code in both trees, so later PAL->USA syncs keep it.
+- ISS-161 finding (USA freeze at match/arena select): the Sofdec/middleware thread th9 (entry 0x14B990) is raised to priority 1 and spins on IPU_CMD reads forever (log: `[ipu] rd64 CMD n=4294967296`, no further IPU commands). Both builds decode the same 256x256 MPEG-1 still (sequence header 000001B3, 100100C4, FFFFE142); PAL continues with FDEC 0x1E, USA stops issuing commands after the third FDEC and only polls. libmpeg (0x120000-0x126FFF) and the IPU wrappers (0x1964C0-0x196BC8) are identical in both ELFs apart from +0x1280 data pointers. While th9 holds priority 1 no other guest thread runs, which explains the freeze (and likely the missing menu/arena graphics).
+- Diagnostics added (both trees): PS2Runtime::Load32/Load64 note the guest pc/ra/sp of the last IPU register load; SvrIpu prints `[ipu] rd CMD from pc=.. ra=.. sp=.. stack: ..` at every power-of-two CMD read from 8 on, so one USA run names the spinning loop.
+- Files: ps2xRuntime/src/main.cpp, src/lib/Kernel/EeScheduler.cpp, src/lib/ps2_runtime.cpp, src/lib/Kernel/Stubs/SvrIpu.cpp in PS2Recomp and PS2Recomp_usa (.bak_cl0272 backups).
+
+## CL-0273 - USA main code regenerated with the current recompiler (2026-11-16)
+- ROOT CAUSE of the USA hang at arena/match select, and very likely of the misaligned/text-only menus and the crash: the USA main ELF code (out\generated_usa, 11-10) was produced by PS2Recomp\ps2xRecomp\build\ps2xRecomp\Release\ps2_recomp.exe, which was built 10-26 15:23. That predates every recompiler fix the PAL runner has: 64-bit branch compares (.bak_s64), JAL fix, EE FPU exact (incl. SQRT.S operand), MMI HI/LO and word multiply, VU DIV/SQRT, VSQI, VU clamp, vf0. The USA overlay banks (VM build of 11-07) already had them; only the main code was stale.
+- Proof (CL-0272 diag): th9 spins at pc 0x121454 in libmpeg's IPU-wait 0x121328: `ld s1,IPU_CMD; bgezl s1,done`. IPU_CMD = 0x00000000FFFFE142 (not busy). The stale USA code tested `GPR_S32(s1) >= 0` (low word negative -> "busy" forever); PAL tests `GPR_S64`.
+- Fix: rebuilt ps2_recomp from the current sources (Linux, cloud container) and regenerated SLUS_212.86 with the unchanged USA toml: 7,292 files, all branch compares 64-bit. Old output kept as out\generated_usa.bak_cl0273; archive build\regen\generated_usa_cl0273.tgz.
+- usa_build.ps1 (.bak_cl0273): refuses -Regen when ps2_recomp.exe is older than its sources, so the stale exe cannot overwrite the good output again. To regenerate on Windows later, rebuild ps2_recomp.exe first.
+
+## CL-0274 - USA picture squashed into the top of the screen: scan-out forced to PAL video mode (2026-11-16)
+- Symptom (USA, after CL-0273): every game screen drawn into the top ~78% of the picture (title, menus, select screens), so the game layer no longer lined up with the intro/title movies drawn under it.
+- Cause: gs_vulkan_bridge.cpp synthesizes SMODE1 for paraLLEl-GS (libgs is HLE'd) and always picked PAL (CMOD 3). The USA game renders 224-line NTSC fields (VRAM dump: double-buffered 640x224 fields at FBP 0 / 0x46); scanned as 288-line PAL fields they fill 224/288 = 78% of the frame.
+- Fix: CMOD follows the region clock (SVR06_REGION_HZ from CL-0272): NTSC discs get CMOD 2, PAL stays CMOD 3. Both trees (.bak_cl0274).
+- Still open on USA (seen in the 19:13-19:16 screenshots): word gaps in menu text drawn as a garbage glyph, garbage blocks / salmon box on the superstar select screen.
+
+## CL-0275 - USA freeze at match start: 18 indirect-call entry points missing from the USA toml (2026-11-16)
+- Symptom: USA now loads the arena (CH.PAC reads after MENU.PAC 0x32f800), then freezes at match start. Log: `[guest-branch:missing-target] kind=IndirectCall op=JALR source=0x225234 target=0x2269f0`; the main thread (th1) ends Dormant at pc 0x2269F0.
+- Cause: usa_map.py carried PAL entry points only through addr_map entries of quality >= 2. PAL 0x225850 (an entry reached only by JALR) mapped with quality 1 to 0x2269F4 (off by one instruction: the USA prologue is one word longer) and was dropped, so the USA build had no callable entry at 0x2269F0. 22 PAL entry points were affected.
+- Fix: entry points re-derived by matching code (prologue alignment + normalised 16-word window vs both ELFs); 18 recovered entries (code range only) added to config\svr06_usa_ps2recomp.toml (marked "CL-0275"; backup .bak_cl0275): 0x10D110 0x1BAC40 0x1BC970 0x1BD4A0 0x1CAB60 0x20EE40 0x219B50 0x2223B0 0x222A30 0x2248D0 0x225330 0x226890 0x2269F0 0x249810 0x24BF50 0x24BF60 0x24BF74 0x24BF88. USA code regenerated with the current recompiler (5 files change; other files keep their timestamps so the rebuild is incremental). Archive build\regen\generated_usa_cl0275.tgz.
+- Still open: USA menu textures (superstar grid, VS/WWE logos, brand box) show garbage/wrong palettes; word gaps drawn as a glyph.
+
+## CL-0276 - PAL ISS-008 fix ported to USA: 1,874 hidden function starts (2026-11-16)
+- Finding: the PAL runner differs from what the PAL toml produces with the current recompiler by exactly 1,777 registered entries = the ISS-008 / CL-0020 "hidden starts" (vtable-only leaf functions after `jr ra`/`j`+nop, 16-byte aligned) that were merged straight into the PAL runner and never written to the toml. The USA build is generated from its toml, so it never had them: functions reached only through vtables/pointers ran from the wrong place (the PAL symptom of ISS-008 was broken menu/state-machine behaviour).
+- Fix: the same ovl_recomp.py heuristic run on the USA ELF (main code 0x100000-0x30D750, mpeg area 0x123000-0x127000 excluded as in PAL; validated on PAL: reproduces 1,775 of the 1,777 merged entries) minus already-registered addresses = 1,874 entries, added to config\svr06_usa_ps2recomp.toml (marked "CL-0276 hidden start"; backup .bak_cl0276). USA code regenerated: 1,586 files changed/new, register table 236,546 -> 238,529 entries; 9 obsolete entry_*.cpp files moved to out\stale_cl0276 and PS2Recomp_usa\ps2xRuntime\stale_cl0276. Archive build\regen\generated_usa_cl0276_delta.tgz.
+- Also ported: CL-0037 VU0 MAC/STATUS flag production (patch_vu0_flags.py) in sub_0010D3B0 / sub_0010D400 (PAL files, identical code) and sub_00114F70 (sites 0x114FD0/D4/F0/F4).
+- Checked and already present in the regenerated USA code via the translator: VFTOI clamp, VDIV/VSQRT, ACC clamp, MMI HI/LO, 64-bit branches, vf0 sink. Not ported (PAL-only cheats/guards): god mode, open titles, Chara inline guard (ISS-150 runtime fix covers the root cause).
+
+## CL-0277 - Full PAL -> USA audit: everything PAL carries is now in USA (2026-11-16)
+Method: rebuilt PAL from its own toml with the current recompiler (+ the 1,777 hidden starts) and diffed against the shipped PAL runner; every remaining difference is a hand patch or a diagnostic. Same comparison for all 10 overlay banks, the stub list, the port-override address table and the runtime's hard-coded game addresses.
+Ported to USA:
+- ISS-123 delay slots that live in the next function: sub_00118EA0 (0x118FFC `b`, sq $v1,0xA0($sp)) and the USA-only twin sub_001E8230 (0x1E847C `bltzl`, addiu $v0,-1) found by the same scan.
+- ISS-101 camera guard (PAL 0x1A8EF0 -> USA sub_001A8EE0): keep the last valid view matrix when the camera object is poison-filled.
+- CL-0037 VU0 MAC/STATUS flags (sub_0010D3B0, 0010D400, 00114F70).
+- These are applied by the new tools\usa_postgen_patches.py, now run automatically by usa_build.ps1 before the USA code is copied (idempotent; backup usa_build.ps1.bak_cl0277).
+- MISSING OVERLAY: USA had no bank table for Locker.bin (only ovxLocker_functions.h + 331 function files), so the Locker Room overlay code was never registered. out\usa_ovl\x\ovxLocker\final\svr06_ovxLocker.cpp derived from the PAL table +0x1380 (method checked on CAS: identical function table, 42,333 of 42,335 labels).
+- Menu overlay label fix (PAL CL-0217 note, case 0x564E10) -> USA ovxMenu_00566180 case 0x5661A0.
+- Cheats: any-gender / GM open titles (CL-0172/0173, diag bits 0x200/0x400) on the matched USA Menu functions 0x4DBE30, 0x4DD7F0, 0x57D170, 0x582970 (9 of 9 sites). God mode not ported (the USA MainGame function differs too much to place it safely).
+- Runtime bug found (affected USA only): Vu0ExactGen.cpp sceVu0ecossin hard-coded the PAL coefficient table 0x30D700; on USA that address holds other data, so every sceVu0RotMatrixX/Y/Z result was wrong (rotated menu/3D objects). Now reads the table address from the game's own lui/addiu (both trees, .bak_cl0277).
+Checked, nothing to port: the 265 stubs map to matching USA code; all 93 quality-3 hook addresses in the port report verify against both ELFs; recompiler-level fixes (64-bit branches, VFTOI/ACC clamps, VDIV, SQRT.S, vf0) are present in the regenerated USA main code and all USA banks (the PAL banks still hold 590 unclamped ACC sites, so USA banks are newer than PAL here); the remaining PAL-runner differences are diagnostics (camlog, eulerlog, snd*, coll*, spin101cd0 ...).
+Known leftovers: 4 PAL guard/coverage hooks have no reliable USA match (0x20EC00 MoHo update guard, 0x1B9380/0x1B93C0/0x1B9840 coverage probes) and stay disabled on USA.
+Note for PAL: its 1,777 hidden starts exist only in the runner, not in config\svr06_ps2recomp.toml; a PAL regeneration from the toml would drop them.
+
+## CL-0278 - PAL hidden starts written into the PAL toml (2026-11-16)
+- The 1,777 ISS-008 / CL-0020 hidden function starts that existed only in the PAL runner are now in config\svr06_ps2recomp.toml (entry_points, marked "CL-0278"; backup .bak_cl0278). A PAL regeneration from the toml now keeps them (verified in the CL-0277 audit: regenerated PAL then differs from the shipped runner only by hand patches and diagnostics).
+- No effect on the current PAL build: no PAL build script reads the toml or regenerates. If PAL is ever regenerated, re-apply the PAL hand patches (tools\codeaudit\patch_*.py, plus the ISS-123 delay-slot and ISS-101 camera-guard edits listed in CL-0277).
+
+## CL-0279 - USA titantron loader: per-disc file names (1 s freeze before entrances) (2026-11-16)
+- User (USA): entrances freeze for about a second before they start; PAL loads titantrons without it.
+- Cause: the [cl0215] ADXF_GetFnameRangeEx HLE (fnameRangeHook) that builds the titantron partition so the game streams the video itself had PAL names hard-coded (MOVIEP/NMVP00n.AFS, "moviep/nmvp00n.afs") and the PAL file-table index 104. The USA disc has MOVIE/NMV00n.AFS, so no partition was built (no "[fnr] built partition" line in the USA log); the game's stream failed and the native fallback player opened the file synchronously = the freeze.
+- Fix (overrides/svr06_overrides.cpp, .bak_cl0279; reaches USA through usa_port_overrides.py): svr06TitanDir/Name pick MOVIEP/NMVP or MOVIE/NMV from the disc; svr06TitanLbn finds the file's entry in the game's {lbn,size} file table by its size (bytes or sectors), PAL index 104 only as fallback; logs "[fnr] <file> = file table entry N". PAL behaviour unchanged.
+
+## CL-0280 (2026-11-15) SPU2 runaway-voice guards + sample sanity diagnostics (Buried Alive chair: no SFX, then ringing)
+- Symptom (USA, Buried Alive): chair weapon hit plays nothing, then a continuous ringing sound.
+- Log review of the run (saved as analysis/run_err_usa_buriedalive_20261115.txt): SPU bank region at 0x5010 is re-uploaded several times (DMA core=1 -> 0x5010 0x20000 / 0x25010 0xe140 repeated); hundreds of KONs at ssa 0x2808 (first sample of that region) with identical pitch 0x759/vol 0c7b, i.e. the same sample for many different sounds; PAL log shows a varied-sample mix instead.
+- ps2xIOP/src/emulator/core/iop_spu2.cpp (both trees, .bak_cl0280):
+  * KONBAD log: at every KON, scan the sample (<=0x4000 blocks) for an end flag and non-zero data and log voices whose sample is empty / has no end flag.
+  * RUNAWAY guard: a voice that walks 0x8000 blocks (512 KB) without an end flag is stopped.
+  * RUNAWAYLOOP guard: repeat flag with no loop-start flag and no LSA looping onto its own start more than 48 times is stopped (the continuous buzz case).
+  * LONGVOICE log every 4 s for voices alive > 6 s; DMA log cap 60 -> 600.
+- Needs rebuild; then repeat the chair hit and read [spu2] KONBAD / RUNAWAY / LONGVOICE lines.
+
+## CL-0281 (2026-11-17) - EE RPC callback start/done tracing (USA NOW LOADING stall diagnostic)
+- EeScheduler.cpp (both PAL and USA runtimes; backup .bak_cl0281): logs `[cl0281] rpc-cb START(run|idle)` and `[cl0281] rpc-cb DONE` (tag = server sid, pc, thread, pending queue size) for the first 600 RpcCallback invocations each. No behaviour change.
+- Purpose: USA hang after character select. Stall point: after last SOUND.PAC load + sndrpc #50, two queued EE RPC callbacks (sid 0x200 fn 1 func 0x1c0a50), then no further CD read. Stuck run has mainWaitFlag=0 and th1 awake; good run has mainWaitFlag=1 with th1 asleep. Need to learn whether the queued callbacks start and finish.
+- Findings so far: not a slowdown (60 fps, idle loader); sound worker th3 (entry 0x1c0670) idle on sema 9; callback 0x1c0a50 fn=1 calls guest fn pointer at msg+0x14 with a1=msg+0x18.
+
+## CL-0282 (2026-11-17) - resolution-mode readout + CAS sharpening
+- gs_vulkan_bridge.cpp: logs `[gsvk] internal resolution mode N` to stderr too (was stdout only); new svr06_internal_res_mode().
+- ps2_runtime.cpp: FPS overlay now ends with `R<mode>` (R0 native, R1 SSAA4x, R2 2x, R3 2x+SSAA8x) so the active mode is visible on screen.
+- ps2_ship_menu.cpp: image.sharp is now AMD-style contrast-adaptive sharpening (no halos) instead of a 4-tap unsharp mask.
+- Applied to PAL and USA runtimes; backups .bak_cl0282. Not yet built/tested.
+
+## CL-0283 (2026-11-17) - frame-pacing recorder + debug-log gating (performance pass step 1)
+- ps2_runtime.cpp (PAL+USA): presenter now logs `[ftime] 3s: n= p50= p95= p99= max= over20= over33=` every 3 s and `[ftime] SLOW <ms> vsync=<tick>` for any frame interval > 25 ms (first 300). Measures real frame-to-frame time, not just present cost.
+- iop_kernel.cpp (PAL+USA): the `[iop-sema12]` signal/wait prints (up to 800k lines per session) are now off unless env SVR06_VERBOSE is set.
+- Baseline from the Buried Alive session (run_err_usa_buriedalive_20261115.txt): present avg 3.8 ms, 71 of 658 three-second windows had a present spike >16.7 ms, 5 >33 ms, worst 197 ms (at startup). tprof shows sprite ~13% of wall time (~400 ms/3 s).
+- Backups .bak_cl0283. Not yet built/tested.
+
+## CL-0284 - wall-clock vsync while an idle-priority thread runs (2026-11-17)
+- Symptom (USA, Finisher Situation / Attribute select and other movie-background menus): presenter 60 fps but guest vsync ~16/s, game logic at 1/4 speed, then a hard stop.
+- Cause: VBlank fires only when BOTH the guest cycle deadline and the host deadline pass. The watchdog showed th9 (Sofdec middleware, entry 0x14B990, prio 46) as the only running thread, looping over its server callbacks at 0x16D7C0-0x16D878 ([prof] 16D800:3000) with very heavy IPU decode (fdec ~720k). Guest cycles advanced slowly in host time, so vsync starved.
+- Fix: EeScheduler::checkpointDue: every 512 checkpoints, if the running thread's priority >= 40 and the earliest deadline's host time is >2 ms past, account guest cycles up to that deadline (hardware: vsync is wall-clock, the idle thread just gets less time). Logs `[cl0284] wall-vsync skip #N` at powers of two. Opt out: SVR06_NO_WALLVSYNC=1. Normal-priority game threads are untouched.
+- Files: ps2xRuntime/src/lib/Kernel/EeScheduler.cpp in both trees (.bak_cl0284).
+
+## CL-0284 - remove redundant game-thread work (2026-11-17)
+(The earlier wall-clock-vsync idea was reverted before any build: it changed guest timing.)
+- GS::writeRegister (Vulkan active): the HLE GS clear (Kernel/Stubs/GS.cpp applyGsClearPacket, once per frame) wrote its sprite through direct register writes, which paraLLEl-GS drew AND the software rasterizer drew again into a VRAM copy that is never displayed or read back in Vulkan mode. `[tprof] sprite` showed ~2 ms per call on the game thread. Vertex-kick registers (XYZ2/XYZF2/XYZ3/XYZF3) now skip the CPU draw when Vulkan is active; all other register state is unchanged. Opt back in: SVR06_CPU_DIRECT_DRAW=1.
+- New `[gsclear] 3s: n= fence= max=` line: how long the game thread waits on the VIF/VU1/GIF drain before each GS clear (next optimisation target if large).
+- Debug GS packet/VRAM dump no longer runs by default (renderer default tick 7000, run.cmd 10300, launcher USA 4800): it wrote a 4 MB VRAM snapshot + ~20 frames of packets to disk mid-game every run. Still available by setting SVR06_GSDUMPTICK.
+- Files (both trees, .bak_cl0284): ps2xRuntime/src/lib/gs/gs_frontend.cpp, ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp; svr06-recomp/scripts/run.cmd, tools/launcher/server.py.
+
+## CL-0285 - IPU colour conversion 7-12x faster, bit-exact (2026-11-17)
+- Finding: every `[ftime] SLOW` frame in menus sat inside Sofdec movie decoding. The IPU CSC ran ~60,000 macroblocks/s (39 M in one session) on the game thread through PCSX2's scalar reference paths: ~15 us per macroblock = ~17 ms per 640x448 frame.
+- yuv2rgb and ipu_dither now have SSE2 versions with the same integer arithmetic. Verified offline (tools/ipubench/exact.cpp): all 2^24 Y/Cb/Cr inputs + 200,000 random macroblocks for CSC, 600,000 macroblocks (both dither modes, clamp edges) for dither: 0 mismatches. End-to-end CSC through the real DMA/FIFO path (tools/ipubench/bench.cpp) gives identical output hashes.
+- Speed (per macroblock, offline): RGB32 16.2 -> 1.3 us; RGB16 12.8 -> 1.4 us; RGB16+dither 14.6 -> 2.1 us.
+- The `[cscstat]` analysis scan (read each macroblock twice) now only runs with SVR06_VERBOSE=1.
+- A/B switch: SVR06_IPU_REFCSC=1 uses the original scalar code.
+- Files: ps2xRuntime/src/lib/Kernel/Stubs/SvrIpu.cpp in both trees (.bak_cl0285); new svr06-recomp/tools/ipubench/ (bench.cpp, exact.cpp, rt.cpp; build with clang++ -O2 -msse4.1 against SvrIpu.cpp, shim intrin.h -> x86intrin.h on Linux).
+
+## CL-0286 - slow-frame profiler (2026-11-17)
+- Finding after CL-0284/0285 (USA menu): one 25-53 ms frame every ~250 vsyncs (~4 s), very regular. Present stays < 11 ms; the pre-clear fence measures 0 ms. The old [sample] sampler watched one thread that sits in a wait the whole time, so it cannot see the cost.
+- New profiler in vu/ps2_vu1_sampler.cpp (debug flag 22 = 4194304, live: `svrlive.py flag 22 1`): every ~1 ms it reads every thread's CPU cycles and samples the RIP (+ first exe return address) of each thread that ran. On every frame > 25 ms the presenter calls svr06SlowFrame() and the sampler prints `[slowsamp] frame N ms:` plus, per busy thread (top 5), `tid (name) ms= Mcyc= top: rva<callerRva:count ...`.
+- USA builds now write analysis\svr06_usa.map (lld /MAP via usa_build.ps1); resolve with `SVR06_MAP=analysis/svr06_usa.map python tools/mapsym.py RVA`.
+- Files: both trees ps2xRuntime/src/lib/vu/ps2_vu1_sampler.cpp, ps2xRuntime/src/lib/ps2_runtime.cpp (.bak_cl0286); svr06-recomp/scripts/usa_build.ps1, tools/mapsym.py (.bak_cl0286).
+
+## CL-0287 - HD texture pack: stage 2 (actual replacement) (2026-11-17)
+- paraLLEl-GS (third_party/parallel-gs/gs/gs_interface.{hpp,cpp}): new GSInterface::set_texture_replace_hook. When a long-term cached, single-level, non-SSAA texture is bound for a render pass the hook may return another image view. TexInfo sizes/region/bias stay computed from the NATIVE cached view, and the shader samples with normalised coordinates, so an image of any resolution covering the same texture rect samples the same area at higher detail. Native caching, page tracking and invalidation are unchanged; no hook registered = identical behaviour.
+- gs_vulkan_bridge.cpp: on a cache (re)creation the bridge hashes the texture from the CPU copy of host uploads exactly like stage 1 / PCSX2 (raw swizzled blocks + CSM1 CT32 palette); only EXACT texture+palette pack matches are replaced. PNGs (4x) are decoded on two worker threads (stb_image, static), cropped to the cached rect, alpha clamped to the original's max alpha (upscaler overshoot), uploaded as RGBA8; the native texture is shown until the HD one is ready. Re-uploads change the hash -> back to native automatically.
+- Safety: VRAM pages written by the GPU (FRAME/ZBUF targets in any A+D position, local->local copies) are marked dirty until the next host upload; textures touching dirty pages or never uploaded (all-zero) are never replaced. Skipped: mipmapped, SSAA-arrayed, CT16/CT24, CT16 palettes, rects outside the texture. 3 GB budget.
+- Log: `[texpack2] HD ready #N file (w x h -> W x H) | looked= matched= dirtySkip= budgetSkip= failed= mem=`. SVR06_TEXPACK_HD=0 = detection log only.
+- Launcher: pack path fixed (mods/texturepack/USA_Textures|PAL_Textures/replacements; the old emulation_lovers_hd path no longer exists) and the pack is allowed on USA (hashes are content-based; the pack is a USA pack). Mods page stage = 'hd'.
+- Compile-checked offline (clang -fsyntax-only with the real Granite/paraLLEl-GS headers) for gs_vulkan_bridge.cpp and gs_interface.cpp.
+- Files (both trees, .bak_cl0287): ps2xRuntime/src/lib/gs/gs_vulkan_bridge.cpp, ps2xRuntime/third_party/parallel-gs/gs/gs_interface.{hpp,cpp}; svr06-recomp/tools/launcher/server.py.
+
+## CL-0288 - slow-frame profiler moved off debug flag 22 (2026-11-18)
+- CL-0286 put the slow-frame profiler on debug flag 22, but flags 17..28 are the ISS-145 VU1 bisect switches (`s_cl133Off = ... | (flags >> 17) & 0xFFF` in ps2_vu1_core.cpp runFast). Flag 22 therefore also switched off the native VU1 fast path.
+- Measured live in a USA entrance: flag 22 on = vu1run 2.7 s per 3 s and 20-28 frames over 33 ms per 3 s; flag 22 off = vu1run 1.6-1.75 s and 3-6 frames over 33 ms. The extra hitching after the profiler was switched on (21:52 and 22:15 runs) came from this.
+- Profiler now enabled by `SVR06_SLOWPROF=1` or by creating `analysis\live\slowprof.on` (checked every 0.5 s). Debug flag 22 is back to its bisect meaning only. Both trees, ps2xRuntime/src/lib/vu/ps2_vu1_sampler.cpp (.bak_cl0288). Needs a rebuild.
+- Rule for the future: never assign new debug flags in 17..28 (bisect range), 29 (Safe mode) or 30 (VU0 fast path).
+
+## CL-0289 - PSP Arcade: WWE Texas Hold'em (2026-11-18)
+- New native screen over the game (like the F1 menu): F1 > Enhancements > Gameplay > "Play WWE Texas Hold'em". No game code is called or patched; while the table is open the game sees an idle controller (same mechanism as the F1 menu) and F1 is ignored.
+- Rules (ps2_arcade_holdem_engine.h): no-limit hold'em, you vs John Cena, Batista, Triple H, $5,000 each, blinds $50/$100 rising every 8 hands, side pots, all-ins, heads-up blinds, odd-chip rule. Computer players: Monte Carlo equity vs live opponents + pot odds + per-player aggression/looseness, short thinking delay. Win = bankrupt everyone (PSP goal); wins counted in svr06_settings.json `arcade.holdem.wins`.
+- Art read at runtime from the user's PSP game: $SVR06_PSPDIR/PSP_GAME/USRDIR/zpac/zmisc.pac, DPAC group MGTX -> PAC -> BPE -> GIM decoded in C++ (felt, 4 card faces + back, 8 chip stacks, CHECK/BET/CALL/RAISE/FOLD/WINNER, SvR logo, PSP button glyphs; 28/28 decoded from the user's USA PSP data). Nothing from the PSP game is in the repo. Without the PSP game linked the screen explains how to link it and closes.
+- Controls: D-pad/arrows choose and size the bet, L1/R1 or PgUp/PgDn big steps, Triangle/Tab all in, Cross/Enter confirm, Circle/Esc leave (with confirm); mouse click and wheel work too.
+- Tested offline: 200 simulated computer-only games (8,123 hands) with chip totals checked after every hand; rendered with raylib 5.5 under Xvfb against the user's zmisc.pac; ship menu + arcade + stubs link cleanly.
+- Files (both trees, .bak_cl0289): new src/lib/ps2_arcade_holdem.cpp, src/lib/ps2_arcade_holdem_engine.h; ps2_ship_menu.cpp (button, F1 guard, svr06_ship_font()), ps2_runtime.cpp (svr06_arcade_frame after the menu), ps2_pad.cpp (idle pad while open), CMakeLists.txt (new source). Launcher 2: game.arcade description corrected. Needs a rebuild.
+- Next: Game Show (needs the clip -> move-name list), then Eugene Airplane Race.
+
+## CL-0290 - Arcade Mode entry on the game's main menu (2026-11-18)
+- Main menu mapped (USA RAM dumps at the main menu, cursor moved 0->1->2, Exhibition sub-menu, back): Menu.bin descriptor table at 0x59C5F0 (stride 0x30; entry 0 = main menu {count 6, 1, 0, 0, x 320.0, y 262.0, ..., labels -> 0x59BCB0 = [1..6]}; entry 1 is a built-in 7-item variant [1, 0x4D1, 2, 3, 4, 0x6A9, 6]). Live list object on the heap (0xC7E7E0 in both main-menu visits): +0 descriptor, +4 cursor (0..5), +0x14 item records (20 bytes: +0 greyed flag, +16 label id; Online = label 5 has flag 1). Builder func 0x540C20, descriptor getter 0x540BE0. The object is gone while a sub-menu is open.
+- The presenter now reads (never writes) those to know when the main menu is on screen and shows an "Arcade Mode" entry under the menu: SELECT (or F2, or click) opens WWE Texas Hold'em. Greyed out with "Needs the PSP game" when the PSP game is not linked, as the spec asks (like Online). Detection: descriptor signature scan of the Menu.bin slot every 30 frames; list object checked at its last address, otherwise searched 512 KB per frame (no frame stalls). Verified on the 4 dumps: main menu yes (cursor 0/2/2), sub-menu no.
+- Not yet: a real 7th row inside the game's own list (needs the label art id and the confirm handler for a new label; candidate = the built-in 7-item descriptor, slot 2 after Exhibition).
+- Files: ps2_arcade_holdem.cpp (mainmenu namespace + entry drawing), ps2_runtime.cpp (passes guest RAM to svr06_arcade_frame), both trees. Needs a rebuild.
+
+## CL-0291 - Arcade Mode as a real main-menu item, like the PSP (2026-11-18)
+- Found in Menu.bin (USA): the PSP 7-item main menu list is still in the PS2 game (descriptor 1: labels [1, 0x4D1 Arcade Mode, 2, 3, 4, 0x6A9 Wireless, 6]); the labels are text ids drawn with the chrome font, and the PS2 text data still holds "Arcade Mode", "Texas Hold'em", "Eugene Airplane Race", "Game Show" and their descriptions. The greying routine (0x4E3310) works by label; the confirm handler (0x4E2300) dispatches by label (6 Options, 0x6A9, 5 Online, 4 Locker Room, 3 Create, 2 Game Modes, 1 Exhibition) and has no case for 0x4D1, so Cross on Arcade does nothing in the game itself.
+- Runtime (guest RAM only, disc data untouched): as soon as Menu.bin is resident, the main-menu descriptor is pointed at the PSP list with Wireless replaced by Online (count 7, PSP row spacing). Live-tested 2026-11-18: seven rows in the game's own font, only Online greyed (set by the game). Cross on the Arcade Mode row is taken by ps2_pad.cpp and opens the port's Arcade Mode screen (PSP layout: header, Texas Hold'em / Eugene Airplane Race / Game Show, description panel, Select / Back); Eugene and Game Show are greyed "not available yet". The row is greyed while the PSP game is not linked. F1 > Enhancements > Gameplay: "Arcade Mode in the Main Menu" (menu.arcadeEntry, default on) and "Play WWE Texas Hold'em".
+- Replaces the CL-0290 corner box. Files (both trees): ps2_arcade_holdem.cpp, ps2_pad.cpp, ps2_ship_menu.cpp, ps2_runtime.cpp. Needs a rebuild.
+
+## CL-0292 - PSP Arcade: Game Show playable (2026-11-18)
+- Reverse-engineered the PSP Game Show data. Questions are 40-byte records in the PSP moves overlay (bin_PSP.pac OVRM/MOVS): {right answer, 3 wrong answers, category, picture, next question's two text words, 0, 0}; a record's own question words sit in the two words before its answers. Answers are SDB/MING text ids; question words name the nearest existing text id below the stored value. Pictures: zmisc MGQG/Q000..Q008, outer entry 57, picture number = media id (Q000 PPV arenas 20, Q001 portraits 63, Q002 belts 11, Q003 attire 52, Q004 finishers 35, Q005 crowd signs 57, Q006 silhouettes 44, Q007 tattoos 23, Q008 match scenes 11). Checked against the pictures (crowd signs 10550..10556 = Hogan, JYD, DiBiase, Jake Roberts, Jimmy Hart, Steven Richards, Daivari).
+- Category 9 (match scenes) shows the picture for 5 seconds, hides it, then asks (how many Superstars, rope colour, weapon, diving attack, thrown outside, match type, PPV). Categories 10 (entrance music / song / voice) and 11 (50 movie clips) are not built (need PSP audio banks and PMF video).
+- The first record of each category carries answers of the table before it, and a few PSP records have wrong-kind choices ("Stunner" among belts, the WWE Championship text among Superstars): first records are skipped, wrong-kind distractors are swapped for another right answer of the same category, wrong-kind right answers are dropped. USA PSP data: 324 records -> 305 questions (26 distractors replaced).
+- Native screen (ps2_arcade_gameshow.inc, included by ps2_arcade_holdem.cpp): title with the SvR logo and the PSP game-show stage backdrop (MGQG/MNLB), 10 questions spread over the categories, 15 s each, 2x2 answers (arrows + Cross, mouse, keys 1-4), CORRECT / INCORRECT / TIME OVER from the PSP text, score 100 + 10 per second left, result + high score (settings arcade.gameshow.best). Circle asks before leaving. The Arcade Mode row "Game Show" is now enabled.
+- Also: the Arcade Mode list screen described in CL-0291 had only been in the test harness copy; it is in both trees now.
+- Files (both trees): ps2_arcade_holdem.cpp (dpacEntry, Screen::GameShow, list entry enabled), new ps2_arcade_gameshow.inc; launcher2 schema text. Needs a rebuild.
+
+## CL-0293 - Game Show: pictures matched to the right answers (2026-11-18)
+- User report: pictures did not match the answers (Lita shown with no Lita choice). Cause: I had the quiz record layout wrong. The Game Show code indexes the table as 0x8D1DA80 + 40 * n (0x8CE589C) and reads +0 category, +4 picture; the real record is {category, picture, question line 1, question line 2, 0, 0, right answer, wrong 1, wrong 2, wrong 3}, so my reading paired every question with the next record's answers. Also every text number is 1 above the SDB/MING id it shows (the game's text is the existing entry just below the number, 0x1084 -> 0x1082 The Rock).
+- With the right layout all 334 picture questions are consistent with their pictures (portraits 10111 Lita, 10125 The Hurricane, 10151 John Cena, 10145 Bret Hart; belts 10201 World Heavyweight; signs 10500 The Rock) and the CL-0292 "repairs" are gone. Full table: 470 records (20 arenas, 63 portraits, 11 belts, 52 attire, 34 finishers, 57 signs, 44 silhouettes, 23 tattoos, 30 match-scene, 74 music/voice, 50 clip).
+- Screen layout and rules are still the port's own (no PSP reference yet). File: ps2_arcade_gameshow.inc (both trees). Needs a rebuild.
+
+## CL-0294 - Game Show rebuilt to match the PSP (2026-11-18)
+- Watched the PSP Game Show live in the user's PPSSPP (USA ULUS10050). Real flow: no title screen, straight to "Question 1"; 10 questions; 10-second clock; the four choices are on Cross / Circle / Triangle / Square in a list; wrong choices fade out as the clock runs (about 7.5, 5 and 3.5 s left) and can no longer be picked; a pick locks in and shows its button in the 1P circle, the clock still runs out, then the 1P plate shows CORRECT +points, INCORRECT or TIME OVER; points = 10 per choice still showing when picked (seen +20, +30). Top bar "Question N" with ten marks (red = right, dark = wrong). Portrait questions zoom out over the 10 s; match scenes show the picture 5 s with "You will be given 5 seconds..." then ask text-only. Text-only questions ("The Pedigree belongs to which WWE Superstar?", "What is Hulk Hogan's finishing move?") come from a third PSP table: {0, 0, line 1, subject, line 2, line 3, right, wrong x3} (55 records). Result screen over the stage backdrop: Result box, 1P / name / score, Rematch / Match Select / Exit, Cross Select.
+- Port now follows that layout on the PSP's 16:9 screen (drawn at 2x), with the same rules. Keys: Enter/Space or 1 = Cross, Backspace or 2 = Circle, Tab or 3 = Triangle, 4 = Square (pad face buttons as usual); Esc / P / Start asks to quit. 389 questions (55 text, 334 picture). Still missing from the PSP: the music / voice questions and the movie-clip questions (category 10 and 11, they need PSP audio and PMF video), and the PSP's chrome art pieces (drawn with plain shapes for now).
+- Seen while there: the PSP's Texas Hold'em has a Training / Tournament menu first; the port goes straight to a game.
+- Files (both trees): ps2_arcade_gameshow.inc, ps2_arcade_holdem.cpp. Needs a rebuild.

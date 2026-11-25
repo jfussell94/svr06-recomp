@@ -12,6 +12,11 @@
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include <filesystem>
+// CL-0287: PNG decoding for the HD texture pack (static, so no clash with other stb copies in the exe)
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#include "../../../third_party/parallel-gs/Granite/third_party/stb/stb/stb_image.h"
 #include <unordered_map>
 #define XXH_INLINE_ALL
 #include "../../../third_party/xxhash/xxhash.h"
@@ -19,6 +24,8 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -37,6 +44,9 @@ extern std::atomic<uint32_t> g_svr06Diag;
 extern std::atomic<int> g_svr06DrawLimit;
 extern std::atomic<int> g_svr06DrawCtr;
 bool svr06_movie_active(); // SvrMovie.cpp
+bool svr06VifOnWorker(); // ps2_memory.cpp (CL-0233)
+bool svr06VifAsyncOn(); // ps2_memory.cpp (CL-0241)
+void svr06SlowFrame(float ms); // CL-0296: global (ps2_vu1_sampler.cpp); all-thread sample when the presenter stops
 namespace gsvk
 {
 // [scale] internal resolution: 0 = native, 1 = native output + SSAA 4x, 2 = 2x output (SSAA 4x + high-res scanout), 3 = 2x output + SSAA 8x.
@@ -120,7 +130,7 @@ bool initLocked(State &s)
 
     ParallelGS::GSOptions opts;
     { const int m = scaleMode(); if (m == 1 || m == 2) opts.super_sampling = ParallelGS::SuperSampling::X4; else if (m == 3) opts.super_sampling = ParallelGS::SuperSampling::X8;
-      std::cout << "[gsvk] internal resolution mode " << m << (m >= 2 ? " (2x output)" : (m == 1 ? " (SSAA 4x)" : " (native)")) << std::endl; }
+      std::cout << "[gsvk] internal resolution mode " << m << (m >= 2 ? " (2x output)" : (m == 1 ? " (SSAA 4x)" : " (native)")) << std::endl; std::fprintf(stderr, "[gsvk] internal resolution mode %d\n", m); }
     if (!s.iface.init(&s.dev, opts))
     {
         reportFatal("paraLLEl-GS initialisation failed.");
@@ -209,6 +219,7 @@ static void imgWatch(const uint8_t *d, uint32_t n)
 // diagnostics: host-side hang watchdog. Stage ids: 10 gif waiting for lock, 11 gif has lock, 12 inside iface.gif_transfer, 20 present has lock, 21 flush, 22 vsync, 23 readback submit, 24 wait_idle, 25 done
 static std::atomic<int> g_stgGif{0}, g_stgPres{0};
 static std::atomic<uint64_t> g_presCount{0}, g_gifCount{0};
+static std::atomic<int> g_rttPassPn{0}; static std::atomic<uint64_t> g_rttStart{0}; // [rttlog] present index of first FRAME_1 write to the crowd RTT (cutscene start)
 static void startHangWatch()
 {
     static std::once_flag once;
@@ -222,6 +233,7 @@ static void startHangWatch()
                 if (p == lastP) ++stall; else stall = 0;
                 if (stall >= 4 && (stall % 5) == 4)
                     std::fprintf(stderr, "[gsvk-hang] no present for %ds: pres stage=%d gif stage=%d presCount=%llu gifCount=%llu (gif calls moved=%d)\n", stall * 2, g_stgPres.load(), g_stgGif.load(), (unsigned long long)p, (unsigned long long)g, g != lastG);
+                if (stall >= 4 && (stall % 5) == 4) ::svr06SlowFrame(8000.0f); // CL-0296: sample every thread's RIP/caller
                 lastP = p; lastG = g;
             }
         }).detach();
@@ -253,6 +265,7 @@ namespace
         int logN = 0; uint32_t uniq = 0, texHit = 0, exact = 0;
     } g_tp;
     constexpr uint32_t kVMask = (4u << 20) - 1u;
+    uint8_t g_tpDirty[512]; // CL-0287: 8 KB VRAM pages written by the GPU (FRAME/ZBUF targets, local->local copies) since their last host upload
     void tpInit()
     {
         if (g_tp.init) return;
@@ -294,7 +307,7 @@ namespace
             for (uint32_t o = 0; o + 4 <= size && x.n < total; o += 4, ++x.n)
             {
                 const uint32_t px = x.sx + (uint32_t)(x.n % x.rw), py = x.sy + (uint32_t)(x.n / x.rw);
-                std::memcpy(v + (GSPSMCT32::addrPSMCT32(x.dbp, x.dbw, px, py) & kVMask), d + o, 4);
+                { const uint32_t a_ = GSPSMCT32::addrPSMCT32(x.dbp, x.dbw, px, py) & kVMask; std::memcpy(v + a_, d + o, 4); g_tpDirty[a_ >> 13] = 0; }
             }
         }
         else if (x.dpsm == 19)
@@ -302,7 +315,7 @@ namespace
             for (uint32_t o = 0; o < size && x.n < total; ++o, ++x.n)
             {
                 const uint32_t px = x.sx + (uint32_t)(x.n % x.rw), py = x.sy + (uint32_t)(x.n / x.rw);
-                v[GSPSMT8::addrPSMT8(x.dbp, x.dbw, px, py) & kVMask] = d[o];
+                { const uint32_t a_ = GSPSMT8::addrPSMT8(x.dbp, x.dbw, px, py) & kVMask; v[a_] = d[o]; g_tpDirty[a_ >> 13] = 0; }
             }
         }
         else
@@ -312,7 +325,7 @@ namespace
                 const uint32_t px = x.sx + (uint32_t)(x.n % x.rw), py = x.sy + (uint32_t)(x.n / x.rw);
                 const uint32_t nib = GSPSMT4::addrPSMT4(x.dbp, x.dbw, px, py);
                 const uint8_t val = (o & 1u) ? (d[o >> 1] >> 4) : (d[o >> 1] & 15u);
-                uint8_t &b = v[(nib >> 1) & kVMask];
+                g_tpDirty[((nib >> 1) & kVMask) >> 13] = 0; uint8_t &b = v[(nib >> 1) & kVMask];
                 b = (nib & 1u) ? (uint8_t)((b & 0x0f) | (val << 4)) : (uint8_t)((b & 0xf0) | val);
             }
         }
@@ -402,6 +415,179 @@ namespace
         else if (g_tp.logN < 700) { ++g_tp.logN; std::fprintf(stderr, "[texpack] none tbp=%u psm=%u %ux%u hash=%llx clut=%llx\n", tbp, psm, w, h, (unsigned long long)th64, (unsigned long long)ch); }
         if ((g_tp.uniq % 100) == 0)
             std::fprintf(stderr, "[texpack] stats: unique textures seen=%u, tex-hash hits=%u, exact (tex+palette)=%u\n", g_tp.uniq, g_tp.texHit, g_tp.exact);
+    }
+}
+// ============================================================================
+// CL-0287: texture pack stage 2 = HD replacement. paraLLEl-GS calls tp2Replace (GSInterface::set_texture_replace_hook) when it binds
+// a long-term cached texture. We hash the texture exactly like stage 1 / PCSX2 (raw swizzled blocks + CSM1 palette) from the CPU copy
+// of host->local uploads, and on an EXACT pack match (texture AND palette) return an HD image of the same texture rect (PNG decoded on
+// a worker thread; native is used until it is ready). Never replaced: textures in VRAM pages the GPU has drawn into since their last
+// upload (render targets; the CPU copy would be stale), mip-mapped / SSAA textures, palettes other than CT32 CSM1, sizes the PNG does not
+// divide evenly. Off unless SVR06_TEXPACK is set; SVR06_TEXPACK_HD=0 keeps stage 1 (detection log) only.
+// ============================================================================
+namespace
+{
+    void tpMarkDirty(uint32_t page0, uint32_t pagesPerRow, uint32_t rows)
+    {
+        if (!pagesPerRow) pagesPerRow = 1;
+        for (uint32_t r = 0; r < rows; ++r) for (uint32_t c = 0; c < pagesPerRow; ++c) g_tpDirty[(page0 + r * pagesPerRow + c) & 511u] = 1;
+    }
+    struct Hd
+    {
+        std::string path; uint32_t W = 0, H = 0, rx = 0, ry = 0, rw = 0, rh = 0; uint8_t maxA = 255;
+        std::atomic<int> state{0}; // 0 queued, 1 decoded (px), 2 image ready, -1 failed
+        std::vector<uint8_t> px; uint32_t pw = 0, ph = 0;
+        Vulkan::ImageHandle img;
+    };
+    struct Tp2
+    {
+        bool init = false, on = false;
+        std::string dir;
+        std::mutex qm; std::condition_variable qcv; std::deque<Hd *> q; bool worker = false;
+        std::unordered_map<std::string, Hd *> byKey;
+        std::unordered_map<const Vulkan::Image *, Hd *> byImg;
+        uint64_t bytes = 0; uint64_t budget = 3ull << 30;
+        uint32_t looked = 0, matched = 0, dirtySkip = 0, shown = 0, failed = 0, budgetSkip = 0;
+    } g_tp2;
+    void tp2Worker()
+    {
+        for (;;)
+        {
+            Hd *h = nullptr;
+            { std::unique_lock<std::mutex> lk(g_tp2.qm); g_tp2.qcv.wait(lk, [] { return !g_tp2.q.empty(); }); h = g_tp2.q.front(); g_tp2.q.pop_front(); }
+            int w = 0, ht = 0, n = 0;
+            stbi_uc *p = stbi_load(h->path.c_str(), &w, &ht, &n, 4);
+            const uint32_t s = (p && h->W && w > 0 && (uint32_t)w % h->W == 0u) ? (uint32_t)w / h->W : 0u;
+            if (!p || !s || (uint32_t)ht != h->H * s)
+            {
+                if (p) stbi_image_free(p);
+                std::fprintf(stderr, "[texpack2] cannot use %s (%dx%d for a %ux%u texture)\n", h->path.c_str(), w, ht, h->W, h->H);
+                h->state.store(-1); continue;
+            }
+            h->pw = h->rw * s; h->ph = h->rh * s;
+            h->px.resize((size_t)h->pw * h->ph * 4u);
+            for (uint32_t y = 0; y < h->ph; ++y)
+            {
+                const uint8_t *src = p + ((size_t)(h->ry * s + y) * (uint32_t)w + h->rx * s) * 4u;
+                uint8_t *dst = h->px.data() + (size_t)y * h->pw * 4u;
+                std::memcpy(dst, src, (size_t)h->pw * 4u);
+                for (uint32_t x = 0; x < h->pw; ++x) if (dst[x * 4u + 3u] > h->maxA) dst[x * 4u + 3u] = h->maxA; // upscaler overshoot above the original's alpha
+            }
+            stbi_image_free(p);
+            h->state.store(1);
+        }
+    }
+    // PCSX2 replacement hash of the texture described by TEX0 (same as tpTex0) + max alpha + whether any page is GPU-dirty
+    bool tp2Hash(uint64_t tex0, uint64_t &th64, uint64_t &ch, uint8_t &maxA, bool &dirty)
+    {
+        const uint32_t tbp = (uint32_t)(tex0 & 0x3fff), tbw = (uint32_t)((tex0 >> 14) & 63), psm = (uint32_t)((tex0 >> 20) & 63);
+        const uint32_t tw = (uint32_t)((tex0 >> 26) & 15), th = (uint32_t)((tex0 >> 30) & 15);
+        const uint32_t cbp = (uint32_t)((tex0 >> 37) & 0x3fff), cpsm = (uint32_t)((tex0 >> 51) & 15), csm = (uint32_t)((tex0 >> 55) & 1);
+        if (psm != 0 && psm != 19 && psm != 20) return false;
+        if (psm != 0 && (cpsm != 0 || csm != 0)) return false;
+        if (tw > 10 || th > 10) return false;
+        const uint32_t w = 1u << tw, h = 1u << th;
+        const uint32_t bw = psm == 0 ? 8u : (psm == 19 ? 16u : 32u), bh = psm == 0 ? 8u : 16u;
+        const uint8_t *v = g_tp.vram.data();
+        dirty = false; maxA = 0; bool nz = false;
+        XXH3_state_t st; XXH3_64bits_reset(&st);
+        for (uint32_t by = 0; by < (h / bh ? h / bh : 1u); ++by)
+            for (uint32_t bx = 0; bx < (w / bw ? w / bw : 1u); ++bx)
+            {
+                const uint32_t x = bx * bw, y = by * bh;
+                uint32_t a;
+                if (psm == 0) a = GSPSMCT32::addrPSMCT32(tbp, tbw, x, y);
+                else if (psm == 19) a = GSPSMT8::addrPSMT8(tbp, tbw, x, y);
+                else a = GSPSMT4::addrPSMT4(tbp, tbw, x, y) >> 1;
+                a &= kVMask;
+                if (g_tpDirty[a >> 13]) dirty = true;
+                XXH3_64bits_update(&st, v + a, 256);
+                if (!nz) for (uint32_t k = 0; k < 256; ++k) if (v[a + k]) { nz = true; break; }
+                if (psm == 0) for (uint32_t k = 3; k < 256; k += 4) if (v[a + k] > maxA) maxA = v[a + k];
+            }
+        if (!nz) return false; // never uploaded by the host (or blank): nothing trustworthy to match
+        th64 = XXH3_64bits_digest(&st);
+        ch = 0;
+        if (psm != 0)
+        {
+            uint32_t pal[256];
+            const uint32_t n = psm == 19 ? 256u : 16u;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                uint32_t xx, yy;
+                if (n == 256) { const uint32_t j = (i & 0xE7u) | ((i & 8u) << 1) | ((i & 16u) >> 1); xx = j % 16u; yy = j / 16u; }
+                else { xx = i % 8u; yy = i / 8u; }
+                const uint32_t pa = GSPSMCT32::addrPSMCT32(cbp, 1, xx, yy) & kVMask;
+                if (g_tpDirty[pa >> 13]) dirty = true;
+                std::memcpy(&pal[i], v + pa, 4);
+                if ((pal[i] >> 24) > maxA) maxA = (uint8_t)(pal[i] >> 24);
+            }
+            ch = XXH3_64bits(pal, n * 4u);
+        }
+        return true;
+    }
+    Hd *tp2Match(const ParallelGS::TextureDescriptor &d)
+    {
+        const uint64_t tex0 = d.tex0.bits;
+        const uint32_t psm = (uint32_t)((tex0 >> 20) & 63), tw = (uint32_t)((tex0 >> 26) & 15), th = (uint32_t)((tex0 >> 30) & 15);
+        const uint32_t W = 1u << tw, H = 1u << th;
+        if (d.rect.width == 0 || d.rect.height == 0 || d.rect.x + d.rect.width > W || d.rect.y + d.rect.height > H) return nullptr;
+        uint64_t th64 = 0, ch = 0; uint8_t maxA = 0; bool dirty = false;
+        ++g_tp2.looked;
+        if (!tp2Hash(tex0, th64, ch, maxA, dirty)) return nullptr;
+        auto it = g_tp.idx.find(th64);
+        if (it == g_tp.idx.end()) return nullptr;
+        const uint32_t bits = psm | (tw << 6) | (th << 10);
+        const TexPack::E *hit = nullptr;
+        for (const auto &e : it->second) if (e.bits == bits && e.clut == ch) { hit = &e; break; }
+        if (!hit) return nullptr;
+        if (dirty) { ++g_tp2.dirtySkip; return nullptr; }
+        char key[160]; std::snprintf(key, sizeof key, "%s|%u,%u,%u,%u|%u", hit->name.c_str(), d.rect.x, d.rect.y, d.rect.width, d.rect.height, maxA);
+        auto f = g_tp2.byKey.find(key);
+        if (f != g_tp2.byKey.end()) return f->second;
+        const uint64_t need = (uint64_t)d.rect.width * d.rect.height * 16u * 4u; // 4x pack
+        if (g_tp2.bytes + need > g_tp2.budget) { ++g_tp2.budgetSkip; return nullptr; }
+        g_tp2.bytes += need;
+        Hd *h = new Hd();
+        h->path = g_tp2.dir + "/" + hit->name; h->W = W; h->H = H; h->rx = d.rect.x; h->ry = d.rect.y; h->rw = d.rect.width; h->rh = d.rect.height; h->maxA = maxA;
+        g_tp2.byKey.emplace(key, h);
+        ++g_tp2.matched;
+        { std::lock_guard<std::mutex> lk(g_tp2.qm); g_tp2.q.push_back(h); if (!g_tp2.worker) { g_tp2.worker = true; std::thread(tp2Worker).detach(); std::thread(tp2Worker).detach(); } }
+        g_tp2.qcv.notify_one();
+        return h;
+    }
+    const Vulkan::ImageView *tp2Replace(void *, const ParallelGS::TextureDescriptor &d, const Vulkan::Image *native, bool fresh)
+    {
+        Hd *h = nullptr;
+        auto it = g_tp2.byImg.find(native);
+        if (fresh || it == g_tp2.byImg.end()) { h = tp2Match(d); g_tp2.byImg[native] = h; }
+        else h = it->second;
+        if (!h) return nullptr;
+        int s = h->state.load();
+        if (s == 1)
+        {
+            Vulkan::ImageCreateInfo info = Vulkan::ImageCreateInfo::immutable_2d_image(h->pw, h->ph, VK_FORMAT_R8G8B8A8_UNORM);
+            Vulkan::ImageInitialData init = {h->px.data(), 0, 0};
+            h->img = st().dev.create_image(info, &init);
+            std::vector<uint8_t>().swap(h->px);
+            h->state.store(s = h->img ? 2 : -1);
+            if (s == 2) ++g_tp2.shown; else ++g_tp2.failed;
+            if (g_tp2.shown <= 20 || (g_tp2.shown % 100) == 0)
+                std::fprintf(stderr, "[texpack2] HD ready #%u %s (%ux%u -> %ux%u) | looked=%u matched=%u dirtySkip=%u budgetSkip=%u failed=%u mem=%lluMB\n", g_tp2.shown,
+                             h->path.c_str() + g_tp2.dir.size() + 1, h->rw, h->rh, h->pw, h->ph, g_tp2.looked, g_tp2.matched, g_tp2.dirtySkip, g_tp2.budgetSkip, g_tp2.failed,
+                             (unsigned long long)(g_tp2.bytes >> 20));
+        }
+        return s == 2 ? &h->img->get_view() : nullptr;
+    }
+    void tp2Register(ParallelGS::GSInterface &iface)
+    {
+        if (g_tp2.init) return;
+        g_tp2.init = true;
+        const char *d = std::getenv("SVR06_TEXPACK"); const char *hd = std::getenv("SVR06_TEXPACK_HD");
+        if (!g_tp.on || !d || (hd && hd[0] == '0')) return;
+        g_tp2.dir = d; g_tp2.on = true;
+        iface.set_texture_replace_hook(tp2Replace, nullptr);
+        std::fprintf(stderr, "[texpack2] HD replacement on (%s)\n", d);
     }
 }
 namespace
@@ -556,12 +742,13 @@ namespace
                 const uint32_t r = (uint32_t)(hi & 0xff);
                 if (r == 0x50) ps.bb = lo; else if (r == 0x51) ps.tp = lo; else if (r == 0x52) ps.tr = lo;
                 else if (r == 0x06 || r == 0x07) { if (g_tp.on) tpTex0(lo); }
-                else if (r == 0x53) { if (g_tp.on) { if ((lo & 3) == 0) tpBegin(path & 3u, ps.bb, ps.tp, ps.tr); else g_tp.xf[path & 3u].on = false; } if ((lo & 3) == 0) { ps.kind = ipKind(ps.bb, ps.tp, ps.tr); ps.off = 0; ps.hit = ps.miss = 0; ps.any = ps.tot = 0; ps.buf.clear(); ps.dbp = g_ip.cur[0]; ps.dpsm = g_ip.cur[1]; ps.w = g_ip.cur[2]; ps.h = g_ip.cur[3]; } else ps.kind = 0; }
+                else if (r == 0x53) { if (g_tp.on) { if ((lo & 3) == 2) tpMarkDirty((uint32_t)((ps.bb >> 32) & 0x3fff) / 32u, (uint32_t)((ps.bb >> 48) & 63), (uint32_t)((ps.tr >> 32) & 0xfff) / 32u + 2u); /* CL-0287 */ if ((lo & 3) == 0) tpBegin(path & 3u, ps.bb, ps.tp, ps.tr); else g_tp.xf[path & 3u].on = false; } if ((lo & 3) == 0) { ps.kind = ipKind(ps.bb, ps.tp, ps.tr); ps.off = 0; ps.hit = ps.miss = 0; ps.any = ps.tot = 0; ps.buf.clear(); ps.dbp = g_ip.cur[0]; ps.dpsm = g_ip.cur[1]; ps.w = g_ip.cur[2]; ps.h = g_ip.cur[3]; } else ps.kind = 0; }
                 if (--ps.left == 0) ps.mode = 0;
                 break;
             }
             case 2:
             {
+                if (!g_tp.on && ps.kind == 0) { const uint32_t avail = (size - i) / 16u; const uint32_t k = ps.left < avail ? ps.left : avail; ps.left -= k; i += (k - 1u) * 16u; if (ps.left == 0) ps.mode = 0; break; } // CL-0233 fast skip
                 if (g_tp.on) tpFeed(path & 3u, data + i, 16);
                 if (ps.kind == 3)
                 {
@@ -595,16 +782,283 @@ namespace
                 break;
             }
             default:
-                if (--ps.left == 0) ps.mode = 0;
+            { // CL-0233: skip the whole data block at once instead of one qword per iteration
+                const uint32_t avail = (size - i) / 16u; const uint32_t k = ps.left < avail ? ps.left : avail;
+                ps.left -= k; i += (k - 1u) * 16u;
+                if (ps.left == 0) ps.mode = 0;
                 break;
+            }
             }
         }
         return tmp.empty() ? data : tmp.data();
     }
 }
+static void gifTransferNow(uint32_t path, const uint8_t *data, uint32_t sizeBytes);
+// CL-0233: GS submit queue. GIF packets produced by the async VIF1/GIF worker are copied into a queue and fed to paraLLEl-GS
+// by a dedicated thread, so the worker (the match bottleneck: ~88% busy, ~25% of it inside gifTransfer) only runs VIF/VU1.
+// Order is kept: every other gsvk entry point (and the VIF fence / presenter idle check) drains the queue first, and
+// non-worker submits drain before submitting directly. SVR06_GSQ=0 turns it off.
+namespace gsq
+{
+    struct Pkt { uint32_t path; std::vector<uint8_t> d; std::thread::id owner{}; }; // CL-0357: owner = pushing thread (tail merge)
+    struct Q { std::mutex m; std::condition_variable cv, cvDone; std::deque<Pkt> q; std::vector<std::vector<uint8_t>> pool; size_t bytes = 0; bool busy = false; std::thread::id tid{}; bool started = false; };
+    static std::atomic<uint32_t> g_pending{0};
+    static Q &q() { static Q *p = new Q(); return *p; }
+    static bool on() { static const bool e = [] { const char *v = std::getenv("SVR06_GSQ"); return !(v && *v == '0'); }(); return e; }
+    static void main_()
+    {
+        Q &Qs = q();
+        { std::lock_guard<std::mutex> lk(Qs.m); Qs.tid = std::this_thread::get_id(); }
+        for (;;)
+        {
+            Pkt k;
+            { std::unique_lock<std::mutex> lk(Qs.m); while (Qs.q.empty()) Qs.cv.wait_for(lk, std::chrono::milliseconds(2)); k = std::move(Qs.q.front()); Qs.q.pop_front(); Qs.busy = true; } // CL-0357: timed wait picks up merged tails that were not signalled
+            gifTransferNow(k.path, k.d.data(), (uint32_t)k.d.size());
+            { std::lock_guard<std::mutex> lk(Qs.m); Qs.bytes -= k.d.size(); Qs.busy = false; if (Qs.pool.size() < 256) { k.d.clear(); Qs.pool.push_back(std::move(k.d)); } g_pending.fetch_sub(1, std::memory_order_release); }
+            Qs.cvDone.notify_all();
+        }
+    }
+    static bool onQueueThread() { return std::this_thread::get_id() == q().tid; }
+    static void pushNow(uint32_t path, const uint8_t *data, uint32_t n);
+    static void pushSwap(uint32_t path, std::vector<uint8_t> &buf)
+    {
+        Q &Qs = q();
+        std::unique_lock<std::mutex> lk(Qs.m);
+        if (!Qs.started) { Qs.started = true; std::thread(main_).detach(); }
+        Qs.cvDone.wait(lk, [&] { return Qs.bytes < (48u << 20); });
+        const size_t n = buf.size();
+        Pkt k; k.path = path; k.d.swap(buf);
+        if (!Qs.pool.empty()) { buf = std::move(Qs.pool.back()); Qs.pool.pop_back(); }
+        buf.clear(); Qs.bytes += n;
+        const bool wasEmpty = Qs.q.empty() && !Qs.busy;
+        Qs.q.push_back(std::move(k)); g_pending.fetch_add(1, std::memory_order_release);
+        lk.unlock(); if (wasEmpty) Qs.cv.notify_one();
+    }
+    // CL-0261: GIF packet batching on the VIF1/VU1 worker. A busy match sends ~100k small XGKICK packets per second; each took the
+    // queue mutex, copied, and could wake the GS thread (~25% of the worker in ntdll + gifTransfer). The worker now appends packets of
+    // the same path into a thread-local buffer and hands it over every 32 KB, on a path change, before any drain, and at the end of
+    // each worker job. The GS stream is byte-for-byte the same and in the same order. SVR06_GIFBATCH=0 turns it off.
+    struct Batch { uint32_t path = 0xFFFFFFFFu; std::vector<uint8_t> buf; };
+    static thread_local Batch t_batch;
+    static bool batchOn() { static const bool e = [] { const char *v = std::getenv("SVR06_GIFBATCH"); return !(v && *v == '0'); }(); return e; }
+    static void flushLocal()
+    {
+        Batch &b = t_batch;
+        if (b.buf.empty()) return;
+        pushSwap(b.path, b.buf); // CL-0263: hand the buffer itself to the queue (no second copy); b.buf comes back as an empty pooled buffer
+    }
+    static void push(uint32_t path, const uint8_t *data, uint32_t n)
+    {
+        if (!batchOn() || !::svr06VifOnWorker()) { pushNow(path, data, n); return; }
+        Batch &b = t_batch;
+        if (!b.buf.empty() && b.path != path) flushLocal();
+        if (b.buf.capacity() < (160u << 10)) b.buf.reserve(160u << 10); // CL-0265: 128 KB batches (fewer GS-thread wake-ups)
+        b.path = path; b.buf.insert(b.buf.end(), data, data + n);
+        if (b.buf.size() >= (128u << 10)) flushLocal();
+    }
+    static void pushNow(uint32_t path, const uint8_t *data, uint32_t n)
+    {
+        Q &Qs = q();
+        std::unique_lock<std::mutex> lk(Qs.m);
+        if (!Qs.started) { Qs.started = true; std::thread(main_).detach(); }
+        Qs.cvDone.wait(lk, [&] { return Qs.bytes < (48u << 20); }); // back-pressure: at most 48 MB in flight
+        // CL-0357: game-thread GIF packets (PATH3, ~400k/s on menus like Exhibition > Singles > No Manager) were queued one by one:
+        // a lock, a copy and often a GS-thread wake-up each. Append to the newest queued item when it is ours, same path, not yet taken
+        // (nothing can sit behind the tail, so the stream order is unchanged), and wake the GS thread only per 32 KB; it also polls every
+        // 2 ms and drain() always wakes it. SVR06_GSQMERGE=0 restores one item per packet.
+        static const bool merge = [] { const char *v = std::getenv("SVR06_GSQMERGE"); return !(v && *v == '0'); }();
+        const std::thread::id me = std::this_thread::get_id();
+        if (merge && !Qs.q.empty())
+        {
+            Pkt &b = Qs.q.back();
+            if (b.owner == me && b.path == path && b.d.size() + n <= (128u << 10))
+            {
+                const size_t before = b.d.size();
+                b.d.insert(b.d.end(), data, data + n); Qs.bytes += n;
+                const bool cross = before < (32u << 10) && b.d.size() >= (32u << 10);
+                lk.unlock(); if (cross) Qs.cv.notify_one();
+                return;
+            }
+        }
+        Pkt k; k.path = path; k.owner = me; if (!Qs.pool.empty()) { k.d = std::move(Qs.pool.back()); Qs.pool.pop_back(); }
+        if (merge && k.d.capacity() < (32u << 10)) k.d.reserve(32u << 10);
+        k.d.assign(data, data + n); Qs.bytes += n;
+        const bool wasEmpty = Qs.q.empty() && !Qs.busy; // CL-0240: wake the GS thread only when it may be sleeping (saves a kernel call per packet)
+        Qs.q.push_back(std::move(k)); g_pending.fetch_add(1, std::memory_order_release);
+        lk.unlock(); if (wasEmpty && (!merge || n >= (32u << 10))) Qs.cv.notify_one();
+    }
+    static void drain()
+    {
+        flushLocal(); // CL-0261
+        if (g_pending.load(std::memory_order_acquire) == 0u || onQueueThread()) return;
+        Q &Qs = q(); std::unique_lock<std::mutex> lk(Qs.m);
+        Qs.cv.notify_one(); // CL-0357: merged tails may not have been signalled yet
+        Qs.cvDone.wait(lk, [&] { return Qs.q.empty() && !Qs.busy; });
+    }
+}
+void drainQueue() { gsq::drain(); }
+void flushWorkerBatch() { gsq::flushLocal(); } // CL-0261
+bool queueIdle() { return gsq::g_pending.load(std::memory_order_acquire) == 0u; }
+// CL-0256c: title video feed. The game's own (never fed) Sofdec/IPU decoder keeps uploading 16x16 macroblocks (DBW 4) to the
+// video texture at DBP 0x1E00 every frame, overwriting the host-decoded frame the runtime puts there (DBW 10). While a block is
+// set, TRXDIR writes that start a host->local transfer to that DBP with another DBW are turned into TRXDIR 3 (transfer off);
+// paraLLEl-GS then ignores the following IMAGE data.
+static std::atomic<uint32_t> g_upBlockDbp{0}, g_upKeepDbw{10};
+static uint32_t g_upCurDbp = 0xFFFFFFFFu, g_upCurDbw = 0u;
+void setUploadBlock(uint32_t dbp, uint32_t keepDbw) { g_upKeepDbw.store(keepDbw); g_upBlockDbp.store(dbp); }
+static bool upBlockHit(uint8_t ad, uint64_t &v)
+{
+    const uint32_t blk = g_upBlockDbp.load(std::memory_order_relaxed);
+    if (ad == 0x50u) { g_upCurDbp = (uint32_t)((v >> 32) & 0x3FFFu); g_upCurDbw = (uint32_t)((v >> 48) & 0x3Fu); return false; }
+    if (ad == 0x53u && blk != 0u && g_upCurDbp == blk && g_upCurDbw != g_upKeepDbw.load(std::memory_order_relaxed) && (v & 3ull) == 0ull)
+    { v = (v & ~3ull) | 3ull; static int n = 0; if (n++ < 3) std::fprintf(stderr, "[titlefeed] game upload to DBP 0x%X (DBW %u) cancelled\n", blk, g_upCurDbw); return true; }
+    return false;
+}
+static bool upBlockFilter(const uint8_t *data, uint32_t size, std::vector<uint8_t> &out)
+{
+    if (g_upBlockDbp.load(std::memory_order_relaxed) == 0u) { return false; }
+    bool mod = false; uint32_t q = 0;
+    while (q + 16u <= size)
+    {
+        uint64_t t0, t1; std::memcpy(&t0, data + q, 8); std::memcpy(&t1, data + q + 8, 8); q += 16u;
+        const uint32_t nl = (uint32_t)(t0 & 0x7FFFu), fl = (uint32_t)((t0 >> 58) & 3u); uint32_t nr = (uint32_t)((t0 >> 60) & 15u); if (!nr) nr = 16u;
+        if (fl >= 2u) { q += nl * 16u; continue; }
+        if (fl == 1u) { q += ((nl * nr * 8u + 15u) / 16u) * 16u; continue; }
+        for (uint32_t i = 0; i < nl; ++i)
+            for (uint32_t r = 0; r < nr; ++r)
+            {
+                if (q + 16u > size) return mod;
+                if (((t1 >> (4u * r)) & 0xFu) == 0xEu)
+                {
+                    uint64_t v; std::memcpy(&v, data + q, 8); const uint8_t ad = data[q + 8];
+                    if (upBlockHit(ad, v)) { if (!mod) { out.assign(data, data + size); mod = true; } std::memcpy(out.data() + q, &v, 8); }
+                }
+                q += 16u;
+            }
+    }
+    return mod;
+}
+void gifTransfer(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
+{
+    std::vector<uint8_t> upTmp; if (data && sizeBytes >= 16u && upBlockFilter(data, sizeBytes, upTmp)) data = upTmp.data(); // CL-0256c
+    if (!data || sizeBytes < 16u) { gifTransferNow(path, data, sizeBytes); return; }
+    // CL-0241: with the async VIF1/GIF worker on, GIF packets from any thread go through the queue (each thread's order is kept by the FIFO;
+    // readbacks and other entry points drain first). Before, game-thread submits (GIF arbiter drain, restore uploads in entrances) ran
+    // synchronously and blocked on paraLLEl-GS's GPU timeline waits (22% of the entrance game thread).
+    if (gsq::on() && (::svr06VifOnWorker() || ::svr06VifAsyncOn())) { gsq::push(path, data, sizeBytes & ~15u); return; }
+    gsq::drain();
+    gifTransferNow(path, data, sizeBytes);
+}
+// CL-0242: per-framebuffer draw tracker (which FRAME_1/FRAME_2 base pointers received primitives and when), used by the presenter
+// to recover scenes that display a buffer nothing draws into (Season post-match cutscene: DISPFB 256/320, all drawing at FBP 0).
+static uint64_t g_fbLastDraw[512]; static uint32_t g_fbW[512]; static uint32_t g_fbDraws[512]; static uint32_t g_fbCur = 0;
+// [flipdiag2] CL-0383: ordered event log per present while flipdiag is on: FRAME_1/FRAME_2 target changes, primitive counts per
+// context (PRIM CTXT bit), and guest DISPFB/PMODE writes (from ps2_memory), so we can see which buffer is drawn while it is displayed.
+static std::atomic<bool> g_fdOn{false};
+static std::atomic<uint32_t> g_cpFix{0}; // CL-0384
+static std::mutex g_fdMx; static std::string g_fdEv; static uint32_t g_fdLast1 = 0xFFFFu, g_fdCur2 = 0, g_fdCtx = 0, g_fdRun = 0, g_fdRunCtx = 0, g_fdRunFbp = 0xFFFFu;
+static void fdFlushRunLocked() { if (g_fdRun) { char b[48]; std::snprintf(b, sizeof b, " c%u@%u:%u", g_fdRunCtx, g_fdRunFbp, g_fdRun); g_fdEv += b; g_fdRun = 0; } }
+static void fdEvent(const char *t) { std::lock_guard<std::mutex> lk(g_fdMx); fdFlushRunLocked(); if (g_fdEv.size() < 6000u) g_fdEv += t; }
+static void fdPrims(uint32_t n, uint32_t fbp1) { std::lock_guard<std::mutex> lk(g_fdMx); const uint32_t fbp = g_fdCtx ? g_fdCur2 : fbp1;
+    if (g_fdRun && (g_fdRunCtx != g_fdCtx || g_fdRunFbp != fbp)) fdFlushRunLocked(); g_fdRunCtx = g_fdCtx; g_fdRunFbp = fbp; g_fdRun += n; }
+void fdPriv(uint32_t address, uint64_t value)
+{
+    if (!g_fdOn.load(std::memory_order_relaxed)) return;
+    const uint32_t off = (address - 0x12000000u) & ~0x7u; char b[48];
+    if (off == 0x70u || off == 0x90u) std::snprintf(b, sizeof b, " [D%u=%u]", off == 0x70u ? 1u : 2u, (unsigned)(value & 0x1FFu));
+    else if (off == 0x00u) std::snprintf(b, sizeof b, " [PM=%llx]", (unsigned long long)(value & 0xFFFFu));
+    else return;
+    fdEvent(b);
+}
+static void trackFrames(const uint8_t *data, uint32_t size)
+{
+    uint32_t &cur = g_fbCur; // FBP of the last FRAME_1 write (GIF stream or writeReg)
+    const uint64_t pres = g_presCount.load(std::memory_order_relaxed);
+    uint32_t q = 0;
+    while (q + 16u <= size)
+    {
+        uint64_t t0, t1; std::memcpy(&t0, data + q, 8); std::memcpy(&t1, data + q + 8, 8); q += 16u;
+        const uint32_t nl = (uint32_t)(t0 & 0x7FFFu), fl = (uint32_t)((t0 >> 58) & 3u); uint32_t nr = (uint32_t)((t0 >> 60) & 15u); if (!nr) nr = 16u;
+        if (fl >= 2u) { q += nl * 16u; continue; }
+        const bool fdOn = g_fdOn.load(std::memory_order_relaxed); if (fdOn && ((t0 >> 46) & 1u)) g_fdCtx = (uint32_t)((t0 >> 56) & 1u); // CL-0383
+        if (fl == 1u) { q += ((nl * nr * 8u + 15u) / 16u) * 16u; if (nl) { g_fbLastDraw[cur] = pres; g_fbDraws[cur] += nl; if (fdOn) fdPrims(nl, cur); } continue; }
+        bool nonAd = false;
+        for (uint32_t i = 0; i < nl; ++i)
+            for (uint32_t k = 0; k < nr; ++k)
+            {
+                if (q + 16u > size) return;
+                if (((t1 >> (4u * k)) & 15u) == 0xEu)
+                {
+                    uint64_t v, a; std::memcpy(&v, data + q, 8); std::memcpy(&a, data + q + 8, 8);
+                    if ((a & 0xFFu) == 0x4Cu) { cur = (uint32_t)(v & 0x1FFu); g_fbW[cur] = (uint32_t)((v >> 16) & 0x3Fu); }
+                    if (fdOn) { const uint32_t ra = (uint32_t)(a & 0xFFu); // CL-0383
+                        if (ra == 0x00u) g_fdCtx = (uint32_t)((v >> 9) & 1u);
+                        else if (ra == 0x4Cu || ra == 0x4Du) { const uint32_t nb = (uint32_t)(v & 0x1FFu); uint32_t &c = ra == 0x4Cu ? g_fdLast1 : g_fdCur2;
+                            if (nb != c) { char b[32]; std::snprintf(b, sizeof b, " F%u=%u", ra == 0x4Cu ? 1u : 2u, nb); c = nb; fdEvent(b); } } }
+                    { static uint32_t s_lastFbw = 10; const uint32_t ra = (uint32_t)(a & 0xFFu); /* CL-0287: render targets are not texture-pack material */
+                      if (ra == 0x4Cu || ra == 0x4Du) { s_lastFbw = (uint32_t)((v >> 16) & 0x3Fu); tpMarkDirty((uint32_t)(v & 0x1FFu), s_lastFbw, 16u); }
+                      else if (ra == 0x4Eu || ra == 0x4Fu) tpMarkDirty((uint32_t)(v & 0x1FFu), s_lastFbw, 16u); }
+                }
+                else nonAd = true;
+                q += 16u;
+            }
+        if (nonAd && nl) { g_fbLastDraw[cur] = pres + 1u; g_fbDraws[cur] += nl; if (fdOn) fdPrims(nl, cur); } // +1: 0 means "never"
+    }
+}
+// Returns a replacement FBP when 'fbp' has not been drawn for 30+ presents while another buffer of the same width was drawn
+// heavily during the last 2 presents; otherwise returns fbp unchanged. SVR06_NOUNDRAWN=1 disables.
+static uint32_t undrawnRedirect(uint32_t fbp, uint32_t fbw)
+{
+    static const bool off = std::getenv("SVR06_UNDRAWN") == nullptr; // CL-0243: opt-in only (broke loading/transition screens)
+    if (off || fbp >= 512u) return fbp;
+    const uint64_t pres = g_presCount.load(std::memory_order_relaxed) + 1u;
+    if (g_fbLastDraw[fbp] != 0u && g_fbLastDraw[fbp] + 30u >= pres) return fbp;
+    uint32_t best = fbp, bestN = 0;
+    for (uint32_t i = 0; i < 512u; ++i)
+        if (i != fbp && g_fbW[i] == fbw && g_fbLastDraw[i] + 2u >= pres && g_fbLastDraw[i] != 0u && g_fbDraws[i] > bestN) { best = i; bestN = g_fbDraws[i]; }
+    if (bestN < 200u) return fbp;
+    static int n = 0; if (n++ < 8) std::fprintf(stderr, "[undrawn] CL-0242: DISPFB fbp %u has no draws, showing fbp %u (%u draws)\n", fbp, best, bestN);
+    return best;
+}
+// [rttflush] CL-0374: live experiment for the Season cutscene black arena. When analysis\\live\\rttflush.on exists (checked every
+// 30 presents), every GIF packet is scanned for FRAME_1 writes that switch the render target to or from the crowd RTT (fbp 15296);
+// the packet is split there and paraLLEl-GS is flushed between the parts, so the crowd pass is complete before the composite samples it.
+static std::atomic<bool> g_rttFlushOn{false};
+static std::atomic<uint32_t> g_rttSplits{0};
+static uint32_t g_rttCurFbp = 0xFFFFFFFFu;
+static void rttSplitPoints(const uint8_t *data, uint32_t sizeBytes, std::vector<uint32_t> &cuts)
+{
+    const uint64_t *q = reinterpret_cast<const uint64_t *>(data);
+    const uint32_t nq = sizeBytes / 8u;
+    uint32_t i = 0;
+    while (i + 2u <= nq)
+    {
+        const uint64_t tag = q[i];
+        const uint32_t nloop = (uint32_t)(tag & 0x7fffu), flg = (uint32_t)((tag >> 58) & 3u);
+        uint32_t nreg = (uint32_t)((tag >> 60) & 15u); if (nreg == 0u) nreg = 16u;
+        const uint32_t nqw = flg >= 2u ? nloop : (flg == 1u ? (nloop * nreg + 1u) / 2u : nloop * nreg);
+        if (flg == 0u)
+            for (uint32_t k = 0; k < nloop; ++k)
+                for (uint32_t r = 0; r < nreg; ++r)
+                {
+                    if (((q[i + 1] >> (4u * r)) & 0xFu) != 0xEu) continue;
+                    const uint32_t qi = i + 2u + 2u * (k * nreg + r);
+                    if (qi + 1u >= nq) break;
+                    if ((q[qi + 1] & 0xFFu) != 0x4Cu) continue;
+                    const uint32_t bp = (uint32_t)(q[qi] & 0x1FFu) * 32u;
+                    if (bp != g_rttCurFbp && (bp == 15296u || g_rttCurFbp == 15296u) && i != 0u &&
+                        (cuts.empty() || cuts.back() != i * 8u))
+                        cuts.push_back(i * 8u);
+                    else if (bp != g_rttCurFbp && (bp == 15296u || g_rttCurFbp == 15296u) && i == 0u)
+                        cuts.push_back(0u); // switch at the packet start: flush before the whole packet
+                    g_rttCurFbp = bp;
+                }
+        i += 2u * (1u + nqw);
+    }
+}
 static int g_gifCapFrames = 0;
 static FILE *g_gifCapF = nullptr; // diagnostics: raw GIF capture of exactly one frame (see FLAGDUMP in presentFrame)
-void gifTransfer(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
+static void gifTransferNow(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
 {
     State &s = st();
     g_stgGif = 10; startHangWatch();
@@ -620,20 +1074,130 @@ void gifTransfer(uint32_t path, const uint8_t *data, uint32_t sizeBytes)
     if ((++calls % 20000) == 1) std::cout << "[gsvk] gif bytes p1=" << cnt[1] << " p2=" << cnt[2] << " p3=" << cnt[3] << " calls=" << calls << std::endl;
     if (g_gifCapF) { uint32_t hd[2] = {sizeBytes, path}; std::fwrite(hd, 4, 2, g_gifCapF); std::fwrite(data, 1, sizeBytes, g_gifCapF); }
     { static const bool s_imgwEnv = std::getenv("SVR06_IMGW") != nullptr; /* perf: was an uncached getenv per GIF packet (~16% of the game thread) */ const bool iw = s_imgwEnv || (g_svr06Diag.load() & 1u); if (iw) imgWatch(data, sizeBytes); }
+    { // [rttlog] CL-0217: scan A+D FRAME_1/2 writes targeting the crowd RTT (fbp 15296) and log event order; SVR06_RTTLOG=1
+      static const bool on = std::getenv("SVR06_RTTLOG") != nullptr; static int n = 0;
+      if (on && (n < 4000 || g_rttPassPn.load() < 48)) { const uint64_t *q = reinterpret_cast<const uint64_t *>(data); const uint32_t nq = sizeBytes / 8u; uint32_t i = 0;
+        while (i + 2u <= nq) { const uint64_t tag = q[i]; const uint32_t nloop = (uint32_t)(tag & 0x7fffu), flg = (uint32_t)((tag >> 58) & 3u); uint32_t nreg = (uint32_t)((tag >> 60) & 15u); if (nreg == 0u) nreg = 16u;
+          const uint32_t nqw = flg >= 2u ? nloop : nloop * nreg; // CL-0221: FLG=3 = IMAGE // data qwords after the tag
+          if (flg == 0u) { static uint32_t shp[16] = {0}; /* [rttlog] tag shape histogram */ for (uint32_t k = 0; k < nloop; ++k) for (uint32_t r = 0; r < nreg; ++r) { const uint32_t qi = i + 2u + 2u * (k * nreg + r); if (qi + 1u >= nq) break; if (((q[i + 1] >> (4u * r)) & 0xFu) != 0xEu) continue; const uint64_t v = q[qi], ad = q[qi + 1] & 0xFFu;
+              if ((ad == 0x50u || ad == 0x53u) && g_rttStart.load() != 0u) { static int bn = 0; const uint32_t dbp = (uint32_t)((v >> 32) & 0x3FFFu); if ((ad == 0x53u || (dbp >= 15000u && dbp < 16200u)) && bn++ < 600) std::fprintf(stderr, "[rttlog] XFER ad=0x%02x raw=%016llx path=%u pres=%llu\n", (unsigned)ad, (unsigned long long)v, path, (unsigned long long)g_presCount.load()); }
+              if (g_rttStart.load() != 0u) { static int tn = 0; static uint64_t lt[0x80] = {0}; if (ad < 0x80u && lt[ad] != v && (ad == 0x3Bu || ad == 0x42u || ad == 0x43u || ad == 0x08u || ad == 0x09u || ad == 0x1Cu || ((ad == 0x06u || ad == 0x07u) && (v & 0x3FFFull) == 15296ull) || ad == 0x47u || ad == 0x48u) && tn < 600) { lt[ad] = v; ++tn; std::fprintf(stderr, "[rttlog] AD 0x%02x raw=%016llx pres=%llu\n", ad,(unsigned long long)v, (unsigned long long)g_presCount.load()); } }
+              if (ad == 0x4Cu && g_rttStart.load() != 0u) { /* [rttpass] snapshot the crowd RT just before the game switches FRAME_1 back to the screen (= at composite time) */
+                static uint32_t pb = 0xFFFFFFFFu; int pn = g_rttPassPn.load(); static std::vector<uint8_t> acc; const uint32_t bpn = (uint32_t)(v & 0x1FFu) * 32u;
+                if (bpn == 0u && pb == 15296u && pn < 48 && g_presCount.load() >= g_rttStart.load() + 40u) {
+                  s.iface.flush(); const uint8_t *vr = static_cast<const uint8_t *>(s.iface.map_vram_read(0, 4u * 1024u * 1024u));
+                  if (vr) { acc.insert(acc.end(), vr + 478u * 8192u, vr + 480u * 8192u); ++pn; g_rttPassPn.store(pn); if (pn == 48) { FILE *pf = std::fopen("analysis/live/rttpass.bin", "wb"); if (pf) { std::fwrite(acc.data(), 1, acc.size(), pf); std::fclose(pf); std::fprintf(stderr, "[rttlog] wrote rttpass.bin pres=%llu\n", (unsigned long long)g_presCount.load()); } } } }
+                pb = bpn; }
+              if (ad == 0x4Cu || ad == 0x4Du || ad == 0x4Eu || ad == 0x4Fu) { static uint64_t last[4] = {0, 0, 0, 0}; const uint32_t bp = (uint32_t)(v & 0x1FFu) * 32u;
+                if (n < 4000 && ((bp >= 15000u && bp < 16200u) || (g_rttStart.load() != 0u && n < 1500)) && last[ad - 0x4C] != v) { last[ad - 0x4C] = v; if (ad == 0x4C && g_rttStart.load() == 0u) g_rttStart.store(g_presCount.load()); std::fprintf(stderr, "[rttlog] %s_%d bp=%u w=%u psm=%u hi=%08x raw=%016llx nreg=%u path=%u pres=%llu\n", ad < 0x4Eu ? "FRAME" : "ZBUF", (int)((ad & 1u) + 1u), bp, (unsigned)((v >> 16) & 63u), (unsigned)((v >> 24) & 63u), (unsigned)(v >> 32), (unsigned long long)v, nreg, path, (unsigned long long)g_presCount.load()); ++n; } } } (void)shp; }
+          i += 2u * (1u + nqw); } } }
     g_stgGif = 12;
+    if (g_rttFlushOn.load(std::memory_order_relaxed))
+    { // [rttflush] CL-0374
+        std::vector<uint32_t> cuts;
+        rttSplitPoints(data, sizeBytes, cuts);
+        if (!cuts.empty())
+        {
+            uint32_t from = 0;
+            for (uint32_t c : cuts)
+            {
+                if (c > from)
+                {
+                    std::vector<uint8_t> segTmp;
+                    const uint8_t *seg = ipStream(path, data + from, c - from, segTmp);
+                    trackFrames(data + from, c - from);
+                    tp2Register(s.iface);
+                    s.iface.gif_transfer(path, seg, c - from);
+                }
+                s.iface.flush();
+                g_rttSplits.fetch_add(1u, std::memory_order_relaxed);
+                from = c;
+            }
+            if (from < sizeBytes)
+            {
+                std::vector<uint8_t> segTmp;
+                const uint8_t *seg = ipStream(path, data + from, sizeBytes - from, segTmp);
+                trackFrames(data + from, sizeBytes - from);
+                tp2Register(s.iface);
+                s.iface.gif_transfer(path, seg, sizeBytes - from);
+            }
+            g_stgGif = 0;
+            return;
+        }
+    }
     std::vector<uint8_t> iconTmp;
     const uint8_t *iconData = ipStream(path, data, sizeBytes, iconTmp);
+    trackFrames(data, sizeBytes); // CL-0242
+    tp2Register(s.iface); // CL-0287
+    std::vector<uint8_t> cpTmp; bool cpHit = false; uint32_t cpDst = 0;
+    { // [cpfix] CL-0384: Season cutscene field copies (fbp 0 -> FRAME_2 256/320, PSMCT24, TEST_2 ATE/NEVER/AFAIL=RGB_ONLY, ZBUF_2 at page 0)
+      // never reach VRAM. Live A/B: analysis\live\cpfixA.on = ZBUF_2 ZMSK on, cpfixB.on = AFAIL RGB_ONLY -> FB_ONLY (same result for 24-bit).
+      const uint32_t m = g_cpFix.load(std::memory_order_relaxed);
+      if (m || g_fdOn.load(std::memory_order_relaxed))
+      { const uint8_t *src = iconData; uint32_t qq = 0;
+        while (qq + 16u <= sizeBytes) { uint64_t t0, t1; std::memcpy(&t0, src + qq, 8); std::memcpy(&t1, src + qq + 8, 8); qq += 16u;
+          const uint32_t nl = (uint32_t)(t0 & 0x7FFFu), fl = (uint32_t)((t0 >> 58) & 3u); uint32_t nr = (uint32_t)((t0 >> 60) & 15u); if (!nr) nr = 16u;
+          if ((m & 32u) && fl == 0u && ((t0 >> 46) & 1u) && (((t0 >> 47) & 0x7FFu) == 0x316u)) { const uint64_t nt = t0 & ~(1ull << (47 + 4)); if (cpTmp.empty()) cpTmp.assign(src, src + sizeBytes); std::memcpy(cpTmp.data() + qq - 16u, &nt, 8); }
+          if (fl >= 2u) { qq += nl * 16u; continue; } if (fl == 1u) { qq += ((nl * nr * 8u + 15u) / 16u) * 16u; continue; }
+          for (uint32_t i = 0; i < nl; ++i) for (uint32_t k = 0; k < nr; ++k) { if (qq + 16u > sizeBytes) break;
+            if (((t1 >> (4u * k)) & 15u) == 0xEu) { uint64_t v, a; std::memcpy(&v, src + qq, 8); std::memcpy(&a, src + qq + 8, 8); const uint32_t ra = (uint32_t)(a & 0xFFu);
+              if (ra == 0x4Du && ((v & 0x1FFu) == 256u || (v & 0x1FFu) == 320u) && ((v >> 24) & 0x3Fu) == 1u) { cpHit = true; cpDst = (uint32_t)(v & 0x1FFu); }
+              uint64_t nv = v;
+              if ((m & 1u) && ra == 0x4Fu && (v & 0x1FFu) == 0u && ((v >> 24) & 0xFu) == 1u) nv |= 1ull << 32;
+              if ((m & 64u) && ra == 0x48u && v == 0x33001ull) nv = 0x30000ull;
+              if ((m & 256u) && (ra == 0x14u || ra == 0x15u) && v == 0x60ull) nv = 0ull;
+              if ((m & 512u) && (ra == 0x08u || ra == 0x09u) && v == 5ull) nv = 0ull;
+              if ((m & 2u) && ra == 0x48u && (v & 1u) && ((v >> 1) & 7u) == 0u && ((v >> 12) & 3u) == 3u) nv = (nv & ~(3ull << 12)) | (1ull << 12);
+              if (nv != v) { if (cpTmp.empty()) cpTmp.assign(src, src + sizeBytes); std::memcpy(cpTmp.data() + qq, &nv, 8); } }
+            qq += 16u; } }
+        if (!cpTmp.empty()) iconData = cpTmp.data(); } }
+    if (cpHit && (g_cpFix.load(std::memory_order_relaxed) & 4u)) { const uint64_t pk[4] = {gifTagLo(1, 0, 1), 0xE, 1ull, 0x1Aull}; s.iface.gif_transfer(2, reinterpret_cast<const uint8_t *>(pk), sizeof pk); } // CL-0384 C: PRMODECONT AC=1
+    if (cpHit && (g_cpFix.load(std::memory_order_relaxed) & 8u)) s.iface.flush(); // CL-0384 D: flush before the copy
+    // CL-0384 E: the copies sample TBP0=0 while ZBUF_2 also points at page 0 (Z24). paraLLEl-GS then treats the draw as depth
+    // feedback (texture == depth buffer of the pass) and samples the on-tile depth instead of VRAM -> black copies. The copies never
+    // read or write Z (ZTST ALWAYS, ATST NEVER + AFAIL RGB_ONLY), so point ZBUF_2 elsewhere (masked) for this packet only, then restore.
+    const bool cpE = cpHit && (g_cpFix.load(std::memory_order_relaxed) & (16u | 64u)) && (s.iface.get_register_state().ctx[1].zbuf.bits & 0x1FFu) == 0u;
+    const uint64_t cpZ = s.iface.get_register_state().ctx[1].zbuf.bits;
+    if (cpE) { const uint64_t pk[4] = {gifTagLo(1, 0, 1), 0xE, (cpZ & ~0x1FFull) | 0x1C0ull | (1ull << 32), 0x4Full}; s.iface.gif_transfer(2, reinterpret_cast<const uint8_t *>(pk), sizeof pk); }
     s.iface.gif_transfer(path, iconData, sizeBytes);
+    if (cpE) { const uint64_t pk[4] = {gifTagLo(1, 0, 1), 0xE, cpZ, 0x4Full}; s.iface.gif_transfer(2, reinterpret_cast<const uint8_t *>(pk), sizeof pk); }
+    if (cpHit && (g_cpFix.load(std::memory_order_relaxed) & 128u))
+    { // CL-0384 H: redo the field copy as a GS local->local transfer (fbp 0, 512x256, PSMCT32 -> PSMCT24 at fbp 256/320; odd field starts one line down)
+        const uint64_t ssay = (cpDst == 320u) ? 1ull : 0ull;
+        const uint64_t pk[10] = {gifTagLo(4, 0, 1), 0xE,
+            (0ull) | (8ull << 16) | (0ull << 24) | ((uint64_t)cpDst * 32ull << 32) | (8ull << 48) | (1ull << 56), 0x50ull,
+            (ssay << 16), 0x51ull,
+            (512ull) | (256ull << 32), 0x52ull,
+            2ull, 0x53ull};
+        s.iface.gif_transfer(2, reinterpret_cast<const uint8_t *>(pk), sizeof pk);
+    }
+    if (cpHit && g_fdOn.load(std::memory_order_relaxed))
+    { // CL-0384 probe: did the copy land? count nonzero words in the first 4 pages of fbp 256 and 320 right after this packet
+        s.iface.flush(); const uint8_t *vr = static_cast<const uint8_t *>(s.iface.map_vram_read(0, 4u * 1024u * 1024u));
+        if (vr) { uint32_t n256 = 0, n320 = 0; for (uint32_t i = 0; i < 4u * 8192u; i += 4) { n256 += (*reinterpret_cast<const uint32_t *>(vr + 256u * 8192u + i) & 0xFFFFFFu) != 0u; n320 += (*reinterpret_cast<const uint32_t *>(vr + 320u * 8192u + i) & 0xFFFFFFu) != 0u; }
+            uint32_t nAll = 0; for (uint32_t i = 0; i < 128u * 8192u; i += 4) nAll += (*reinterpret_cast<const uint32_t *>(vr + 256u * 8192u + i) & 0xFFFFFFu) != 0u;
+            uint32_t nSrc = 0, nSrcA = 0; for (uint32_t i = 0; i < 128u * 8192u; i += 4) { const uint32_t w = *reinterpret_cast<const uint32_t *>(vr + i); nSrc += (w & 0xFFFFFFu) != 0u; nSrcA += (w >> 24) != 0u; }
+            { static int dn = 0; if (dn < 2 && nAll == 0u) { ++dn; if (FILE *df = std::fopen("analysis\\live\\cp_vram.bin", dn == 1 ? "wb" : "ab")) { std::fwrite(vr, 1, 4u * 1024u * 1024u, df); std::fclose(df); } } }
+            const auto &rs = s.iface.get_register_state();
+            std::string grp; { for (uint32_t g = 0; g < 16u; ++g) { uint32_t nz = 0; const uint32_t *w = reinterpret_cast<const uint32_t *>(vr + (size_t)g * 32u * 8192u); for (uint32_t i = 0; i < 32u * 2048u; i += 7) nz += w[i] != 0u; char t[16]; std::snprintf(t, sizeof t, "%u,", nz / 16u); grp += t; } }
+            char b[600]; std::snprintf(b, sizeof b, " [grp=%s V256=%u V320=%u all=%u src=%u srcA=%u m=%u prmc=%llx prim=%llx f2=%llx z2=%llx t2=%llx xy2=%llx sc2=%llx tex2=%llx f1=%llx xy1=%llx]", grp.c_str(), n256, n320, nAll, nSrc, nSrcA, g_cpFix.load(),
+                (unsigned long long)rs.prmodecont.bits, (unsigned long long)rs.prim.bits, (unsigned long long)rs.ctx[1].frame.bits, (unsigned long long)rs.ctx[1].zbuf.bits, (unsigned long long)rs.ctx[1].test.bits,
+                (unsigned long long)rs.ctx[1].xyoffset.bits, (unsigned long long)rs.ctx[1].scissor.bits, (unsigned long long)rs.ctx[1].tex0.bits, (unsigned long long)rs.ctx[0].frame.bits, (unsigned long long)rs.ctx[0].xyoffset.bits); fdEvent(b); } }
+    { static const bool fl = std::getenv("SVR06_RTTFLUSH") != nullptr; if (fl && g_rttStart.load() != 0u) s.iface.flush(); } // [rttlog] experiment: flush after every GIF packet during the Season cutscene
     g_stgGif = 0;
 }
 
 void writeReg(uint8_t reg, uint64_t value)
 {
+    gsq::drain();
     State &s = st();
     std::lock_guard<std::mutex> lk(s.m);
     if (!initLocked(s))
         return;
+    upBlockHit(reg, value); // CL-0256c
     uint64_t pkt[4] = {gifTagLo(1, 0, 1), 0xE, value, static_cast<uint64_t>(reg)};
+    if (reg == 0x4C) { g_fbCur = static_cast<uint32_t>(value & 0x1FFu); g_fbW[g_fbCur] = static_cast<uint32_t>((value >> 16) & 0x3Fu); } // CL-0242
+    { static const bool on = std::getenv("SVR06_RTTLOG") != nullptr; static int wn = 0; if (on && (reg == 0x4C || reg == 0x4D || reg == 0x4E || reg == 0x4F) && (((((value & 0x1FFu) * 32u) >= 15000u && ((value & 0x1FFu) * 32u) < 16200u)) || g_rttStart.load() != 0u) && wn++ < 1500) std::fprintf(stderr, "[rttlog] writeReg 0x%x raw=%016llx pres=%llu\n", reg, (unsigned long long)value, (unsigned long long)g_presCount.load()); }
     if (g_gifCapF) { uint32_t hd[2] = {32u, 0xFEu}; std::fwrite(hd, 4, 2, g_gifCapF); std::fwrite(pkt, 1, sizeof pkt, g_gifCapF); }
     s.iface.gif_transfer(2, reinterpret_cast<const uint8_t *>(pkt), sizeof pkt);
 }
@@ -641,6 +1205,7 @@ void writeReg(uint8_t reg, uint64_t value)
 void uploadImage(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir,
                  const uint8_t *data, uint32_t sizeBytes)
 {
+    gsq::drain();
     State &s = st();
     std::lock_guard<std::mutex> lk(s.m);
     if (!initLocked(s) || !data)
@@ -650,6 +1215,7 @@ void uploadImage(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t 
         std::fprintf(stderr, "[zeroup-vk] dbp=0x%llx ptr=%p bytes=%u nzQ=%u%s\n", (unsigned long long)((bitbltbuf >> 32) & 0x3fff), (const void *)data, sizeBytes, nz, nz ? "" : " ALLZERO"); ++zn; } }
     { static const bool s_imgwEnv = std::getenv("SVR06_IMGW") != nullptr; /* perf: was an uncached getenv per GIF packet (~16% of the game thread) */ const bool iw = s_imgwEnv || (g_svr06Diag.load() & 1u); static int un = 0; if (iw && un++ < 200) std::fprintf(stderr, "[imgw] uploadImage dbp=%llX dbw=%llu psm=%llu bytes=%u\n", (unsigned long long)((bitbltbuf >> 32) & 0x3fff), (unsigned long long)((bitbltbuf >> 48) & 63), (unsigned long long)((bitbltbuf >> 56) & 63), sizeBytes); }
     if (g_gifCapF) { uint32_t hd[2] = {0xFFFFFFFEu, sizeBytes}; std::fwrite(hd, 4, 2, g_gifCapF); const uint64_t q4[4] = {bitbltbuf, trxpos, trxreg, trxdir}; std::fwrite(q4, 8, 4, g_gifCapF); }
+    { static const bool on = std::getenv("SVR06_RTTLOG") != nullptr; static int n = 0; if (on && n++ < 3000) std::fprintf(stderr, "[rttlog] LOAD dbp=%llu dbw=%llu psm=%llu pos=%llx reg=%llx bytes=%u pres=%llu\n", (unsigned long long)((bitbltbuf >> 32) & 0x3fff), (unsigned long long)((bitbltbuf >> 48) & 63), (unsigned long long)((bitbltbuf >> 56) & 63), (unsigned long long)trxpos, (unsigned long long)trxreg, sizeBytes, (unsigned long long)g_presCount.load()); }
     // A+D packet with the four transfer registers, then an IMAGE-mode packet with the payload.
     uint64_t setup[2 + 8];
     setup[0] = gifTagLo(4, 0, 1);
@@ -697,8 +1263,11 @@ static bool presentFrameImpl(const GSRegisters &r, std::vector<uint8_t> &rgba, u
         // SvR06 here is the PAL build: synthesize PAL analog when the game left SMODE1 unset/invalid.
         uint64_t sm1 = r.smode1;
         const uint32_t cmod = static_cast<uint32_t>((sm1 >> 13) & 3u), lc = static_cast<uint32_t>((sm1 >> 3) & 0x7Fu);
-        if ((cmod != 2u && cmod != 3u) || lc != 32u)
-            sm1 = (sm1 & ~((3ull << 13) | (0x7Full << 3))) | (3ull << 13) | (32ull << 3);
+        // CL-0274: region video mode. NTSC discs (SVR06_REGION_HZ=60, set from the serial in main.cpp) scan out NTSC (CMOD 2): with the
+        // PAL mode forced here the USA 224-line fields were read as 288-line PAL fields and the picture was squashed into the top 78%.
+        static const uint64_t s_cmod = [] { const char *e = std::getenv("SVR06_REGION_HZ"); return (e && std::atoi(e) == 60) ? 2ull : 3ull; }();
+        if ((cmod != 2u && cmod != 3u) || lc != 32u || cmod != s_cmod)
+            sm1 = (sm1 & ~((3ull << 13) | (0x7Full << 3))) | (s_cmod << 13) | (32ull << 3);
         std::memcpy(&p.smode1, &sm1, 8);
     }
     std::memcpy(&p.smode2, &r.smode2, 8);
@@ -722,6 +1291,7 @@ static bool presentFrameImpl(const GSRegisters &r, std::vector<uint8_t> &rgba, u
                 break;
             }
         }
+        { const uint32_t nf = undrawnRedirect(static_cast<uint32_t>(d & 0x1FFu), static_cast<uint32_t>((d >> 9) & 0x3Fu)); d = (d & ~0x1FFull) | nf; } // CL-0242
         std::memcpy(&p.dispfb1, &d, 8);
     }
     uint64_t dispUsed = r.display1;
@@ -755,7 +1325,7 @@ static bool presentFrameImpl(const GSRegisters &r, std::vector<uint8_t> &rgba, u
             std::cout << std::hex << "[gsvk] DISPLAY convention fix: " << r.display1 << " -> " << d1 << std::dec << std::endl;
         s_lastD = d1;
         std::memcpy(&p.display1, &d1, 8);
-        std::memcpy(&p.dispfb2, &r.dispfb2, 8);
+        { uint64_t f2 = r.dispfb2; const uint32_t nf = undrawnRedirect(static_cast<uint32_t>(f2 & 0x1FFu), static_cast<uint32_t>((f2 >> 9) & 0x3Fu)); f2 = (f2 & ~0x1FFull) | nf; std::memcpy(&p.dispfb2, &f2, 8); } // CL-0242
         std::memcpy(&p.display2, &d2, 8);
     }
     std::memcpy(&p.extbuf, &r.extbuf, 8);
@@ -1082,13 +1652,68 @@ static void applyColourBlind(std::vector<uint8_t> &rgba, uint32_t w, uint32_t h)
 }
 bool presentFrame(const GSRegisters &r, std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
 {   // [fps60] CL-0112: frame-cost telemetry, one line per 300 presented frames (avg/max ms, GPU scanouts and VRAM saves per frame)
+    const auto tD0 = std::chrono::steady_clock::now(); // CL-0391: time the presenter waits for the GS queue (= worker + VU1 + GIF backlog) before drawing
+    gsq::drain();
     const auto t0 = std::chrono::steady_clock::now();
+    static double s_drainSum = 0.0, s_drainMax = 0.0, s_gapSum = 0.0; static std::chrono::steady_clock::time_point s_prevPresent{};
+    { const double dm = std::chrono::duration<double, std::milli>(t0 - tD0).count(); s_drainSum += dm; if (dm > s_drainMax) s_drainMax = dm;
+      if (s_prevPresent.time_since_epoch().count() != 0) s_gapSum += std::chrono::duration<double, std::milli>(tD0 - s_prevPresent).count(); }
     g_queueFill.store(false);
     const bool ok = presentFrameImpl(r, rgba, width, height);
+    { // [rttflush] CL-0374: toggle by file, report once per ~60 presents while on
+        static uint32_t pc = 0;
+        if ((++pc % 30u) == 0u)
+        {
+            const bool on = std::filesystem::exists("analysis\\live\\rttflush.on");
+            if (on != g_rttFlushOn.load()) { g_rttFlushOn.store(on); std::fprintf(stderr, "[rttflush] %s\n", on ? "ON" : "OFF"); }
+            { const uint32_t cm = (std::filesystem::exists("analysis\\live\\cpfixA.on") ? 1u : 0u) | (std::filesystem::exists("analysis\\live\\cpfixB.on") ? 2u : 0u) | (std::filesystem::exists("analysis\\live\\cpfixC.on") ? 4u : 0u) | (std::filesystem::exists("analysis\\live\\cpfixD.on") ? 8u : 0u) | (std::filesystem::exists("analysis\\live\\cpfixE.on") ? 16u : 0u) | (std::filesystem::exists("analysis\\live\\cpfixF.on") ? 32u : 0u) | (std::filesystem::exists("analysis\\live\\cpfixG.on") ? 64u : 0u) | (std::filesystem::exists("analysis\\live\\cpfixH.on") ? 128u : 0u) | (std::filesystem::exists("analysis\\live\\cpfixJ.on") ? 256u : 0u) | (std::filesystem::exists("analysis\\live\\cpfixK.on") ? 512u : 0u);
+              if (cm != g_cpFix.load()) { g_cpFix.store(cm); std::fprintf(stderr, "[cpfix] CL-0384 mode=%u\n", cm); } }
+            if (on && (pc % 60u) == 0u)
+                if (FILE *f = std::fopen("analysis\\live\\rttflush.txt", "w")) { std::fprintf(f, "on splits=%u pres=%llu\n", g_rttSplits.load(), (unsigned long long)g_presCount.load()); std::fclose(f); }
+        }
+    }
+    { // [flipdiag] CL-0376: while analysis\live\flipdiag.on exists, log per present which buffer is scanned out (DISPFB1/2) and which
+      // frame buffers received primitives since the previous present (Season cutscene black/partial frames: shown buffer vs drawn buffer).
+      static uint32_t fc = 0; static bool fon = false; static uint32_t prevDraws[512] = {0}; static FILE *ff = nullptr; static uint32_t lines = 0;
+      if ((++fc % 30u) == 0u) { const bool on = std::filesystem::exists("analysis\\live\\flipdiag.on");
+          if (on && !fon) { ff = std::fopen("analysis\\live\\flipdiag.txt", "w"); lines = 0; std::memcpy(prevDraws, g_fbDraws, sizeof prevDraws); }
+          if (!on && fon && ff) { std::fclose(ff); ff = nullptr; }
+          fon = on; g_fdOn.store(on); }
+      if (fon && ff && lines < 3000u) {
+          uint64_t lum = 0; uint32_t ln = 0;
+          if (ok && !rgba.empty()) for (size_t i = 0; i + 3 < rgba.size(); i += 4u * 97u) { lum += rgba[i] + rgba[i + 1] + rgba[i + 2]; ++ln; }
+          std::fprintf(ff, "pres=%llu disp1=%u/%u disp2=%u/%u pmode=%llx lum=%u draws:", (unsigned long long)g_presCount.load(),
+                       (unsigned)(r.dispfb1 & 0x1FFu), (unsigned)((r.dispfb1 >> 9) & 0x3Fu), (unsigned)(r.dispfb2 & 0x1FFu), (unsigned)((r.dispfb2 >> 9) & 0x3Fu),
+                       (unsigned long long)r.pmode, ln ? (unsigned)(lum / ln) : 9999u);
+          { static std::vector<uint8_t> pgb(112u * 8192u); uint32_t nz0 = 0, nz256 = 0, nz320 = 0; if (readVramPages(0, 112, pgb.data())) for (uint32_t i = 0; i < 112u * 8192u; i += 4) nz0 += (*reinterpret_cast<uint32_t *>(pgb.data() + i) & 0xFFFFFFu) != 0u; if (readVramPages(256, 56, pgb.data())) for (uint32_t i = 0; i < 56u * 8192u; i += 4) nz256 += (*reinterpret_cast<uint32_t *>(pgb.data() + i) & 0xFFFFFFu) != 0u; if (readVramPages(320, 56, pgb.data())) for (uint32_t i = 0; i < 56u * 8192u; i += 4) nz320 += (*reinterpret_cast<uint32_t *>(pgb.data() + i) & 0xFFFFFFu) != 0u; std::fprintf(ff, "nz0=%u nz256=%u nz320=%u ", nz0, nz256, nz320); }
+          for (uint32_t i = 0; i < 512u; ++i) { const uint32_t d = g_fbDraws[i] - prevDraws[i]; if (d) std::fprintf(ff, " %u:%u", i, d); }
+          std::memcpy(prevDraws, g_fbDraws, sizeof prevDraws);
+          { std::lock_guard<std::mutex> lk(g_fdMx); fdFlushRunLocked(); std::fprintf(ff, " |%s", g_fdEv.c_str()); g_fdEv.clear(); } // CL-0383
+          std::fputc('\n', ff); if ((++lines & 31u) == 0u) std::fflush(ff); } }
+    { // [rttlog] per-present nonzero count of the crowd RTT pages (colour 478-479, Z 486-487) and the 3BC0 save area start
+      static const bool on = std::getenv("SVR06_RTTLOG") != nullptr; static int n = 0;
+      if (on && ok && n < 6000) { uint8_t pg[4 * 8192]; if (readVramPages(478, 2, pg) && readVramPages(486, 2, pg + 2 * 8192)) { uint32_t nzc = 0, nzz = 0;
+          for (uint32_t i = 0; i < 2u * 8192u; i += 4) { nzc += *reinterpret_cast<uint32_t *>(pg + i) != 0u; nzz += *reinterpret_cast<uint32_t *>(pg + 2 * 8192 + i) != 0u; }
+          std::fprintf(stderr, "[rttlog] PRESENT %llu colourNZw=%u zNZw=%u\n", (unsigned long long)g_presCount.load(), nzc, nzz); ++n; if (nzc > 2000u && g_rttStart.load() != 0u) { static int dn = 0; if (dn < 8 && (g_presCount.load() % 15u) == 0u) { char nm[96]; std::snprintf(nm, sizeof nm, "analysis\\live\\rtt_%llu.bin", (unsigned long long)g_presCount.load()); FILE *f = std::fopen(nm, "wb"); if (f) { std::fwrite(pg, 1, sizeof pg, f); std::fclose(f); ++dn; std::fprintf(stderr, "[rttlog] dumped %s\n", nm); } } } } } }
     if (ok) applyColourBlind(rgba, width, height);
     static double s_sum = 0.0, s_max = 0.0; static uint32_t s_n = 0;
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     s_sum += ms; if (ms > s_max) s_max = ms;
+    { // CL-0391: every 120 presents write analysis/live/gpucost.txt (one line replaced): wait for the GS queue vs draw+scanout vs full frame time
+        static double s_dSum = 0.0; static uint32_t s_k = 0;
+        s_dSum += ms; ++s_k;
+        s_prevPresent = std::chrono::steady_clock::now();
+        if (s_k >= 120u)
+        {
+            if (FILE *f = std::fopen("analysis\\live\\gpucost.txt", "a"))
+            {
+                std::fprintf(f, "pres=%llu queue_wait avg %.2f max %.2f ms | draw+scan avg %.2f ms | frame interval avg %.2f ms (%.1f fps)\n", (unsigned long long)g_presCount.load(),
+                             s_drainSum / s_k, s_drainMax, s_dSum / s_k, s_gapSum / s_k, s_gapSum > 0.0 ? 1000.0 * s_k / s_gapSum : 0.0);
+                std::fclose(f);
+            }
+            s_drainSum = 0.0; s_drainMax = 0.0; s_gapSum = 0.0; s_dSum = 0.0; s_k = 0u;
+        }
+    }
     if (++s_n >= 300u)
     {
         std::fprintf(stderr, "[fps60] present avg %.2f ms max %.2f ms (gpu wait %.2f ms), scans/frame %.2f, vram saves/frame %.2f, queue %d\n", s_sum / s_n, s_max,
@@ -1101,6 +1726,7 @@ bool presentFrame(const GSRegisters &r, std::vector<uint8_t> &rgba, uint32_t &wi
 bool lastPresentWasQueueFill() { return g_queueFill.load(); }
 uint32_t readLocalToHostCT32(uint32_t sbp, uint32_t sbw, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, uint8_t *dst, uint32_t maxBytes)
 {
+    gsq::drain();
     g_fpsSaves.fetch_add(1u, std::memory_order_relaxed);
     // ISS-122: the game saves VRAM pages to RAM with sceGsExecStoreImage and re-uploads them every frame; without a readback the
     // saved font/CLUT pages come back blank. paraLLEl-GS keeps GS local memory in the native swizzled layout.
@@ -1113,6 +1739,7 @@ uint32_t readLocalToHostCT32(uint32_t sbp, uint32_t sbw, uint32_t x0, uint32_t y
     std::lock_guard<std::mutex> lk(s.m);
     if (!initLocked(s))
         return 0u;
+    { static const bool on = std::getenv("SVR06_RTTLOG") != nullptr; static int n = 0; if (on && n++ < 3000) std::fprintf(stderr, "[rttlog] STORE sbp=%u(0x%x) sbw=%u x=%u y=%u %ux%u pres=%llu\n", sbp, sbp, sbw, x0, y0, w, h, (unsigned long long)g_presCount.load()); }
     s.iface.flush(); // [rbflush] ISS-124: complete any pending GIF transfer/draw batch so the save sees the latest VRAM
     // [fps60] CL-0112: the per-save [vramw] file append (one fopen per frame) was removed
     const uint8_t *vram = static_cast<const uint8_t *>(s.iface.map_vram_read(0, 4u * 1024u * 1024u));
@@ -1144,6 +1771,7 @@ uint32_t readLocalToHostCT32(uint32_t sbp, uint32_t sbw, uint32_t x0, uint32_t y
 
 bool readVramPages(uint32_t firstPage, uint32_t numPages, uint8_t *dst)
 {
+    gsq::drain();
     State &s = st();
     std::lock_guard<std::mutex> lk(s.m);
     if (!initLocked(s) || !dst) return false;
@@ -1156,6 +1784,7 @@ bool readVramPages(uint32_t firstPage, uint32_t numPages, uint8_t *dst)
 
 bool dumpVram(const char *path)
 {
+    gsq::drain();
     State &s = st();
     std::lock_guard<std::mutex> lk(s.m);
     if (!initLocked(s)) return false;
@@ -1164,6 +1793,34 @@ bool dumpVram(const char *path)
     if (!vram) return false;
     FILE *f = std::fopen(path, "wb"); if (!f) return false;
     std::fwrite(vram, 1, 4u * 1024u * 1024u, f); std::fclose(f); return true;
+}
+
+bool vramSave(std::vector<uint8_t> &out)
+{   // CL-0392 save states: raw 4 MB GS VRAM
+    gsq::drain();
+    State &s = st();
+    std::lock_guard<std::mutex> lk(s.m);
+    if (!initLocked(s)) return false;
+    s.iface.flush();
+    const void *vram = s.iface.map_vram_read(0, 4u * 1024u * 1024u);
+    if (!vram) return false;
+    out.assign(static_cast<const uint8_t *>(vram), static_cast<const uint8_t *>(vram) + 4u * 1024u * 1024u);
+    return true;
+}
+bool vramLoad(const std::vector<uint8_t> &in)
+{
+    if (in.size() != 4u * 1024u * 1024u) return false;
+    gsq::drain();
+    State &s = st();
+    std::lock_guard<std::mutex> lk(s.m);
+    if (!initLocked(s)) return false;
+    s.iface.flush();
+    void *vram = s.iface.map_vram_write(0, in.size());
+    if (!vram) return false;
+    std::memcpy(vram, in.data(), in.size());
+    s.iface.end_vram_write(0, in.size());
+    s.iface.flush();
+    return true;
 }
 
 } // namespace gsvk
@@ -1176,14 +1833,26 @@ bool enabled() { return false; }
 int outputScale() { return 1; }
 bool ensureInit() { return false; }
 void setSubmitPath(uint32_t) {}
+void setUploadBlock(uint32_t, uint32_t) {}
 uint32_t submitPath() { return 3; }
 void gifTransfer(uint32_t, const uint8_t *, uint32_t) {}
 void uploadImage(uint64_t, uint64_t, uint64_t, uint64_t, const uint8_t *, uint32_t) {}
 uint32_t readLocalToHostCT32(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint8_t *, uint32_t) { return 0u; }
 bool dumpVram(const char *) { return false; }
+bool vramSave(std::vector<uint8_t> &) { return false; }
+bool vramLoad(const std::vector<uint8_t> &) { return false; }
 bool readVramPages(uint32_t, uint32_t, uint8_t *) { return false; }
 bool presentFrame(const GSRegisters &, std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
 bool lastPresentWasQueueFill() { return false; }
+void drainQueue() {}
+void flushWorkerBatch() {} // CL-0261
+bool queueIdle() { return true; }
 } // namespace gsvk
 
+#endif
+
+#if defined(PS2X_HAS_PARALLEL_GS) && PS2X_HAS_PARALLEL_GS
+int svr06_internal_res_mode() { return gsvk::scaleMode(); } // CL-0282: shown in the FPS overlay
+#else
+int svr06_internal_res_mode() { return 0; }
 #endif
