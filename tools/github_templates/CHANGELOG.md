@@ -3,6 +3,14 @@ Summary of releases. The full engineering log (CL-nnnn / ISS-nnn) is in `CHANGEL
 
 ## Unreleased
 
+### 2026-11-16 to 2026-11-25 (CL-0272 - CL-0395) - v0.9.0-beta
+- **Playable end to end on USA (SLUS-21286):** SmackDown Season and RAW Season play through, including the final cutscenes; the stuck/flickering Season cutscene scene, the black arena after a Season match and several load hangs are fixed.
+- **Pacing:** vsync/frame pacing fixes (no more slow motion without a manager), GS queue tail merge for menu lag.
+- **Roster/content:** roster database, import of SvR05/HCTP wrestlers, cut-wrestler restore, extra entrance music and movies, movesets, custom entrance database (launcher import tools).
+- **Debugging:** Win32 menu bar and debugger window (breakpoints, registers, disassembly, memory find), GPU timing log.
+- **Save states (new):** in-session save/load states (4 slots, F6/F7) that capture RAM, the EE kernel, GS VRAM, the IPU video decoder and the host audio streams.
+- Known open: Rumble/crowd slowdown (profiling), voice drift at camera cuts, a post-match stall in the WrestleMania 21 final cutscene, PAL build not re-verified.
+
 ### 2026-11-13 to 2026-11-15 (CL-0217 - CL-0271)
 - **Speed.** Matches and entrances run at full speed; a crowded Royal Rumble went from 32-36 to 46-49 fps (PAL, Ryzen 5 5600X):
   native VU1 programs generated locally from your own disc (never published; without them the runtime uses the interpreter),

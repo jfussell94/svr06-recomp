@@ -1,9 +1,0 @@
-/mnt/c/Users/ajizz/Documents/Recomp/svr06-recomp/tools/vu1bench/img_scan/scan_513e81c1.bin:1f,50,a2,c0,ec,112,156
-/mnt/c/Users/ajizz/Documents/Recomp/svr06-recomp/tools/vu1bench/img_scan/scan_3f114703.bin:0,14,b4,140,1cc
-/mnt/c/Users/ajizz/Documents/Recomp/svr06-recomp/tools/vu1bench/img_scan/scan_984ab955.bin:456,459,51a,51d,5d0,5d4,5d7,5f8,60d,610,613,65c,6bf,6c2,6c5,79f
-/mnt/c/Users/ajizz/Documents/Recomp/svr06-recomp/tools/vu1bench/img_scan/scan_e1142adc.bin:456,549
-/mnt/c/Users/ajizz/Documents/Recomp/svr06-recomp/tools/vu1bench/img_scan/scan_ec212d0b.bin:0,14,b4,140,1cc,44c,44e,456,473,4ae,4cd,4f6
-/mnt/c/Users/ajizz/Documents/Recomp/svr06-recomp/tools/vu1bench/img_scan/scan_20b15a83.bin:456,459,51a,51d,5d0,5d4,5d7,60d,610,613,65c
-/mnt/c/Users/ajizz/Documents/Recomp/svr06-recomp/tools/vu1bench/img_scan/scan_5c6fd1df.bin:0,14,b4,140,1cc,456,49e,4a0,4a2,4ae,4c7,521
-/mnt/c/Users/ajizz/Documents/Recomp/svr06-recomp/tools/vu1bench/img_scan/scan_b662df7f.bin:0,14,b4,140,1cc,44c,44e,456,49e,4a0,4a2,4ae,4c7,4cd
-/mnt/c/Users/ajizz/Documents/Recomp/svr06-recomp/tools/vu1bench/img_scan/scan_053b1e23.bin:0,14,b4,140,1cc,44c,44e,456,49e,4a0,4a2,4c7,4cd
