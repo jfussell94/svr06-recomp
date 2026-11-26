@@ -2793,6 +2793,7 @@ void svr06BuildHostFnMap()
         if (g_ps2RecompiledFunctionTable[s]) g_hostFnMap.emplace_back((uintptr_t)g_ps2RecompiledFunctionTable[s], g_ps2RecompiledFunctionTableBase + s * 4u);
     std::sort(g_hostFnMap.begin(), g_hostFnMap.end());
 }
+int svr06RipModule(uint64_t rip, char *out, int n, uint64_t *off);
 uint32_t svr06CurOsTid(); uint64_t svr06ExeBase(); int svr06SampleThreadStack(uint32_t osTid, uint64_t *rips, int maxFrames); // CL-0310b (ps2_pagewatch.cpp)
 uint32_t svr06HostToGuest(uintptr_t host)
 {
@@ -2961,7 +2962,7 @@ void PS2Runtime::run()
                                     for (size_t i = 0; i < cv.size() && i < 40; ++i) std::fprintf(f, "  %5.1f%% %s\n", 100.0 * cv[i].second / (stackN ? stackN : 1), cv[i].first.c_str());
                                     std::vector<std::pair<uint64_t, uint32_t>> rv(topRip.begin(), topRip.end()); std::sort(rv.begin(), rv.end(), [](const auto &x, const auto &y) { return x.second > y.second; });
                                     std::fprintf(f, "top host rip (exe offset, resolve with the linker map):\n");
-                                    for (size_t i = 0; i < rv.size() && i < 30; ++i) std::fprintf(f, "  %5.1f%% +%llX guest~%06X\n", 100.0 * rv[i].second / (stackN ? stackN : 1), (unsigned long long)rv[i].first, svr06HostToGuest((uintptr_t)(rv[i].first + exeBase)));
+                                    for (size_t i = 0; i < rv.size() && i < 30; ++i) { char mn[96]; uint64_t mo = 0; svr06RipModule(rv[i].first + exeBase, mn, sizeof mn, &mo); std::fprintf(f, "  %5.1f%% +%llX guest~%06X  %s+%llX\n", 100.0 * rv[i].second / (stackN ? stackN : 1), (unsigned long long)rv[i].first, svr06HostToGuest((uintptr_t)(rv[i].first + exeBase)), mn, (unsigned long long)mo); }
                                 }
                                 for (size_t i = 0; i < v.size() && i < 60; ++i)
                                     std::fprintf(f, "%5.1f%% T%u z%u pc=%06X\n", 100.0 * v[i].second / (total ? total : 1), (unsigned)(v[i].first >> 40), (unsigned)((v[i].first >> 32) & 0xFF), (unsigned)(v[i].first & 0xFFFFFFFFu));

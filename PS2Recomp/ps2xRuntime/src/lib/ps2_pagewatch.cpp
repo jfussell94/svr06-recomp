@@ -155,6 +155,15 @@ void svr06PageWatchSet(uint8_t *rdram, uint32_t addr, uint32_t len) { svr06HwWat
 // CL-0310b live EE stack sampler support (used by the prof.req sampler in ps2_runtime.cpp). No allocation while the target is suspended.
 uint32_t svr06CurOsTid() { return (uint32_t)GetCurrentThreadId(); }
 uint64_t svr06ExeBase() { return (uint64_t)(uintptr_t)GetModuleHandleW(nullptr); }
+// CL-0410: module name + offset of a host address (resolves RIPs that lie outside the exe: drivers, ntdll, ...)
+int svr06RipModule(uint64_t rip, char *out, int n, uint64_t *off)
+{
+    HMODULE m = nullptr; out[0] = 0; *off = 0;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)rip, &m) || !m) return 0;
+    char path[MAX_PATH]; if (!GetModuleFileNameA(m, path, MAX_PATH)) return 0;
+    const char *b = path; for (const char *q = path; *q; ++q) if (*q == '\\' || *q == '/') b = q + 1;
+    std::snprintf(out, (size_t)n, "%s", b); *off = rip - (uint64_t)(uintptr_t)m; return 1;
+}
 int svr06SampleThreadStack(uint32_t osTid, uint64_t *rips, int maxFrames)
 {
     HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, (DWORD)osTid);
@@ -223,6 +232,7 @@ static struct Svr06CrashInstall { Svr06CrashInstall() { SetUnhandledExceptionFil
 uint32_t svr06CurOsTid() { return 0; }
 uint64_t svr06ExeBase() { return 0; }
 int svr06SampleThreadStack(uint32_t, uint64_t *, int) { return 0; }
+int svr06RipModule(uint64_t, char *o, int, uint64_t *f) { o[0] = 0; *f = 0; return 0; }
 void svr06HwWatchHost(uint8_t *, uint32_t, uint32_t) {}
 void svr06StartPageWatch(uint8_t *) {}
 void svr06PageWatchSet(uint8_t *, uint32_t, uint32_t) {}
