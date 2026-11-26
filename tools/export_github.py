@@ -90,13 +90,16 @@ seen = set()
 for x in oldrt:
     s = os.path.join(RT_SRC, x[len('PS2Recomp/'):])
     if os.path.isfile(s) and rt_ok(os.path.basename(s)) and not BAD.search(x): put(s, x); seen.add(x)
-for sub in ('ps2xRuntime/src/lib', 'ps2xRuntime/include', 'ps2xRuntime/cmake', 'ps2xIOP/src', 'ps2xIOP/include'):
+for sub in ('ps2xRuntime/src/lib', 'ps2xRuntime/include', 'ps2xRuntime/cmake', 'ps2xIOP/src', 'ps2xIOP/include', 'ps2xRecomp/src', 'ps2xRecomp/include'):   # CL-0402: the recompiler (incl. src/runner/main.cpp) is needed to build from a fresh checkout
     for p, r in walk(os.path.join(RT_SRC, sub), None, maxsize=3000000, skipnames=lambda n: not rt_ok(n)):
         rel = 'PS2Recomp/' + sub + '/' + r.replace('\\', '/')
         if rel not in seen: put(p, rel); seen.add(rel)
 for f in ('ps2xRuntime/CMakeLists.txt', 'ps2xIOP/CMakeLists.txt'):
     rel = 'PS2Recomp/' + f
     if rel not in seen and os.path.exists(os.path.join(RT_SRC, f)): put(os.path.join(RT_SRC, f), rel)
+# CL-0404: this project's changes to paraLLEl-GS/Granite (LGPL), laid over the pinned upstream clone by scripts/usa_build.ps1
+for p, r in walk(os.path.join(ROOT, 'patches'), None, maxsize=3000000):
+    put(p, 'patches/' + r.replace('\\', '/'))
 # ---- repo scaffolding
 shutil.copyfile(os.path.join(ROOT, 'tools', 'github_templates', '.gitignore'), os.path.join(out, '.gitignore')) if os.path.exists(os.path.join(ROOT, 'tools', 'github_templates', '.gitignore')) else None
 for f in ('.gitignore', '.gitattributes', 'README.md', 'BUILDING.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'THIRD_PARTY_NOTICES.md', 'release/README.md', 'release/package_release.py',

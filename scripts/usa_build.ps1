@@ -49,6 +49,17 @@ if (-not $fromShipped -and (Test-Path (Join-Path $root 'out\generated_r4'))) {
 } else { Say '1b/4 Stub list already synced in the shipped config - skipped.' }
 # 2. recompile the USA ELF
 $exe = Join-Path $palrt 'ps2xRecomp\build\ps2xRecomp\Release\ps2_recomp.exe'
+# CL-0402: a fresh checkout has no recompiler yet - find it, or build it (once) from the bundled sources
+if (-not (Test-Path $exe)) { $g = Get-ChildItem (Join-Path $palrt 'build_recomp') -Recurse -Filter 'ps2_recomp.exe' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($g) { $exe = $g.FullName } }
+if (-not (Test-Path $exe)) {
+  Say '2a/4 Building the recompiler (ps2_recomp), first time only...'
+  $vc0 = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat'
+  if (Test-Path $vc0) { cmd /c "`"$vc0`" >nul && set" | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') } } }
+  $rb = Join-Path $palrt 'build_recomp'; $clr = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin\clang-cl.exe'
+  cmake -S $palrt -B $rb -G Ninja "-DCMAKE_C_COMPILER=$clr" "-DCMAKE_CXX_COMPILER=$clr" -DPS2X_BUILD_RUNTIME=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF -DCMAKE_BUILD_TYPE=Release 2>&1 | Out-File -Append -Encoding ascii $log
+  cmake --build $rb --target ps2_recomp -j 2>&1 | Out-File -Append -Encoding ascii $log
+  $g = Get-ChildItem $rb -Recurse -Filter 'ps2_recomp.exe' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($g) { $exe = $g.FullName }
+}
 $regf = Join-Path $gen 'register_functions.cpp'
 if ((-not (Test-Path $regf)) -or $Regen -or ((Get-Item (Join-Path $root 'config\svr06_usa_ps2recomp.toml')).LastWriteTime -gt (Get-Item $regf).LastWriteTime)) {
   if (Test-Path $gen) { Remove-Item $gen -Recurse -Force -ErrorAction SilentlyContinue }
@@ -68,6 +79,7 @@ if ((-not (Test-Path $regf)) -or $Regen -or ((Get-Item (Join-Path $root 'config\
 Say '3/4 Preparing the separate USA runtime tree (PS2Recomp_usa)...'
 robocopy $palrt $usart /E /XO /NFL /NDL /NJH /NJS /NP /XD build build_pgs build_sm build_svr06b build_svr06b_clang build_svr06_usa .git android vita /XF *.obj *.pdb *.whl | Out-Null
 $rd = Join-Path $usart 'ps2xRuntime\src\runner'
+New-Item -ItemType Directory -Force $rd | Out-Null   # CL-0403: a release checkout ships no runner folder (it only holds generated code)
 $palgen = Join-Path $root 'out\generated_r4'
 # keep the generic svr06 runtime services (the runtime links against them); drop PAL-generated code, overlay banks and manual PAL function replacements
 $keep = @('svr06_hotload.cpp', 'svr06_overlay.cpp', 'svr06_overrides.cpp')
@@ -122,6 +134,23 @@ Get-ChildItem (Join-Path $root 'out\usa_ovl\x') -Directory -ErrorAction Silently
   $f = Join-Path $_.FullName 'final'
   if (Test-Path $f) { Copy-Item (Join-Path $f '*.cpp') $rd -Force; Copy-Item (Join-Path $f '*.h') $rd -Force }
 }
+# CL-0404: the Vulkan GS backend (paraLLEl-GS + Granite, LGPL-3.0+) is not vendored (390 MB): fetch the pinned upstream commit once and lay this
+# project's modifications (patches\parallel-gs) over it. Without it the runtime does not compile (stb_image.h / gs_interface missing).
+$pgs = Join-Path $usart 'ps2xRuntime\third_party\parallel-gs'
+if (-not (Test-Path (Join-Path $pgs 'Granite\third_party\stb\stb\stb_image.h'))) {
+  Say '3c/4 Fetching paraLLEl-GS (pinned commit, with submodules; needs git + internet, first time only)...'
+  if (Test-Path $pgs) { Remove-Item $pgs -Recurse -Force -ErrorAction SilentlyContinue }
+  New-Item -ItemType Directory -Force (Split-Path $pgs -Parent) | Out-Null
+  git clone -q https://github.com/Arntzen-Software/parallel-gs $pgs 2>&1 | Out-File -Append -Encoding ascii $log
+  git -C $pgs checkout -q cc6184af7e0c03da603045ca371ffa5dae9b0655 2>&1 | Out-File -Append -Encoding ascii $log
+  # only the Granite pieces the runtime build uses (some other pinned submodule commits no longer exist upstream, so a full recursive init fails)
+  git -C $pgs submodule update --init -q Granite 2>&1 | Out-File -Append -Encoding ascii $log
+  foreach ($m in 'stb', 'volk', 'khronos') { git -C (Join-Path $pgs 'Granite') submodule update --init --recursive -q "third_party/$m" 2>&1 | Out-File -Append -Encoding ascii $log }
+  if (-not (Test-Path (Join-Path $pgs 'Granite\third_party\stb\stb\stb_image.h'))) { Write-Host 'Could not fetch paraLLEl-GS (is git installed and online?) - see analysis\usa_build_log.txt' -ForegroundColor Red; Read-Host 'Press Enter to close'; exit 1 }
+}
+if (Test-Path (Join-Path $root 'patches\parallel-gs')) { robocopy (Join-Path $root 'patches\parallel-gs') $pgs /E /XF README.md /NFL /NDL /NJH /NJS /NP | Out-Null }
+# xxHash 0.8.3 (BSD-2-Clause, single header) used by the GS bridge: shipped in patches\xxhash
+if (Test-Path (Join-Path $root 'patches\xxhash')) { robocopy (Join-Path $root 'patches\xxhash') (Join-Path $usart 'ps2xRuntime\third_party\xxhash') /E /NFL /NDL /NJH /NJS /NP | Out-Null }
 # 4. configure + build
 $elf = Find-UsaElf
 if (-not $elf) { Write-Host 'SLUS_212.86 not found under assets (or in a disc image linked in the launcher)' -ForegroundColor Red; Read-Host 'Press Enter to close'; exit 1 }
@@ -134,7 +163,7 @@ $vc = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\
 if (Test-Path $vc) {
   cmd /c "`"$vc`" >nul && set" | ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') } }
 } else { Say "vcvars64.bat not found at $vc - the C compiler test may fail" }
-cmake -S . -B $bdir -G Ninja "-DCMAKE_C_COMPILER=$cl" "-DCMAKE_CXX_COMPILER=$cl" "-DCMAKE_CXX_FLAGS=/EHsc /clang:-mavx2 /clang:-mbmi2 /clang:-mfma /clang:-ffp-contract=off /I$rd" "-DCMAKE_EXE_LINKER_FLAGS=/FORCE:MULTIPLE /MAP:C:/Users/ajizz/Documents/Recomp/svr06-recomp/analysis/svr06_usa.map" -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF -DCMAKE_BUILD_TYPE=Release "-DPS2X_DEFAULT_BOOT_ELF=$($elf.FullName)" -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_RUNTIME_LOGS=OFF -DPS2X_ENABLE_IOP_RPC_TRACE=OFF -DPS2X_ENABLE_FFMPEG=ON -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_RUNNER_UNITY_BUILD=ON -DPS2X_ENABLE_RUNNER_PCH=ON 2>&1 | Out-File -Append -Encoding ascii $log
+cmake -S . -B $bdir -G Ninja "-DCMAKE_C_COMPILER=$cl" "-DCMAKE_CXX_COMPILER=$cl" "-DCMAKE_CXX_FLAGS=/EHsc /clang:-mavx2 /clang:-mbmi2 /clang:-mfma /clang:-ffp-contract=off /I$rd" "-DCMAKE_EXE_LINKER_FLAGS=/FORCE:MULTIPLE /MAP:$($root -replace '\\','/')/analysis/svr06_usa.map" -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF -DCMAKE_BUILD_TYPE=Release "-DPS2X_DEFAULT_BOOT_ELF=$($elf.FullName)" -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF -DPS2X_ENABLE_RUNTIME_LOGS=OFF -DPS2X_ENABLE_IOP_RPC_TRACE=OFF -DPS2X_ENABLE_FFMPEG=ON -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_RUNNER_UNITY_BUILD=ON -DPS2X_ENABLE_RUNNER_PCH=ON 2>&1 | Out-File -Append -Encoding ascii $log
 $bp = Start-Process cmd.exe -ArgumentList "/c cmake --build $bdir --target ps2EntryRunner -j -- -k 0 >> `"$log`" 2>&1" -PassThru -WindowStyle Hidden
 Pop-Location
 Show-BuildProgress $bp $log 'SvR06 USA build' (Join-Path $usart $bdir)

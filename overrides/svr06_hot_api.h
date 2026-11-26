@@ -19,6 +19,28 @@ struct Svr06HotApi
     bool (*ovlSet)(uint32_t, PS2Runtime::RecompiledFunction);
     PS2Runtime::RecompiledFunction (*ovlOrig)(uint8_t *, uint32_t);
 };
+// CL-0404: host UI primitives handed to the hot plugin (raylib-backed, see SvrCustomMusic.cpp svr06ui::k). Field order = the initializer there.
+struct Svr06Ui
+{
+    void (*rect)(int x, int y, int w, int h, uint32_t rgba);
+    void (*rectRound)(int x, int y, int w, int h, float r, uint32_t rgba);
+    void (*rectLines)(int x, int y, int w, int h, int t, uint32_t rgba);
+    void (*text)(const char *s, int x, int y, int size, uint32_t rgba);
+    int (*measure)(const char *s, int size);
+    bool (*keyPressed)(int key);
+    bool (*keyDown)(int key);
+    int (*charPressed)();
+    bool (*padPressed)(int button);
+    bool (*padDown)(int button);
+    float (*padAxis)(int axis);
+    int (*texLoad)(const char *path);
+    void (*texDraw)(int id, int x, int y, int w, int h, uint32_t rgba);
+    void (*texSize)(int id, int *w, int *h);
+    void (*texFree)(int id);
+    double (*time)();
+    void (*scissor)(int x, int y, int w, int h);
+};
+const Svr06Ui *svr06_ui_table();
 // DLL exports (extern "C", __declspec(dllexport)):
 //   void svr06HotLoad(const Svr06HotApi *api);    install hooks
 //   void svr06HotUnload(const Svr06HotApi *api);  restore every hook this DLL installed
