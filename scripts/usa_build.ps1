@@ -3,26 +3,50 @@
 param([switch]$Regen, [switch]$Launch)
 $ErrorActionPreference = 'Continue'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$palrt = (Resolve-Path (Join-Path $root '..\PS2Recomp')).Path
+# CL-0400: runtime sources come from the repo's own PS2Recomp folder (a release checkout) or the developer's sibling folder; the PAL disc/build is not needed.
+$palrt = if (Test-Path (Join-Path $root 'PS2Recomp\ps2xRuntime')) { (Resolve-Path (Join-Path $root 'PS2Recomp')).Path } else { (Resolve-Path (Join-Path $root '..\PS2Recomp')).Path }
 $usart = Join-Path (Split-Path $palrt -Parent) 'PS2Recomp_usa'
 $gen = Join-Path $root 'out\generated_usa'
 $log = Join-Path $root 'analysis\usa_build_log.txt'
 $bdir = 'build_svr06_usa'
 . (Join-Path $PSScriptRoot 'progress_lib.ps1')
 "==== USA BUILD START $(Get-Date)" | Out-File -Encoding ascii $log
+# CL-0400: locate SLUS_212.86 in assets\ or in the folder the launcher unpacks a linked .iso into (mods\discs\ps2_usa)
+function Find-UsaElf {
+  foreach ($d in (Join-Path $root 'assets'), (Join-Path $root '..\assets'), (Join-Path $root 'mods\discs')) {
+    if (Test-Path -LiteralPath $d) { $f = Get-ChildItem -LiteralPath $d -Filter 'SLUS_212.86' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1; if ($f) { return $f } }
+  }
+  return $null
+}
 function Say($t) { Write-Host $t -ForegroundColor Cyan; $t | Out-File -Append -Encoding ascii $log }
 Get-Process SVR06_USA, ps2EntryRunner -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch {} }
 
 # 1. address map + USA recompiler config (idempotent)
-if (-not (Test-Path (Join-Path $root 'config\svr06_usa_ps2recomp.toml')) -or $Regen) {
-  Say '1/4 Building the PAL->USA address map and USA config...'
+$usaCfg = Join-Path $root 'config\svr06_usa_ps2recomp.toml'
+$shipCfg = Join-Path $root 'regions\usa\recomp.toml'
+$fromShipped = $false
+if ((-not (Test-Path $usaCfg)) -and (Test-Path $shipCfg)) {
+  # CL-0400: the repository ships the finished USA config (function addresses + options only, no game data), so the USA build does not need the PAL disc.
+  Say '1/4 Using the shipped USA config (regions\usa\recomp.toml) - no PAL disc needed.'
+  Copy-Item $shipCfg $usaCfg -Force; $fromShipped = $true
+} elseif ((-not (Test-Path $usaCfg)) -or $Regen) {
+  Say '1/4 Building the PAL->USA address map and USA config (needs the PAL SLES_536.76 under assets)...'
   Push-Location $root; python tools\usa_map.py 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
+}
+# point the config at the boot file where this PC has it (assets\ or the launcher's unpacked ISO)
+$elf0 = Find-UsaElf
+if ($elf0 -and (Test-Path $usaCfg)) {
+  $cfgTxt = [IO.File]::ReadAllText($usaCfg); $want = 'input = "' + ($elf0.FullName -replace '\\', '/') + '"'
+  $new = [regex]::Replace($cfgTxt, '(?m)^input\s*=\s*".*"\s*$', [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $want }, 1)
+  if ($new -ne $cfgTxt) { [IO.File]::WriteAllText($usaCfg, $new, (New-Object Text.UTF8Encoding $false)); Say "USA config input -> $($elf0.FullName)" }
 }
 # 1b. CL-0167: keep the USA stub list identical to what the PAL build really runs (PAL runner = reference). Functions the PAL
 #     build executes as real recompiled code (e.g. the game's own sceMpeg/sceIpu library, which decodes the in-memory
 #     arena/menu videos) must not become HLE stubs in USA. Writes the toml only on change; report analysis\usa\stub_sync_report.txt
-Say '1b/4 Syncing the USA stub list with the PAL build...'
-Push-Location $root; python tools\usa_stub_sync.py 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
+if (-not $fromShipped -and (Test-Path (Join-Path $root 'out\generated_r4'))) {
+  Say '1b/4 Syncing the USA stub list with the PAL build...'
+  Push-Location $root; python tools\usa_stub_sync.py 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
+} else { Say '1b/4 Stub list already synced in the shipped config - skipped.' }
 # 2. recompile the USA ELF
 $exe = Join-Path $palrt 'ps2xRecomp\build\ps2xRecomp\Release\ps2_recomp.exe'
 $regf = Join-Path $gen 'register_functions.cpp'
@@ -56,6 +80,14 @@ Get-ChildItem (Join-Path $root 'overrides') -File -Filter *.h -ErrorAction Silen
 # CL-0154: the PAL game overrides (CD timing, RPC loop, IPU/syscall stubs, movie + music hooks, guards) are translated to USA addresses
 # (code via the PAL->USA map, data +DATA_DELTA) and the override descriptor is retargeted to SLUS_212.86. Report: analysis\usa\port\usa_port_report.txt
 $portdir = Join-Path $root 'analysis\usa\port'
+$usaOv = Join-Path $root 'overrides\usa'
+$haveUsaOv = Test-Path (Join-Path $usaOv 'svr06_overrides.cpp')
+if ($haveUsaOv) {
+  # CL-0400: the repository ships the finished USA hooks (USA addresses), so no PAL->USA translation is needed
+  Say '3a/4 Using the shipped USA overrides (overrides\usa).'
+  foreach ($f in 'svr06_overrides.cpp','svr06_funcs.h','svr06_hotload.cpp','svr06_overlay.cpp') { $s = Join-Path $usaOv $f; if (Test-Path $s) { Copy-Item $s (Join-Path $rd $f) -Force } }
+  Copy-Item (Join-Path $usaOv 'svr06_funcs.h') (Join-Path $usart 'ps2xRuntime\include\svr06_funcs.h') -Force -ErrorAction SilentlyContinue
+} else {
 Push-Location $root; python tools\usa_port_overrides.py $portdir 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
 # CL-0305: the USA svr06_overrides.cpp / svr06_funcs.h are GENERATED here from overrides\ (PAL addresses). Edits made directly to the
 # USA copies are overwritten; keep a copy of them and say so, so a hand edit is never lost silently. Edit overrides\svr06_overrides.cpp instead.
@@ -74,6 +106,7 @@ foreach ($f in 'svr06_overrides.cpp','svr06_funcs.h') {
   if (Test-Path $src) { Copy-Item $src $dst -Force; Copy-Item $src $stamp -Force } else { Write-Host "USA port output missing: $f" -ForegroundColor Red }
 }
 foreach ($f in 'svr06_funcs.h','svr06_engine.h') { $src = Join-Path $portdir $f; if (Test-Path $src) { Copy-Item $src (Join-Path $usart "ps2xRuntime\include\$f") -Force } }
+}
 # CL-0277: hand patches the PAL runner carries (ISS-123 delay slots, ISS-101 camera guard, CL-0037 VU0 flags) re-applied to the USA code (idempotent)
 Push-Location $root; python tools\usa_postgen_patches.py 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
 Copy-Item (Join-Path $gen '*.cpp') $rd -Force
@@ -84,8 +117,8 @@ Get-ChildItem (Join-Path $root 'out\usa_ovl\x') -Directory -ErrorAction Silently
   if (Test-Path $f) { Copy-Item (Join-Path $f '*.cpp') $rd -Force; Copy-Item (Join-Path $f '*.h') $rd -Force }
 }
 # 4. configure + build
-$elf = Get-ChildItem -LiteralPath (Join-Path $root '..\assets') -Filter 'SLUS_212.86' -File -Recurse | Select-Object -First 1
-if (-not $elf) { Write-Host 'SLUS_212.86 not found under assets' -ForegroundColor Red; Read-Host 'Press Enter to close'; exit 1 }
+$elf = Find-UsaElf
+if (-not $elf) { Write-Host 'SLUS_212.86 not found under assets (or in a disc image linked in the launcher)' -ForegroundColor Red; Read-Host 'Press Enter to close'; exit 1 }
 if ((Test-Path (Join-Path $usart "$bdir\CMakeCache.txt")) -and -not (Test-Path (Join-Path $usart "$bdir\build.ninja"))) { Remove-Item (Join-Path $usart $bdir) -Recurse -Force }
 Say '4/4 Configuring and building the USA runtime (first build takes a long time)...'
 $cl = 'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin\clang-cl.exe'
