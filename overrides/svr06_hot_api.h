@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <atomic>
 #include "ps2_runtime.h"
+struct Svr06Ui;
 struct Svr06HotApi
 {
     uint32_t version;                                   // 1
@@ -18,6 +19,10 @@ struct Svr06HotApi
     // (svr06_hotload.cpp); ovlSet(addr, fn) points one at a DLL hook (nullptr = original); ovlOrig(rdram, addr) = bank function.
     bool (*ovlSet)(uint32_t, PS2Runtime::RecompiledFunction);
     PS2Runtime::RecompiledFunction (*ovlOrig)(uint8_t *, uint32_t);
+    // version 3 (CL-0404 in-game roster UI; the exe does not provide these yet -> they stay null with version 2; the plugin must check version >= 3 first)
+    const Svr06Ui *ui;
+    void (*setOverlay)(void (*)());
+    std::atomic<int> *padCapture;
 };
 // CL-0404: host UI primitives handed to the hot plugin (raylib-backed, see SvrCustomMusic.cpp svr06ui::k). Field order = the initializer there.
 struct Svr06Ui
