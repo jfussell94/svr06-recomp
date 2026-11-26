@@ -23,9 +23,11 @@ for /l %%i in (1,1,15) do (
 taskkill /F /IM %EXE% >nul 2>&1
 rem Region-aware launcher: set SVR06_ELF to a specific boot ELF, otherwise the PAL (SLES_536.76) ELF is searched for under assets\
 set "ELF=%SVR06_ELF%"
-if not defined ELF for /r "%~dp0..\..\assets" %%e in (SLES_536.76) do if exist "%%e" set "ELF=%%e"
+set "SERIAL=SLES_536.76"
+if /i "%SVR06_LOGTAG%"=="usa" set "SERIAL=SLUS_212.86"
+if not defined ELF for %%a in ("%~dp0..\..\assets" "%~dp0..\assets" "%~dp0..\mods\discs") do if exist "%%~a" if not defined ELF call :findelf "%%~a"
 if not defined ELF (
-  echo Could not find SLES_536.76 under assets\ - put the PAL game files in a folder inside assets\ or set SVR06_ELF
+  echo Could not find %SERIAL% under assets\ - put the game files in a folder inside assets\ or set SVR06_ELF
   goto :eof
 )
 echo Boot ELF: %ELF%
@@ -51,6 +53,9 @@ set "SVR06_DUMPFRAME=3000"
 set "SVR06_SHOTDIR=%~dp0..\analysis\shots"
 if not exist "%SVR06_SHOTDIR%" mkdir "%SVR06_SHOTDIR%"
 del /q "%SVR06_SHOTDIR%\*.png" 2>nul
+if not defined SVR06_BUILDPATH if /i "%SVR06_LOGTAG%"=="usa" (
+  if exist "%~dp0..\..\PS2Recomp_usa\build_svr06_usa" (set "SVR06_BUILDPATH=%~dp0..\..\PS2Recomp_usa\build_svr06_usa") else set "SVR06_BUILDPATH=%~dp0..\PS2Recomp_usa\build_svr06_usa"
+)
 if not defined SVR06_BUILDPATH set "SVR06_BUILDPATH=%~dp0..\..\PS2Recomp\build_svr06b_clang"
 cd /d "%SVR06_BUILDPATH%"
 if not exist analysis\live mkdir analysis\live
@@ -61,3 +66,8 @@ for %%f in (ps2EntryRunner.exe ps2xRuntime\ps2EntryRunner.exe) do if exist %%f (
   goto :eof
 )
 echo ps2EntryRunner.exe not found - run scripts\link_runtime.ps1 first
+goto :eof
+:findelf
+rem for /r does not accept a modified loop variable as its root, hence the subroutine (CL-0408)
+for /r "%~1" %%e in (%SERIAL%) do if exist "%%e" if not defined ELF set "ELF=%%e"
+exit /b 0

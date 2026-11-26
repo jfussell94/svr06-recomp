@@ -41,7 +41,7 @@ def cur_live():
     global LIVE
     try:
         p = load_prefs(); b = BUILD_BY_ID.get(p.get('last_launched')) or selected_build(p)
-        d = os.path.join(os.path.abspath(os.path.join(ROOT, '..', b['dir'], b['bdir'])), 'analysis', 'live') if b['id'] != 'pal' else LIVE_PAL
+        d = os.path.join(sib(b['dir'], b['bdir']), 'analysis', 'live') if b['id'] != 'pal' else LIVE_PAL
     except Exception:
         d = LIVE_PAL
     LIVE = d
@@ -181,7 +181,7 @@ def build_env(p):
         e.pop('SVR06_ICONSET', None)
         if sb['id'] != 'usa': e.pop('SVR06_TEXPACK', None)  # CL-0287: pack hashes are content-based and the pack is a USA pack; other regions untested
         pass  # CL-0284: bring-up GS dump disabled (caused a hitch every run); set SVR06_GSDUMPTICK yourself to capture      # USA bring-up: capture the GS packets of ~20 frames at ~80 s so a broken scene can be analysed
-        e['SVR06_BUILDPATH'] = os.path.abspath(os.path.join(ROOT, '..', sb['dir'], sb['bdir']))
+        e['SVR06_BUILDPATH'] = sib(sb['dir'], sb['bdir'])
         el = find_named(sb['elf'])
         if el: e['SVR06_ELF'] = el
     else:
@@ -357,17 +357,23 @@ BUILD_BY_ID = {b['id']: b for b in BUILDS}
 
 
 def build_exe(b):
-    base = os.path.abspath(os.path.join(ROOT, '..', b['dir'], b['bdir']))
+    base = sib(b['dir'], b['bdir'])
     for sub in ('ps2xRuntime', ''):
         p = os.path.join(base, sub, 'ps2EntryRunner.exe')
         if os.path.exists(p): return p
     return os.path.join(base, 'ps2xRuntime', 'ps2EntryRunner.exe')
 
 
+def sib(*parts):
+    """CL-0407: a path next to the repo (developer layout: <workspace>\\PS2Recomp_usa, <workspace>\\assets) or, in a release checkout, inside it."""
+    a = os.path.abspath(os.path.join(ROOT, '..', *parts)); b = os.path.abspath(os.path.join(ROOT, *parts))
+    return a if (os.path.exists(a) or not os.path.exists(b)) else b
+
+
 def find_named(name):
-    ad = os.path.abspath(os.path.join(ROOT, '..', 'assets'))
-    for dp, dn, fn in os.walk(ad):
-        if name in fn: return os.path.join(dp, name)
+    for ad in (sib('assets'), os.path.join(ROOT, 'mods', 'discs')):          # CL-0407: also the folder an linked .iso is unpacked into
+        for dp, dn, fn in os.walk(ad):
+            if name in fn: return os.path.join(dp, name)
     return ''
 
 
@@ -463,7 +469,7 @@ def exe_path(b=None):
 
 
 def find_elf():
-    ad = os.path.abspath(os.path.join(ROOT, '..', 'assets'))
+    ad = sib('assets')
     base = ad.count(os.sep)
     for dp, dn, fn in os.walk(ad):
         if 'SLES_536.76' in fn: return os.path.join(dp, 'SLES_536.76')
@@ -764,7 +770,7 @@ def _library_scan():
         if _s.startswith('ps2') and _v and os.path.isfile(_v) and _v.lower().endswith(IMAGE_EXT):
             try: links[_s] = resolve_disc(_s, _v)
             except Exception: pass
-    assets = os.path.abspath(os.path.join(ROOT, '..', 'assets'))
+    assets = sib('assets')
     auto = {}
     elf = find_elf()
     if elf: auto['ps2_pal'] = os.path.dirname(elf)
@@ -872,7 +878,7 @@ def games_op(body):
 _CHAR_BUSY = [False]
 def _chars_paths(b=None):
     b = b or selected_build()
-    base = os.path.abspath(os.path.join(ROOT, '..', b['dir'], b['bdir']))
+    base = sib(b['dir'], b['bdir'])
     mods = os.path.join(base, 'mods', 'disc')
     lib = library()
     stock = ''
@@ -931,7 +937,7 @@ _AUDIO = ('.ogg', '.mp3', '.flac', '.wav', '.adx', '.m4a', '.opus', '.aac', '.wm
 _VIDEO = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.m4v', '.bik', '.mpg', '.mpeg', '.ogv', '.flv')
 def _ent_paths(b=None):
     b = b or selected_build()
-    base = os.path.abspath(os.path.join(ROOT, '..', b['dir'], b['bdir']))
+    base = sib(b['dir'], b['bdir'])
     return base, os.path.join(base, 'Custom Entrances'), os.path.join(base, 'Custom Music', 'Entrances'), os.path.join(base, 'Custom Titantrons')
 def _norm(s): return ''.join(c for c in s.lower() if c.isalnum())
 def _ent_files(root, exts):
@@ -1111,7 +1117,7 @@ _GS_LAST = {}
 
 def gs_path(bid):
     b = BUILD_BY_ID.get(bid) or BUILDS[0]
-    return os.path.join(os.path.abspath(os.path.join(ROOT, '..', b['dir'], b['bdir'])), 'svr06_settings.json')
+    return os.path.join(sib(b['dir'], b['bdir']), 'svr06_settings.json')
 
 
 def gs_read(bid):

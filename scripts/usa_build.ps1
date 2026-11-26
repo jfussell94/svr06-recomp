@@ -173,7 +173,8 @@ Add-Content $log '==== BUILD STEP FINISHED ===='
 if ($fail -gt 0) { Write-Host ("USA build finished with {0} error line(s). See analysis\usa_build_log.txt" -f $fail) -ForegroundColor Red }
 else {
   Write-Host 'USA build OK.' -ForegroundColor Green
-  if ($Launch) { cmd /c "`"$root\scripts\run.cmd`" > `"$root\analysis\run_log.txt`" 2>&1" } else { Read-Host 'Press Enter to close' }
+  if ($Launch) { $env:SVR06_LOGTAG = 'usa'; $env:SVR06_ELF = $elf.FullName; $env:SVR06_BUILDPATH = Join-Path $usart $bdir   # CL-0407: run.cmd defaults to the PAL build
+    cmd /c "`"$root\scripts\run.cmd`" > `"$root\analysis\run_log.txt`" 2>&1" } else { Read-Host 'Press Enter to close' }
   exit 0
 }
 Read-Host 'Press Enter to close'

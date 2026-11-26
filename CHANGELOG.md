@@ -3,6 +3,13 @@ Summary of releases. The full engineering log (CL-nnnn / ISS-nnn) is in `CHANGEL
 
 ## Unreleased
 
+### 2026-11-25 (CL-0396 - CL-0409) - v0.9.0-alpha.5
+- **USA builds from the USA disc alone:** no PAL disc, no emulator dump. Shipped USA config and hooks, overlay banks decoded from `BIN.PAC` (`tools/usa_ovl_all.py`), recompiler built on first use, paraLLEl-GS fetched at a pinned commit with our patches (`patches/`).
+- **Launcher:** link a disc image (`.iso`) as well as an extracted folder (unpacked once into `mods/discs/`); build progress now shows during silent compile/link phases; works in a release checkout (paths inside the repo or next to it); Play on USA no longer falls back to the PAL boot file.
+- **Fixes:** fullscreen hides the Win32 menu bar; entrance/menu audio is restored when a save state is loaded; missing `Svr06Ui` type, recompiler `main.cpp` and `xxhash` that stopped fresh checkouts from compiling.
+- **Releases:** assets are uploaded to a draft that the workflow then publishes (the repository uses immutable releases); hyphenated tags are pre-releases.
+- Known: the clean-checkout USA build was verified through to a booting game (frames render); full play-through on a tester build is still being checked.
+
 ### 2026-11-16 to 2026-11-25 (CL-0272 - CL-0395) - v0.9.0-beta
 - **Playable end to end on USA (SLUS-21286):** SmackDown Season and RAW Season play through, including the final cutscenes; the stuck/flickering Season cutscene scene, the black arena after a Season match and several load hangs are fixed.
 - **Pacing:** vsync/frame pacing fixes (no more slow motion without a manager), GS queue tail merge for menu lag.

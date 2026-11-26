@@ -20,6 +20,7 @@ Run `python tools/check_clean.py` before publishing anything.
 ## Quick start (Windows)
 1. Clone this repo, then follow [BUILDING.md](BUILDING.md).
 2. Put your disc files under `assets/` (folder per region is fine), or link your disc image (`.iso`) on the launcher Library page - it is unpacked once into `mods/discs/` (git-ignored).
+   USA (SLUS-21286) needs only the USA disc - see [BUILDING.md](BUILDING.md) (about 1-2 hours for the first build).
 3. Run `scripts\LAUNCHER.cmd` (or the packaged `SvR06Launcher.exe`). Pick the version on the Play tab, then **Rebuild + play**.
 
 ## Layout

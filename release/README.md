@@ -8,6 +8,8 @@ One repo, one release per version tag (`v0.1.0`). A release contains:
 | `SvR06-tools-<version>.zip` | Scripts, `regions/`, `overrides/`, runtime sources, docs - everything needed to build from your own disc |
 | `SHA256SUMS.txt` | Checksums |
 
+Releases are created as drafts, assets uploaded, then published by the workflow (the repository has immutable releases: once a release exists its tag cannot be reused or its assets changed - bump the version for a fix). Tags with a hyphen (`v0.9.0-alpha.5`) are marked pre-release.
+
 Region builds are not shipped as binaries: they contain code translated from the game, so each user recompiles from their own disc with the scripts.
 
 ## Cutting a release
