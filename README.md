@@ -5,7 +5,7 @@ Native Windows port of **WWE SmackDown! vs. Raw 2006** through static recompilat
 | Region | Serial | Status |
 |---|---|---|
 | Europe / Australia (PAL) | SLES-53676 | In-game - matches run, known crashes and glitches |
-| North America (NTSC-U) | SLUS-21286 | Bootable - boots to the logos, black screen afterwards while the PAL fixes are ported |
+| North America (NTSC-U) | SLUS-21286 | Alpha - playable on the developer's machine (Season modes work). The build from your own disc (no PAL disc needed, menus/overlays built from BIN.PAC) is new and still being verified by testers |
 | Italy (PAL) | SLES-53677 | Planned |
 | Japan (NTSC-J) | SLPM-66268 | Planned |
 | Korea (NTSC-K) | SLKA-25318 | Planned |

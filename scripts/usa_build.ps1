@@ -111,7 +111,13 @@ foreach ($f in 'svr06_funcs.h','svr06_engine.h') { $src = Join-Path $portdir $f;
 Push-Location $root; python tools\usa_postgen_patches.py 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
 Copy-Item (Join-Path $gen '*.cpp') $rd -Force
 Copy-Item (Join-Path $gen '*.h') $rd -Force
-# overlay banks recompiled from the USA BIN.PAC overlays (tools\usa_ovl_all.sh -> out\usa_ovl\x\<bank>\final)
+# CL-0401: the menu/title/Season code lives in overlays decoded from the disc's BIN.PAC. Build the banks here when they are missing:
+# tools\usa_ovl_all.py needs only Python + the disc files + ps2_recomp (the RAM image it scans is built from SLUS_212.86, no game dump).
+if (-not (Get-ChildItem (Join-Path $root 'out\usa_ovl\x') -Directory -ErrorAction SilentlyContinue)) {
+  Say '3b/4 Decoding and recompiling the USA overlays from BIN.PAC (menus, title, Season; several minutes)...'
+  Push-Location $root; python tools\usa_ovl_all.py --recomp $exe 2>&1 | Out-File -Append -Encoding ascii $log; Pop-Location
+  if (-not (Get-ChildItem (Join-Path $root 'out\usa_ovl\x') -Directory -ErrorAction SilentlyContinue)) { Write-Host 'Overlay recompile produced no banks - see analysis\usa_build_log.txt' -ForegroundColor Red; Read-Host 'Press Enter to close'; exit 1 }
+}# overlay banks recompiled from the USA BIN.PAC overlays (tools\usa_ovl_all.sh -> out\usa_ovl\x\<bank>\final)
 Get-ChildItem (Join-Path $root 'out\usa_ovl\x') -Directory -ErrorAction SilentlyContinue | ForEach-Object {
   $f = Join-Path $_.FullName 'final'
   if (Test-Path $f) { Copy-Item (Join-Path $f '*.cpp') $rd -Force; Copy-Item (Join-Path $f '*.h') $rd -Force }
