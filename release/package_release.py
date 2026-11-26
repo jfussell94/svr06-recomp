@@ -3,7 +3,7 @@
 import os, sys, zipfile, hashlib, shutil, argparse
 ap = argparse.ArgumentParser(); ap.add_argument('--version', required=True); ap.add_argument('--launcher', default=None); a = ap.parse_args()
 root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..')); dist = os.path.join(root, 'dist'); os.makedirs(dist, exist_ok=True)
-INC = ['regions', 'overrides', 'PS2Recomp', 'scripts', 'tools', 'docs', 'release', 'config', 'README.md', 'BUILDING.md', 'CHANGELOG.md']
+INC = ['regions', 'overrides', 'PS2Recomp', 'scripts', 'tools', 'docs', 'release', 'config', 'Custom Music', 'Custom Titantrons', 'Custom Entrances', 'README.md', 'BUILDING.md', 'CHANGELOG.md']
 SKIP = ('__pycache__', '.bak', 'runner', 'dist', 'build')
 zp = os.path.join(dist, 'SvR06-tools-%s.zip' % a.version)
 with zipfile.ZipFile(zp, 'w', zipfile.ZIP_DEFLATED) as z:

@@ -57,6 +57,8 @@ if not defined SVR06_BUILDPATH if /i "%SVR06_LOGTAG%"=="usa" (
   if exist "%~dp0..\..\PS2Recomp_usa\build_svr06_usa" (set "SVR06_BUILDPATH=%~dp0..\..\PS2Recomp_usa\build_svr06_usa") else set "SVR06_BUILDPATH=%~dp0..\PS2Recomp_usa\build_svr06_usa"
 )
 if not defined SVR06_BUILDPATH set "SVR06_BUILDPATH=%~dp0..\..\PS2Recomp\build_svr06b_clang"
+rem CL-0411: Custom Music / Custom Titantrons / Custom Entrances sit in the repo root
+if not defined SVR06_CUSTOMMUSIC for %%i in ("%~dp0..") do set "SVR06_CUSTOMMUSIC=%%~fi\Custom Music"
 cd /d "%SVR06_BUILDPATH%"
 if not exist analysis\live mkdir analysis\live
 taskkill /F /IM %EXE% >nul 2>&1

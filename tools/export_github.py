@@ -110,6 +110,10 @@ if os.path.exists(os.path.join(ROOT, 'docs', 'CHANGELOG-2026-10-28.md')): put(os
 for f in ('SYNC_TO_REPO.ps1', 'README_FIRST.txt'):
     shutil.copyfile(os.path.join(HERE, 'github_templates', f), os.path.join(os.path.dirname(out), f))
 for d in ('assets', 'analysis', 'mods'): text(d + '/.gitkeep', '')
+for d in ('Custom Music/Replacements', 'Custom Music/Entrances', 'Custom Music/Menus'): text(d + '/.gitkeep', '')   # CL-0411
+for d in ('Custom Music', 'Custom Titantrons', 'Custom Entrances'):
+    _rp = os.path.join(ROOT, d, 'README.txt')
+    if os.path.exists(_rp): text(d + '/README.txt', open(_rp, encoding='utf-8', errors='replace').read())
 # ---- deletions relative to the old repo
 new = set(copied)
 gone = sorted(x for x in oldlist if x and x not in new)

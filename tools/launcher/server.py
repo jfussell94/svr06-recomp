@@ -938,7 +938,18 @@ _VIDEO = ('.mp4', '.mkv', '.avi', '.mov', '.webm', '.wmv', '.m4v', '.bik', '.mpg
 def _ent_paths(b=None):
     b = b or selected_build()
     base = sib(b['dir'], b['bdir'])
-    return base, os.path.join(base, 'Custom Entrances'), os.path.join(base, 'Custom Music', 'Entrances'), os.path.join(base, 'Custom Titantrons')
+    # CL-0411: Custom Music / Custom Titantrons / Custom Entrances live in the repo root (easy to find); the runtime gets SVR06_CUSTOMMUSIC from run.cmd.
+    for nm in ('Custom Music', 'Custom Titantrons', 'Custom Entrances'):       # one-time move from <build dir>\<name> (older versions)
+        old, new = os.path.join(base, nm), os.path.join(ROOT, nm)
+        try:
+            if os.path.isdir(old) and os.path.abspath(old) != os.path.abspath(new):
+                for dp, dn, fn in os.walk(old):
+                    for f in fn:
+                        d = os.path.join(new, os.path.relpath(os.path.join(dp, f), old))
+                        if not os.path.exists(d):
+                            os.makedirs(os.path.dirname(d), exist_ok=True); shutil.move(os.path.join(dp, f), d)
+        except Exception: pass
+    return base, os.path.join(ROOT, 'Custom Entrances'), os.path.join(ROOT, 'Custom Music', 'Entrances'), os.path.join(ROOT, 'Custom Titantrons')
 def _norm(s): return ''.join(c for c in s.lower() if c.isalnum())
 def _ent_files(root, exts):
     out = []

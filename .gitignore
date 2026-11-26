@@ -67,3 +67,17 @@ ps2_vu1_native_gen.cpp
 tools/vu1bench/img/
 tools/vu1bench/natlist.txt
 ps2_vu1_native_gen.cpp
+
+# your own music / Titantrons / entrance choices stay on your PC
+/Custom Music/**
+!/Custom Music/**/
+!/Custom Music/README.txt
+!/Custom Music/**/.gitkeep
+/Custom Titantrons/**
+!/Custom Titantrons/**/
+!/Custom Titantrons/README.txt
+!/Custom Titantrons/**/.gitkeep
+/Custom Entrances/**
+!/Custom Entrances/**/
+!/Custom Entrances/README.txt
+!/Custom Entrances/**/.gitkeep
