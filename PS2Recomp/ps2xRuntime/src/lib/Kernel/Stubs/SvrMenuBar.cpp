@@ -42,6 +42,7 @@ std::atomic<int> g_cmd{0};
 std::atomic<uint8_t *> g_rdram{nullptr};
 WNDPROC g_oldProc = nullptr;
 HWND g_game = nullptr;
+HMENU g_bar = nullptr; // CL-0397: kept so the bar can be taken off in fullscreen and put back
 std::atomic<HWND> g_dbgWnd{nullptr};
 std::atomic<bool> g_dbgThread{false};
 HWND g_out = nullptr, g_in = nullptr;
@@ -259,6 +260,7 @@ bool installMenu(HWND h)
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(dbg), L"Debug");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"Help");
     if (!SetMenu(h, bar)) { DestroyMenu(bar); return false; }
+    g_bar = bar;
     g_oldProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(gameProc)));
     DrawMenuBar(h);
     return true;
@@ -291,6 +293,15 @@ void svr06MenuTick(uint8_t *rdram)
         HWND h = nullptr;
         EnumWindows(findGame, reinterpret_cast<LPARAM>(&h));
         if (h && installMenu(h)) { g_game = h; std::fprintf(stderr, "[menubar] installed on the game window\n"); }
+    }
+    // CL-0397: no menu bar in fullscreen / borderless (the window has no caption then): take it off, and put it back in a normal window
+    if (g_game && g_bar && (s_tries++ % 10) == 0)
+    {
+        const LONG_PTR st = GetWindowLongPtrW(g_game, GWL_STYLE);
+        const bool wantBar = (st & WS_CAPTION) == WS_CAPTION;
+        const bool hasBar = GetMenu(g_game) != nullptr;
+        if (!wantBar && hasBar) SetMenu(g_game, nullptr);
+        else if (wantBar && !hasBar) { SetMenu(g_game, g_bar); DrawMenuBar(g_game); }
     }
     // hotkeys while the game window has focus: F2 debugger, F5 continue
     static bool s_f2 = false, s_f5 = false;

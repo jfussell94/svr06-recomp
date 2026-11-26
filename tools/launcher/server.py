@@ -406,6 +406,23 @@ def linker_running():
     return _link_cache[1]
 
 
+_ninja_cache = [0.0, False]
+_link_t0 = [0.0]
+
+
+def ninja_running():
+    """CL-0398: True while any ninja/cmake build is running, however it was started (launcher button, a script or an assistant): the log is silent for minutes at a time."""
+    if not IS_WIN: return False
+    if time.time() - _ninja_cache[0] < 3: return _ninja_cache[1]
+    try:
+        out = subprocess.run(['tasklist', '/NH'], capture_output=True, text=True, creationflags=NOWIN, timeout=8).stdout.lower()
+        _ninja_cache[1] = 'ninja.exe' in out
+    except Exception:
+        pass
+    _ninja_cache[0] = time.time()
+    return _ninja_cache[1]
+
+
 def build_state(logname=None):
     if logname is None: logname = selected_build()['log']
     lg = os.path.join(ROOT, 'analysis', logname)
@@ -424,14 +441,21 @@ def build_state(logname=None):
     m = re.findall(r'\[(\d+)/(\d+)\]', tail)
     n, tot = (int(m[-1][0]), int(m[-1][1])) if m else (0, 0)
     bad = bool(re.search(r'(?<![A-Za-z-])error:', tail)) or 'FAILED:' in tail or (bool(endm) and endm[-1] != '0')
-    running = (time.time() - mt) < 20 and not done
-    linking = (not running) and (not done) and (not bad) and (time.time() - mt) < 3600 and (linker_running() or (n and tot and n >= tot - 8))
+    nin = ninja_running()                       # CL-0398: a build started outside the launcher still shows progress
+    age = time.time() - mt
+    lk = (not done) and (not bad) and nin and age >= 4 and linker_running()   # silent log + linker process = the link step
+    running = (age < 20 or nin) and not done and not lk
+    linking = lk or ((not running) and (not done) and (not bad) and age < 3600 and (linker_running() or (n and tot and n >= tot - 8)))
+    if linking:
+        if not _link_t0[0] or time.time() - _link_t0[0] > 3600: _link_t0[0] = time.time()
+    else:
+        _link_t0[0] = 0.0
     if running: state = 'running'
     elif linking: state = 'linking'
     elif done and bad: state = 'failed'
     elif done: state = 'ok'
     else: state = 'interrupted'
-    return {'state': state, 'n': n, 'total': tot, 'age': round(time.time() - mt), 'mtime': mt}
+    return {'state': state, 'n': n, 'total': tot, 'age': round(time.time() - mt), 'mtime': mt, 'link_secs': (round(time.time() - _link_t0[0]) if _link_t0[0] else 0)}
 
 
 def exe_path(b=None):
@@ -736,6 +760,10 @@ def library(force=False):
 
 def _library_scan():
     p = load_prefs(); links = dict(p.get('games') or {})
+    for _s, _v in list(links.items()):          # CL-0399: older links straight to an .iso are extracted on first use
+        if _s.startswith('ps2') and _v and os.path.isfile(_v) and _v.lower().endswith(IMAGE_EXT):
+            try: links[_s] = resolve_disc(_s, _v)
+            except Exception: pass
     assets = os.path.abspath(os.path.join(ROOT, '..', 'assets'))
     auto = {}
     elf = find_elf()
@@ -773,6 +801,27 @@ def psp_primary(psp, p):
     return ok[0] if ok else None
 
 
+def browse_image():
+    """CL-0399: file picker for a disc image (.iso etc.)."""
+    if not IS_WIN: return ''
+    ps = ("Add-Type -AssemblyName System.Windows.Forms;$d=New-Object System.Windows.Forms.OpenFileDialog;"
+          "$d.Title='Pick the PS2 disc image';$d.Filter='Disc images (*.iso;*.bin;*.img;*.mdf)|*.iso;*.bin;*.img;*.mdf|All files (*.*)|*.*';"
+          "$f=New-Object System.Windows.Forms.Form;$f.TopMost=$true;if($d.ShowDialog($f) -eq 'OK'){[Console]::Out.Write($d.FileName)}")
+    try:
+        return subprocess.run(['powershell', '-NoProfile', '-STA', '-Command', ps], capture_output=True, text=True, creationflags=NOWIN, timeout=300).stdout.strip()
+    except Exception:
+        return ''
+
+
+def resolve_disc(slot, path):
+    """CL-0399: a PS2 slot may be linked to a disc image. The runtime and the importers read a folder, so the image is
+    extracted once into mods/discs/<slot> (git-ignored game data) and re-used while the image is unchanged."""
+    if not (path and os.path.isfile(path) and path.lower().endswith(IMAGE_EXT)): return path
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import isoextract
+    return isoextract.ensure_extracted(path, os.path.join(ROOT, 'mods', 'discs', slot))
+
+
 def browse_folder(kind):
     if not IS_WIN: return ''
     ps = ("Add-Type -AssemblyName System.Windows.Forms;$d=New-Object System.Windows.Forms.FolderBrowserDialog;"
@@ -790,12 +839,20 @@ def games_op(body):
     valid = [s['id'] for s in PS2_SLOTS + PSP_SLOTS]
     msg = ''
     if op == 'browse':
-        return {'path': browse_folder(slot)}
+        return {'path': browse_image() if body.get('image') else browse_folder(slot)}
     if op in ('link', 'unlink', 'primary', 'rescan'):
         if op == 'link':
             if slot not in valid: return {'message': 'Unknown slot'}
             path = (body.get('path') or '').strip().strip('"')
             if not path or not os.path.exists(path): return {'message': 'That path does not exist'}
+            if slot.startswith('ps2') and os.path.isfile(path):
+                if not path.lower().endswith(IMAGE_EXT): return {'message': 'That file is not a disc image. Pick an .iso (or .bin/.img), or the extracted game folder.'}
+                try: root = resolve_disc(slot, path)
+                except Exception as ex: return {'message': 'Could not read the disc image: %s' % ex}
+                gi = dict(p.get('game_images') or {}); gi[slot] = path; p['game_images'] = gi
+                path = root
+            else:
+                gi = dict(p.get('game_images') or {}); gi.pop(slot, None); p['game_images'] = gi
             det = (detect_ps2 if slot.startswith('ps2') else detect_psp)(path)
             g[slot] = path; msg = ('Linked: ' + (det.get('serial') or det.get('disc_id') or 'recognised')) if det.get('found') else 'Linked, but nothing recognisable was found there: ' + det.get('note', '')
         elif op == 'unlink':

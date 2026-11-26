@@ -328,7 +328,7 @@ function updateLive() {
   const bb = $('#buildBar');
   if (bs.state === 'running' || bs.state === 'linking') {
     const pct = bs.total ? Math.min(100, Math.round(bs.n / bs.total * 100)) : 0;
-    bb.replaceChildren(h('p', { class: 'desc', style: 'margin-top:14px' }, bs.state === 'linking' ? 'Linking the game (the last step, can take a minute)...' : `Building ${bs.n} of ${bs.total}`), h('div', { class: 'bar' }, h('i', { style: 'width:' + (bs.state === 'linking' ? 100 : pct) + '%' })));
+    bb.replaceChildren(h('p', { class: 'desc', style: 'margin-top:14px' }, bs.state === 'linking' ? `Linking the game (the last step, usually 5 to 8 minutes) - ${Math.floor((bs.link_secs || 0) / 60)}:${String((bs.link_secs || 0) % 60).padStart(2, '0')} so far` : (bs.total ? `Building ${bs.n} of ${bs.total}` : 'Building...')), h('div', { class: 'bar' }, h('i', { style: 'width:' + (bs.state === 'linking' ? Math.min(99, Math.round((bs.link_secs || 0) / 420 * 100)) : pct) + '%' })));
   } else if (bs.state === 'failed') bb.replaceChildren(h('div', { class: 'note-box bad' }, 'The last build failed. Open Tools, then Logs, then Build log to see why.'));
   else bb.replaceChildren();
   if (run) {
@@ -558,7 +558,8 @@ function pageLibrary() {
       d.path ? h('p', { style: 'margin-top:2px;color:var(--faint)' }, d.path + (d.auto ? '  (found automatically)' : '')) : null,
       d.features && d.features.length ? h('p', { style: 'margin-top:6px;display:flex;gap:6px;flex-wrap:wrap' }, d.features.map(f => h('span', { class: 'tag ' + (f.ok ? 'good' : 'dev') }, f.name || f.id))) : null),
     h('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end' },
-      h('button', { class: 'btn sm', onclick: async () => { const r = await api('/api/games', { op: 'browse', slot: d.slot_id }); if (r.path) op('link', d.slot_id, r.path); } }, d.found ? 'Change...' : 'Link...'),
+      h('button', { class: 'btn sm', onclick: async () => { const r = await api('/api/games', { op: 'browse', slot: d.slot_id }); if (r.path) op('link', d.slot_id, r.path); } }, d.found ? 'Change folder...' : 'Link folder...'),
+          String(d.slot_id).startsWith('ps2') ? h('button', { class: 'btn sm', title: 'Pick an .iso (or .bin/.img) - the launcher unpacks it once into its own folder', onclick: async () => { const r = await api('/api/games', { op: 'browse', slot: d.slot_id, image: true }); if (r.path) op('link', d.slot_id, r.path); } }, 'Link disc image (.iso)...') : null,
       d.linked ? h('button', { class: 'btn sm', onclick: () => op('unlink', d.slot_id) }, 'Unlink') : null,
       d.slot_id.startsWith('psp') && d.found && d.features && d.features.length && L.psp_primary !== d.slot_id ? h('button', { class: 'btn sm', onclick: () => op('primary', d.slot_id) }, 'Use for extras') : null,
       d.slot_id === L.psp_primary ? h('span', { class: 'tag acc' }, 'Used for extras') : null));
